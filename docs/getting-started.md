@@ -24,7 +24,7 @@ Bondic) to bond the connector body to the PCB; the through-holes by the connecto
 to anchor it. **Keep epoxy off the pins and the mating face.**
 
 <p align="center">
-  <img src="../resources/EpoxyOmnetics.png" width="55%" />
+  <img src="../resources/EpoxyOmnetics.jpg" width="55%" />
 </p>
 
 ## 2. MicroZed boot-mode jumpers (boot from SD)
