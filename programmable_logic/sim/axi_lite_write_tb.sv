@@ -1,33 +1,22 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+
+// axi_lite_write_tb.sv
 //
-// axi_lite_write_tb.sv -- guards the AXI-Lite write handshake in
-// axi_lite_registers, the control-plane bridge that EVERY PS->PL command
-// crosses (start/stop, channel/phase, the COPI command words, aux config).
+// Self-checking xsim testbench for the axi_lite_registers AXI-Lite write
+// handshake. Motivated by a hardware wedge: the historical FSM toggles
+// awready/wready independently every cycle while the corresponding valid is
+// held, and only accepts when BOTH ready/valid pairs coincide -- if the
+// interconnect asserts AWVALID and WVALID one cycle apart, the two readys
+// oscillate in anti-phase and the write NEVER completes (CPU bus hang).
 //
-// THE FAILURE IT PREVENTS
-//   AXI-Lite lets the master present the write-address (AW) and write-data (W)
-//   channels on different cycles; the slave must accept the write for any legal
-//   ordering. If AWREADY/WREADY fail to coincide with their valids for some
-//   AW/W timing, the write never completes: BVALID never asserts and the ARM
-//   core hangs mid-store on the GP port. That is a SILENT BUS WEDGE -- no error,
-//   no bad data, the board just stops accepting commands -- the worst kind of
-//   field failure to diagnose.
+// Checks, for every skew in {AW first by 2,1,0, W first by 1,2}:
+//   A. the write completes (BVALID within a timeout)
+//   B. the register actually took the data
+//   C. back-to-back writes and read-after-write still work
+//   D. reads complete under held ARVALID
 //
-// WHAT IT CHECKS
-//   Drives every AW/W skew ({AW leads by 2,1,0; W leads by 1,2}) and asserts:
-//     A. the write completes (BVALID within a timeout) -- no wedge,
-//     B. the addressed register actually captured the data,
-//     C. back-to-back writes and read-after-write work,
-//     D. reads complete under held ARVALID.
-//
-// WHY IT STAYS / WHEN TO RUN IT
-//   axi_lite_registers is edited every time the register map grows (N_CTRL /
-//   N_STATUS / the address decode) -- which happens with essentially every new
-//   feature. Re-run this whenever you touch that file. It asserts AXI-protocol
-//   correctness directly, so it should pass no matter how many registers exist;
-//   if you change the handshake FSM and it fails, you have reintroduced the
-//   wedge.
+// Run: bash programmable_logic/sim/run_axi_write_tb.sh ("RESULT: PASS")
 
 `timescale 1ns/1ps
 

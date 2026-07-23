@@ -1,36 +1,31 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+
+// dualport_dropout_tb.sv
 //
-// dualport_dropout_tb.sv -- the broadband NO-DATA-LOSS regression guard.
+// Reproduces the Phase-3 "neural channel dropout" report AND verifies the
+// unified packet format (docs/unified-packet-format.md): in debug mode with
+// channel_enable = 0xFF, specific SPI cycles' data come out stuck/wrong. Runs
+// the FULL datapath (data_generator = core + fifo_bram_interface) and captures
+// the BRAM write stream.
 //
-// WHAT IT GUARDS
-//   The full broadband datapath (data_generator = core + fifo_bram_interface)
-//   at the worst-case 0xFF config (all 256 channels -> 140 data words, 154-word
-//   packet). It runs the core in debug mode -- which emits a deterministic sine
-//   pattern whose sample index advances by 1 every packet -- captures the BRAM
-//   write stream, and asserts, on every packet:
-//     1. NO STUCK WORDS: since the debug index advances each packet, every data
-//        word MUST differ between two consecutive packets. A word that repeats
-//        is a frozen/dropped channel.
-//     2. HEADER: the 14-word unified header is well-formed (MAGIC=0xCAFEBABE,
-//        stream_type=1, ver=1, channel_enable=0xFF, num_data_words=140, RSVD=0)
-//        and packets are spaced exactly 154 words (drift => words dropped/added).
-//     3. CONTENT: every data word equals the sine value re-derived below from
-//        the SAME formula the RTL uses -- 0 mismatches.
-//     4. MONOTONICITY: per-stream SEQ (w4), the 64-bit timestamp (w2/w3), and
-//        the debug index each advance by exactly +1 per packet. The SEQ check
-//        IS the loss check.
+// Detection without a sine reference: in debug mode dummy_data_index advances
+// by 1 every packet, so EVERY data word must differ between two consecutive
+// steady-state packets. Any data-region BRAM word that is IDENTICAL across two
+// packets is "stuck" -> the bug. Header words may legitimately repeat, so only
+// the data region (offset >= HDR) is judged.
 //
-// WHY IT STAYS / WHEN IT SHOULD FAIL
-//   This encodes the project's NO-DATA-LOSS hard rule directly, against a
-//   spec-derived reference (not a diff against any prior code), so it stays
-//   meaningful as the design evolves. Re-run it after ANY change to the core,
-//   the FIFO/BRAM packer, the packet/header format, or channel packing. A
-//   stuck-word / SEQ-gap / timestamp-gap failure means real data loss -- do not
-//   ship past it. If you intentionally change the wire format or the debug sine
-//   formula, update the header geometry (HDR/PKT) and ref_lut/ref_cycle_words
-//   here to match; a content mismatch after such a change means the datapath
-//   disagrees with the new spec, which is exactly what you want caught.
+// UNIFIED HEADER + NO-DATA-LOSS assertions (this branch):
+//   * the 14-word header decodes: w0 MAGIC=0xCAFEBABE, w1 stream_type=1/ver=1,
+//     w2/w3 timestamp, w4 per-stream SEQ, w5 AUX0=channel_enable|num_data_words<<8,
+//     w6 AUX1=digital_in/aux metadata, w7 RSVD=0.
+//   * the per-stream SEQ advances by exactly 1 per packet (the loss check).
+//   * BROADBAND CONTENT PRESERVED: every DATA word still matches the SAME sine
+//     reference as the original format (the framing changed, the data did not),
+//     and the timestamp advances by exactly 1 per packet -- so re-framing lost
+//     nothing.
+//
+// Run: bash programmable_logic/sim/run_dualport_dropout_tb.sh  ("RESULT: PASS")
 
 `timescale 1ns/1ps
 
@@ -79,8 +74,9 @@ initial begin
     end
 end
 
-// Expected 4 packed BRAM words for cycle `c` at debug index `ddi`, from the
-// same sine formula the RTL uses -- a match proves the sample content is correct.
+// Expected 4 packed BRAM words for cycle `c` at debug index `ddi`. This is the
+// SAME reference the original testbench used -- the data did not change, only the
+// framing -- so a match proves the broadband DATA content is preserved.
 function automatic void ref_cycle_words(input int c, input int ddi, output logic [31:0] w [0:3]);
     int coff = (c >= 2) ? (c - 2) : 0;
     int bp  = (ddi + coff) & 9'h1FF;
@@ -99,9 +95,9 @@ initial begin
     repeat (5) @(negedge clk);
 
     // enable transmission + debug mode (reg0 bit0 + bit3), infinite loop,
-    // channel_enable = 0xFF at CTRL_REG_2[15:8]
+    // channel_enable = 0xFF at CTRL_REG_2[23:16]
     ctrl[1*32 +: 32] = 32'd0;
-    ctrl[2*32 +: 32] = 32'h0000_FF00;
+    ctrl[2*32 +: 32] = 32'h00FF_0000;
     ctrl[0*32 +: 32] = 32'h0000_0009;
 
     // run long enough for many full packets (each ~2800 clocks)
@@ -158,7 +154,7 @@ initial begin
                 if (hw[7] !== 32'h0)
                     err($sformatf("RSVD (w7) = 0x%08h, expected 0", hw[7]));
 
-                // ---- stuck-word check (frozen/dropped-channel detection), data region ----
+                // ---- stuck-word check (the original dropout test), data region ----
                 for (int w = HDR; w < PKT; w++) begin
                     n_checks++;
                     if (wseq[a+w] === wseq[b+w]) begin
@@ -176,9 +172,10 @@ initial begin
                 else
                     $display("no stuck data words: all %0d data words advance between packets", PKT-HDR);
 
-                // ---- CONTENT: brute-force the debug index, then compare EVERY
-                //      data word to the RTL sine reference. 0 mismatches = the
-                //      sample content is correct. ----
+                // ---- BROADBAND CONTENT PRESERVED: brute-force the debug index,
+                //      then compare EVERY data word to the SAME sine reference
+                //      the original format used. A 0-mismatch match proves the data
+                //      payload is byte-identical to before (only framing changed). ----
                 begin
                     int best_ddi = -1, best_mism = 99999;
                     for (int ddi = 0; ddi < 512; ddi++) begin
@@ -209,7 +206,7 @@ initial begin
                                     ew[0], ew[1], ew[2], ew[3]);
                         end
                     end else
-                        $display("CONTENT OK: all 35 cycles' data match the sine reference exactly");
+                        $display("BROADBAND CONTENT PRESERVED: all 35 cycles' data match the reference sine EXACTLY");
                 end
             end
 
