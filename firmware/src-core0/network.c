@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
 
 #include "main.h"
+#include "pl_dma.h"     // CDMA read of the LFP output BRAM into non-cacheable staging
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -56,16 +57,23 @@ ID   | Command          | Param1              | Param2
 #define CMD_DUMP_BRAM       0x41
 #define CMD_SET_UDP_DEST    0x50
 #define CMD_PING            0x60
-// Aux command sequencer / override layer (Epic A)
+// Aux command sequencer / override layer
 #define CMD_AUX_WRITE_WORD  0x70   // param1 = slot | bank<<8 | is_len<<16; param2 = addr<<16 | data
 #define CMD_AUX_BANK_SELECT 0x71   // param1 = slot; param2 = bank (confirms swap before ACK)
-// 0x72 retired (was CMD_AUX_SEQ_EN): the aux command engine is always on
+// 0x72 is unassigned and must stay so: the aux command engine is always on, so
+// there is no enable command, and a host that sends 0x72 must get an error.
 #define CMD_READ_REGISTER   0x73   // param1 = reg; responds 4-byte {cipo1,cipo0} result
 #define CMD_WRITE_REGISTER  0x74   // param1 = reg; param2 = value; responds 4-byte echo
 #define CMD_SET_FAST_SETTLE 0x75   // param1 = amp: sw | gpio_en<<1 | pin<<4; param2 = dsp: same layout
 #define CMD_SET_DIGOUT      0x76   // param1 = sw | gpio_en<<1 | pin<<4; param2 = reg3_static byte
 #define CMD_SET_CHIRP       0x77   // param1 = mode | stride<<8; param2 = fspan | rate<<16 (CTRL_REG_3)
 
+// LFP/DSP engine (Tier-1). Set params + lane mask + coefficients while disabled,
+// then enable. Coefficients stream one tap per CMD_LFP_WRITE_COEF.
+#define CMD_LFP_ENABLE       0x80  // param1 = 0/1
+#define CMD_LFP_SET_PARAMS   0x81  // param1 ignored (decimation is structural), param2 = num_taps
+#define CMD_LFP_SET_CHANNELS 0x82  // param1 = 8-bit lane mask
+#define CMD_LFP_WRITE_COEF   0x83  // param1 = [0] clear-ptr-first | [1] stage (0=halfband,1=decimator); param2 = 18-bit signed coef
 #define CMD_PERF_RESET       0x91  // clear recv->transmit sticky maxes + histogram + counts
 
 #define ACK_SUCCESS         0x06
@@ -158,10 +166,18 @@ static ip_addr_t beacon_bcast;      // subnet-directed broadcast address
 static uint32_t  beacon_self_ip;    // our IPv4 (network order) for the payload
 
 void beacon_init(void) {
-    uint32_t ip   = netif_ip4_addr(&server_netif)->addr;
-    uint32_t mask = netif_ip4_netmask(&server_netif)->addr;
+    uint32_t ip = netif_ip4_addr(&server_netif)->addr;
     beacon_self_ip = ip;
-    beacon_bcast.addr = (ip & mask) | (~mask);   // (subnet bits) | (host all-ones)
+    // Use the LIMITED broadcast (255.255.255.255), not a subnet-directed one.
+    // A subnet-directed broadcast is only recognised as a broadcast by hosts
+    // that agree with us about the netmask: a client on the same wire with a
+    // /16 sees our /24 broadcast 192.168.18.255 as an ordinary host address,
+    // and its IP stack silently discards the datagram -- while a packet capture
+    // still shows it arriving, because the ETHERNET frame is broadcast and gets
+    // tapped before the IP layer drops it. That failure looks exactly like a
+    // board that never beaconed. The limited broadcast is accepted by every
+    // host on the link regardless of how it is configured.
+    beacon_bcast.addr = IPADDR_BROADCAST;
     beacon_pcb = udp_new();
     if (beacon_pcb == NULL) {
         send_message("ERROR: Could not create beacon UDP PCB\r\n");
@@ -185,8 +201,18 @@ void beacon_send(void) {
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(b), PBUF_REF);
     if (p == NULL) return;
     p->payload = &b;
-    udp_sendto(beacon_pcb, p, &beacon_bcast, BEACON_PORT);
+    err_t e = udp_sendto(beacon_pcb, p, &beacon_bcast, BEACON_PORT);
     pbuf_free(p);
+    // Report a send failure once rather than discarding it. The beacon is
+    // fire-and-forget, so a rejected send is otherwise invisible and looks
+    // identical to a host that cannot hear us -- which costs a long time to
+    // tell apart from the outside.
+    static int beacon_err_reported = 0;
+    if (e != ERR_OK && !beacon_err_reported) {
+        beacon_err_reported = 1;
+        send_message("WARNING: discovery beacon send failed (err %d); "
+                     "discovery is unavailable but streaming is unaffected\r\n", (int)e);
+    }
 }
 
 // ============================================================================
@@ -275,10 +301,13 @@ void collect_status_data(status_response_t* status) {
     status->worst_cdma_ticks  = worst_cdma_ticks;
     status->worst_send_ticks  = worst_send_ticks;
     status->worst_other_ticks = worst_other_ticks;
-    // TX drop diagnostics (v1.6)
+    // TX drop diagnostics
     status->bb_pbuf_alloc_fail  = bb_pbuf_alloc_fail;
     status->bb_send_err         = bb_send_err;
     status->bb_last_send_err    = bb_last_send_err;
+    status->lfp_pbuf_alloc_fail = lfp_pbuf_alloc_fail;
+    status->lfp_send_err        = lfp_send_err;
+    status->lfp_last_send_err   = lfp_last_send_err;
     status->first_drop_pkt      = first_drop_pkt;
     status->last_drop_pkt       = last_drop_pkt;
     status->memp_num_pbuf       = (uint32_t)MEMP_NUM_PBUF;
@@ -291,6 +320,16 @@ void collect_status_data(status_response_t* status) {
 
     // RHD chip register mirror (commanded state of regs 0..21)
     memcpy(status->rhd_reg, rhd_reg_shadow, sizeof(status->rhd_reg));
+
+    // LFP/DSP engine config (host-set) + live status. The lane mask MIRRORS the
+    // broadband channel-enable mask (single source of truth), so report the live
+    // broadband mask rather than a separate LFP mask.
+    status->lfp_enable       = lfp_cfg_enable;
+    status->lfp_lane_mask    = pl_get_current_channel_enable() & 0xFF;
+    status->lfp_decim_R      = lfp_cfg_decim_R;
+    status->lfp_num_taps     = lfp_cfg_num_taps;
+    status->lfp_packets_sent = lfp_udp_packets_sent;
+    status->lfp_overrun      = (pl_lfp_read_status() >> 16) & 1;
 
     // Analytic chirp NCO config (host-set, mirrored from CTRL_REG_3 tracking)
     status->chirp_mode   = chirp_cfg_mode;
@@ -531,6 +570,34 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
                         cmd->param1, cmd->param2);
             break;
 
+        case CMD_LFP_ENABLE:
+            pl_lfp_set_config(cmd->param1 ? 1 : 0, lfp_cfg_num_taps);
+            send_message("Binary Command: LFP_ENABLE %u\r\n", cmd->param1 ? 1 : 0);
+            break;
+
+        case CMD_LFP_SET_PARAMS:
+            // param1 (decim_R) is accepted and ignored: the cascade is wired /10.
+            pl_lfp_set_config(lfp_cfg_enable, cmd->param2 & 0xFF);
+            send_message("Binary Command: LFP_SET_PARAMS num_taps=%u (decim fixed /%u)\r\n",
+                         cmd->param2 & 0xFF, LFP_DECIM_TOTAL);
+            break;
+
+        // CMD_LFP_SET_CHANNELS sets nothing. The LFP lane mask mirrors the
+        // broadband channel-enable mask (set_channels) -- single source of
+        // truth -- so this command is accepted and ignored rather than erroring,
+        // and it must NOT be given a mask register of its own.
+        case CMD_LFP_SET_CHANNELS:
+            send_message("Binary Command: LFP_SET_CHANNELS ignored "
+                         "(lane mask mirrors broadband channel_enable)\r\n");
+            break;
+
+        case CMD_LFP_WRITE_COEF:
+            if (cmd->param1 & 0x1)
+                pl_lfp_coef_begin((cmd->param1 & 0x2) ? LFP_STAGE_DECIMATOR
+                                                      : LFP_STAGE_HALFBAND);
+            pl_lfp_coef_push((int32_t)(cmd->param2 << 14) >> 14);  // sign-extend 18-bit
+            break;
+
         case CMD_PERF_RESET:
             perf_reset();   // fresh recv->transmit measurement window
             send_message("Binary Command: PERF_RESET (maxes/histogram/counts cleared)\r\n");
@@ -698,3 +765,28 @@ void stop_udp_stream(void) {
         send_message("UDP stream stopped\r\n");
     }
 }
+
+// ============================================================================
+// LFP/DSP STREAM (Tier-1): drain the LFP output BRAM -> UDP on the UNIFIED port.
+//
+// Unified-port format: the LFP band streams on the SAME UDP port as broadband
+// (udp_dest_port, default UDP_PORT), demuxed host-side by stream_type=2. The former
+// separate LFP_UDP_PORT (5001) send path is removed.
+//
+// The PL builds the COMPLETE LFP wire packet in its output BRAM (0x84000000):
+// per frame, the unified 8-word common header (MAGIC, TYPE_VER=2, 64-bit master
+// timestamp, SEQ, AUX0=lane_mask/decim_R/num_taps/overrun, AUX1=num_samples,
+// RSVD) followed by the decimated samples (popcount of the broadband
+// channel_enable mask x 32 ch x 16-bit, packed 2/word). So the PS just CDMAs the
+// whole packet from the LFP BRAM into a non-cacheable staging buffer and sends a
+// zero-copy pbuf referencing it -- NO PS-side header math and NO Xil_In32 sample
+// loop (the long single-beat loop blew the per-packet budget; see CLAUDE.md
+// "PL->PS bulk data ALWAYS moves by DMA").
+//
+// The PL exposes its write pointer (next word to be written) in STATUS_REG_13;
+// we drain whole [header|samples] frames as they complete. The frame size is
+// derived from the broadband channel_enable mask (= the PL's LFP lane mask).
+// ============================================================================
+// The LFP stream service lives in stream.c, alongside the broadband one:
+// both turn a PL-assembled BRAM packet into a UDP datagram by the same
+// mechanism, and differ only in retry policy.

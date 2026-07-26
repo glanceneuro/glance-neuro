@@ -1,40 +1,64 @@
-# Testing
+# Testing & benchmarking
 
-The verification that ships with the broadband + aux datapath. RTL sims use Vivado's
-`xsim` (`source /opt/Xilinx/2025.1/Vivado/settings64.sh` first); each `run_*.sh`
-compiles the RTL it needs, runs the sim, and prints `RESULT: PASS` / `RESULT: FAIL`.
-
-Every test here asserts *intended behavior directly* — against a spec-derived
-reference or the AXI protocol, never a diff against older code — so it stays
-meaningful as the design evolves. Run the relevant one after changing the code it
-covers; each testbench's header says what it guards and when it should legitimately
-fail.
+How to run the verification tooling for the broadband datapath. All RTL sims use
+Vivado's `xsim` (`source /opt/Xilinx/2025.1/Vivado/settings64.sh` first); the
+benchmarks run on the board and report over the serial console / `net.py`.
 
 ## RTL simulations (`programmable_logic/sim/`)
 
-| Testbench | Guards | Re-run when you touch |
-|---|---|---|
-| `dualport_dropout_tb` | The **no-data-loss** contract: the full datapath at the 0xFF worst case — no stuck/frozen channels, the 14-word unified header well-formed, every sample byte-exact vs the sine reference, and SEQ / timestamp / index advancing +1 per packet (the SEQ check *is* the loss check). | the acquisition core, the FIFO→BRAM packer, the packet/header format, or channel packing |
-| `data_generator_aux_wire_tb` | The **aux command path on the wire**: decodes the serialized COPI out of the real core and checks the always-on aux commands reach the chip — the channel `CONVERT`s, the slot-0 program loop, the one-shot slot-2 inject, and the override rewrites (fast-settle `WRITE(0)`+D5, DSP-reset bit-H on every `CONVERT`, Reg-3 digout D0). Any of these is silent on the wire if it regresses. | the aux engine, `aux_program`, the override rewrites, or the frame geometry (`acq_frame_pkg`) |
-| `axi_lite_write_tb` | The **AXI-Lite write handshake**: a write must complete for every legal AW/W arrival order, else the PS hangs mid-store — a silent bus wedge that stops the board accepting commands. | `axi_lite_registers.v` — i.e. any time the register map grows |
+Each testbench has a `run_*.sh` that compiles the RTL it needs and runs `xsim`, then
+prints `RESULT: PASS` / `RESULT: FAIL`.
 
 ```bash
 cd programmable_logic/sim
 source /opt/Xilinx/2025.1/Vivado/settings64.sh
-bash run_dualport_dropout_tb.sh    # the no-loss proof
-bash run_aux_wire_tb.sh            # the aux command path on the wire
-bash run_axi_write_tb.sh
+bash run_dualport_dropout_tb.sh     # THE broadband integrity check (run this first)
 ```
 
-## check-dma guardrail (`scripts/check_dma.sh`, `.claude/skills/check-dma/`)
+Each testbench guards a distinct contract on code that still changes; that is the
+whole bar for keeping one (see the git history for the debug/one‑off sims that were
+retired rather than migrated).
 
-A static check for the one anti-pattern that silently breaks the data path: moving
-PL→PS bulk data by looping the CPU over BRAM/staging instead of AXI-CDMA (slow, and
-CPU bursts corrupt the 0xFF stream). Run it before declaring any PL↔PS data-path
-change done; annotate genuinely-justified single-beat peeks `// DMA-EXEMPT: <reason>`.
+| Testbench | `run_*.sh` | What it guards |
+|---|---|---|
+| `dualport_dropout_tb.sv` | `run_dualport_dropout_tb.sh` | **Broadband data integrity**: every data word out of the wrapper is byte‑exact vs the RTL sine reference across both cable ports, and SEQ/timestamp advance +1/packet with no gaps. The canonical "no dropout / no loss" proof. |
+| `data_generator_aux_wire_tb.sv` | `run_aux_wire_tb.sh` | Aux **command path on the wire**: decodes the serialized COPI out of the real core and proves the always‑on aux commands reach the chip — channel CONVERTs, the programmed aux loop, one‑shot injection, and the full override rewrite (fast‑settle WRITE(0) replace + D5, **DSP‑reset bit‑H on every CONVERT**, and **Reg‑3 digout D0 substitution**). Any of these is silent on the wire if it regresses, which is exactly why it's guarded here. |
+| `axi_lite_write_tb.sv` | `run_axi_write_tb.sh` | AXI‑Lite register **write handshake** — catches a silently wedged control bus. |
 
-## Host-side validation (`remote/net.py`)
+## BRAM‑read benchmark — *why DMA is required* (`benchmark_bram_reads.c`)
 
-`python3 remote/net.py` connects (TCP `0x6900`), streams, and validates the UDP data
-(`0x6800`): per-stream SEQ continuity (the loss check), magic/size checks, and
-cable/phase detection. A clean run shows **0 SEQ gaps**.
+A bring‑up diagnostic that times the three ways of reading the capture BRAM, so you
+can see for yourself why the shipped design uses **AXI‑CDMA** rather than the CPU.
+
+Run it from the **serial debug console** (core‑1 UART, 115200 8N1):
+
+```
+benchmark
+```
+
+It reads a fixed block of packets from the capture BRAM via (a) word‑by‑word
+`Xil_In32` single‑beat reads and (b) an `memcpy`/burst path, and prints the elapsed
+time + throughput for each to the console. The takeaway: single‑beat reads over the
+PS `M_AXI_GP` master cannot sustain the 0xFF (256‑ch, 150‑word) packet rate at the
+131.25 MHz AXI clock, and CPU bursts of the BRAM corrupt the 0xFF stream — which is
+why the real path moves the packet BRAM→DDR by CDMA (a PL master over `S_AXI_HP0`),
+landing straight into the pbuf. (See `docs/bram_burst_read_bug.md` and the DMA rule
+in `CLAUDE.md`.)
+
+## check‑dma guardrail (`.claude/skills/check-dma/`)
+
+A skill/script that scans for the anti‑pattern the benchmark above motivates: any
+new PL→PS bulk‑data path that loops the CPU over BRAM/staging instead of using CDMA.
+Run it before declaring a data‑path change done; genuinely‑justified single‑beat
+peeks (e.g. a 2‑word magic/resync read) must be annotated `// DMA-EXEMPT: <reason>`.
+
+## Host‑side (`remote/net.py`)
+
+`python3 net.py` connects (TCP `0x6900`), starts streaming, and validates the
+unified UDP stream (data on `0x6800`): per‑stream SEQ continuity (the loss check),
+magic/size checks, and cable/phase detection. A clean run shows **0 SEQ gaps**.
+
+> **UDP throughput benchmark** (board‑side blaster + `net.py` meter for MB/s vs
+> packet size) is a separate tool being re‑added on top of this branch — it needs a
+> dedicated bench port in the new `0x68xx` scheme and is best validated with a live
+> host‑side throughput measurement.

@@ -46,10 +46,29 @@ module data_generator_core (
     input  logic        cipo_b1,      // cable B, CIPO line 1
 
     // External digital input
-    input  logic [7:0]  digital_in
+    input  logic [7:0]  digital_in,
+
+    // DSP tap: the de-interleaved per-slot sample stream, for the on-PL LFP/DSP
+    // engine. Pulses on each data-word write (NOT the header), carrying the same
+    // 8x16-bit lanes as fifo_write_data with the slot index (cycle_counter) and a
+    // once-per-packet tick. Offset-binary->signed conversion + amplifier-slot
+    // gating happen downstream in lfp_dsp_block. See docs/lfp.md.
+    output logic        dsp_sample_valid,
+    output logic [127:0] dsp_sample_data,
+    output logic [5:0]  dsp_sample_slot,
+    output logic        dsp_packet_tick,
+    // Live 64-bit master sample count, exposed so the LFP engine can stamp each
+    // decimated frame with the master timestamp of the LAST broadband sample that
+    // contributed to it (latched in lfp_dsp_block on the decimation tick). This is
+    // the SAME counter the broadband packet header stamps (header word 1).
+    output logic [63:0] dsp_master_timestamp,
+    // Broadband channel-enable mask (single source of truth for the LFP lane
+    // mask -- the LFP filters exactly the broadband-enabled lanes).
+    output logic [7:0]  dsp_channel_enable
 );
 
 import acq_frame_pkg::*;   // frame geometry + RHD command encoding, single source of truth
+import unified_pkt_pkg::*; // the 8-word common header shared by every PL stream
 
 // Extract control bits
 wire enable_transmission = ctrl_regs_pl[0*32 + 0];
@@ -164,15 +183,10 @@ CIPO_combined_phase_selector cipo_b1_selector(
 logic [6:0] state_counter;
 logic [5:0] cycle_counter;
 
-// Constants
-// Unified common-header constants (identical across all PL streams).
-localparam logic [31:0] UNIFIED_MAGIC       = 32'hCAFEBABE;  // header word 0
-localparam logic [7:0]  STREAM_TYPE_BROADBAND = 8'd1;
-localparam logic [7:0]  UNIFIED_VERSION     = 8'd1;
-// TYPE_VER (header word 1) = stream_type[7:0] | version[15:8] | flags[31:16].
-// Broadband sets no flags (0).
-localparam logic [31:0] BB_TYPE_VER =
-    {16'd0, UNIFIED_VERSION, STREAM_TYPE_BROADBAND};
+// The common header comes from unified_pkt_pkg; only AUX0/AUX1 are ours to
+// define. AUX0 tells the host how big the payload is; AUX1 carries the digital
+// inputs plus this packet's sweep-slot command, which labels the accelerometer
+// axis whose reply lands in the SAME packet at data word 34.
 logic [63:0] timestamp;
 
 // Status tracking (transmission_active is declared near the top of the module)
@@ -529,6 +543,16 @@ always_ff @(posedge clk) begin
 end
 
 
+// The broadband common header, built from the shared contract. AUX0 gives the
+// host the payload size; AUX1 carries the digital inputs, the aux flags, and the
+// sweep-slot command that labels the accel axis replying in this same packet.
+wire [31:0] bb_aux0 = {8'd0, bb_num_data_words[15:0], channel_enable_reg};
+wire [31:0] bb_aux1 = {aux_cmds_final[AUX_SWEEP_SLOT*16 +: 16],   // [31:16] sweep-slot echo
+                       aux_flags,                                  // [15:8]
+                       digital_in_latched};                        // [7:0]
+wire [UNIFIED_HDR_WORDS*32-1:0] bb_hdr =
+    unified_hdr(STREAM_TYPE_BROADBAND, timestamp, bb_seq, bb_aux0, bb_aux1);
+
 // Data-to-BRAM processing
 always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -540,9 +564,16 @@ always_ff @(posedge clk) begin
         bb_seq_next <= 32'd0;
         fifo_packet_end_flag <= 1'b0;
 
+        // DSP tap (LFP): reset the capture-mirror pulses + slot index
+        dsp_sample_valid <= 1'b0;
+        dsp_sample_slot  <= 6'd0;
+        dsp_packet_tick  <= 1'b0;
     end else begin
         // Default: no FIFO write
         fifo_write_en <= 1'b0;
+        // DSP tap defaults (single-cycle pulses)
+        dsp_sample_valid <= 1'b0;
+        dsp_packet_tick  <= 1'b0;
 
         if (transmission_active && !fifo_full) begin
             // ---- Unified packet header (broadband, stream_type=1) -------------
@@ -551,14 +582,13 @@ always_ff @(posedge clk) begin
             // state -> 14 BRAM words ahead of the data. See
             // docs/unified-packet-format.md.
             //
-            // BRAM word layout (LE), per 64-bit write {high32, low32}:
-            //   write0 (w0/w1):  MAGIC=0xCAFEBABE           | TYPE_VER=1|ver<<8|flags<<16
-            //   write1 (w2/w3):  TS_LO                      | TS_HI
-            //   write2 (w4/w5):  SEQ (broadband)            | AUX0=ce|num_data_words<<8
-            //   write3 (w6/w7):  AUX1=digital/flags/fs-echo | RSVD=0
-            //   write4 (w8/w9):  fs+inject echoes           | analog ch0-1   (sub-block)
-            //   write5 (w10/w11):analog ch2-3              | analog ch4-5
-            //   write6 (w12/w13):analog ch6-7              | reserved=0
+            // BRAM word layout (LE), per 64-bit write {high32, low32}. Writes
+            // 0..3 are the shared header (unified_pkt_pkg defines the words);
+            // writes 4..6 are the broadband-only sub-block:
+            //   write0..3 (w0..w7):  the 8-word common header, two words at a time
+            //   write4 (w8/w9):  fs+inject echoes           | analog ch0-1
+            //   write5 (w10/w11):analog ch2-3               | analog ch4-5
+            //   write6 (w12/w13):analog ch6-7               | reserved=0
             // Latch the per-packet broadband seq at the packet start, before it is
             // stamped into header word 4 (FIFO state 2). bb_seq_next advances at
             // the packet end below, so consecutive packets get +1 with no gap.
@@ -575,23 +605,13 @@ always_ff @(posedge clk) begin
                     fifo_packet_end_flag <= 1'b0;  // Header words are never at the end
                     case (state_counter)
                         // ---- common 8-word header (words 0..7) ----
-                        7'd0: fifo_write_data <= {BB_TYPE_VER, UNIFIED_MAGIC};
-                        7'd1: fifo_write_data <= timestamp;             // TS_LO | TS_HI
-                        // SEQ (w4) | AUX0 (w5) = channel_enable | num_data_words<<8
-                        7'd2: fifo_write_data <= {
-                            {8'd0, bb_num_data_words[15:0], channel_enable_reg}, // w5 AUX0
-                            bb_seq};                                            // w4 SEQ
-                        // AUX1 (w6) = digital inputs + aux flags + this packet's
-                        // sweep-slot command echo:
-                        //   [7:0] digital_in, [15:8] aux_flags,
-                        //   [31:16] sweep-slot command (its reply is data word 34) --
-                        //   this is the accel axis label, paired intra-packet.
-                        // RSVD (w7) = 0.
-                        7'd3: fifo_write_data <= {
-                            32'h0,                                              // w7 RSVD
-                            aux_cmds_final[AUX_SWEEP_SLOT*16 +: 16],            // w6[31:16] sweep-slot echo (accel axis)
-                            aux_flags,                                          // w6[15:8]
-                            digital_in_latched};                                // w6[7:0]
+                        // Built by unified_pkt_pkg so broadband and every other
+                        // stream cannot drift apart; we write it 64 bits at a
+                        // time, so each state takes one {odd,even} word pair.
+                        7'd0: fifo_write_data <= bb_hdr[63:0];      // w1  | w0
+                        7'd1: fifo_write_data <= bb_hdr[127:64];    // w3  | w2
+                        7'd2: fifo_write_data <= bb_hdr[191:128];   // w5  | w4
+                        7'd3: fifo_write_data <= bb_hdr[255:192];   // w7  | w6
                         // ---- broadband sub-block (words 8..13) ----
                         // w8 = the previous packet's fs- and inject-slot command
                         //      echoes (their replies land at cycles 0/1 of THIS
@@ -617,6 +637,11 @@ always_ff @(posedge clk) begin
                 fifo_write_en <= 1'b1;
                 fifo_channel_mask <= channel_enable_reg;  // 8-bit channel enable
                 fifo_packet_end_flag <= is_last_cycle;    // Only last cycle's data word ends the packet
+                // DSP tap: this is a data-word write -> pulse the engine with the
+                // slot index. fifo_write_data (set below) carries the 8 lanes and
+                // is exposed combinationally as dsp_sample_data.
+                dsp_sample_valid <= 1'b1;
+                dsp_sample_slot  <= cycle_counter;
 
                 if (!debug_mode_reg) begin
                     // Real CIPO data, both ports.
@@ -636,6 +661,9 @@ always_ff @(posedge clk) begin
                     bb_seq_next  <= bb_seq_next + 1;  // per-stream broadband seq
                     // (test_signal_gen advances its own sine index + chirp NCO off
                     // synth_packet_advance, which pulses on this same edge.)
+                    // DSP tap (LFP): packet complete -> pulse the engine's per-packet
+                    // ring advance (after all 35 slot samples are ingested).
+                    dsp_packet_tick <= 1'b1;
                 end
             end
 
@@ -648,6 +676,16 @@ always_ff @(posedge clk) begin
         end
     end
 end
+
+// DSP tap data: the registered 128-bit data word (valid when dsp_sample_valid).
+assign dsp_sample_data = fifo_write_data;
+
+// Master timestamp + broadband channel-enable taps for the LFP engine. The LFP
+// engine latches dsp_master_timestamp on its decimation tick (so each LFP frame
+// carries the master count of the last contributing broadband sample) and drives
+// its lane_mask from dsp_channel_enable (mirror of the broadband mask).
+assign dsp_master_timestamp = timestamp;
+assign dsp_channel_enable   = channel_enable_reg;
 
 // Pack status signals
 // Status Register 0: Dynamic status and counters (locally generated)

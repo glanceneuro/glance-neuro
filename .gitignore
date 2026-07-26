@@ -46,10 +46,20 @@ vitis_workspace/
 
 # Overnight build scripts + logs (regenerable)
 build_logs/
-programmable_logic/sim/lfp_*.hex
 programmable_logic/sim/lfp_blk_*.hex
 remote/ripple_envelope.csv
 
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Generated simulation vectors and plots -- reproduce with the sim's gen_*.py
+# script or design_lfp_filters.py --plot. Filter COEFFICIENTS (*_coefs.hex) ARE
+# tracked: they are what the shipped hardware filters with.
+programmable_logic/sim/*_samples.hex
+programmable_logic/sim/*_exp.hex
+programmable_logic/sim/*_exp_*.hex
+programmable_logic/sim/*.png
+# Belt and braces: the coefficients are the filter that ships in the bitstream,
+# so never let a broader pattern above hide them.
+!programmable_logic/sim/*_coefs.hex

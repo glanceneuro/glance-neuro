@@ -66,21 +66,23 @@ uint32_t worst_pkt_index = 0;                       // packet idx of the worst l
 uint32_t worst_cdma_ticks = 0, worst_send_ticks = 0, worst_other_ticks = 0;
 uint32_t loop_hist[PERF_HIST_BUCKETS] = {0};        // recv->transmit time distribution
 
-// TX drop diagnostics (v1.6): split udp_send_errors by failure mode and record
-// WHEN drops happen. Each zero-copy PBUF_REF send holds one MEMP_PBUF entry
-// (MEMP_NUM_PBUF) until the GEM TX-done reaps it; pbuf_alloc()==NULL => that pool
-// is momentarily empty. Declared before perf_reset() so it can clear them.
-// Cleared by CMD_PERF_RESET.
+// TX drop diagnostics: split udp_send_errors by stream + failure mode and
+// record WHEN drops happen. Each zero-copy PBUF_REF send holds one MEMP_PBUF
+// entry (MEMP_NUM_PBUF, shared by broadband + LFP) until the GEM TX-done reaps
+// it; pbuf_alloc()==NULL => that pool is momentarily empty. Declared before
+// perf_reset() so it can clear them. Cleared by CMD_PERF_RESET.
 uint32_t bb_pbuf_alloc_fail = 0, bb_send_err = 0;
 int32_t  bb_last_send_err = 0;
-// NO-LOSS retry stats (bb_send_err now = drops after exhausting all retries).
+// NO-LOSS retry stats: bb_send_err counts only drops that survived every retry.
 uint32_t bb_send_retries = 0, bb_pbuf_retries = 0, bb_send_recovered = 0;
+uint32_t lfp_pbuf_alloc_fail = 0, lfp_send_err = 0;
+int32_t  lfp_last_send_err = 0;
 uint32_t first_drop_pkt = 0, last_drop_pkt = 0;
 uint32_t drop_ring[8] = {0};
 uint32_t drop_ring_idx = 0;
 // If this fails, the wire layout changed -- update net.py get_status (the length
 // check and the struct.unpack offsets) to match.
-_Static_assert(sizeof(status_response_t) == 264, "status_response_t size must match net.py get_status");
+_Static_assert(sizeof(status_response_t) == 288, "status_response_t size must match net.py get_status");
 
 // Clear the sticky maxes + worst-case snapshot + histogram + counts so the user
 // controls the measurement window (CMD_PERF_RESET). Leaves the last-sample fields
@@ -95,20 +97,11 @@ void perf_reset(void) {
   for (int i = 0; i < PERF_HIST_BUCKETS; i++) loop_hist[i] = 0;
   // TX drop diagnostics
   bb_pbuf_alloc_fail = bb_send_err = 0; bb_last_send_err = 0;
+  lfp_pbuf_alloc_fail = lfp_send_err = 0; lfp_last_send_err = 0;
   first_drop_pkt = last_drop_pkt = 0; drop_ring_idx = 0;
   for (int i = 0; i < 8; i++) drop_ring[i] = 0;
 }
 
-// Record a broadband TX drop (pbuf-alloc fail or udp_sendto error). packets_
-// received_count is the count BEFORE this packet's increment, so the dropped
-// packet is ~that index. first/last bracket the span; the ring shows clustering.
-static void record_bb_drop(void) {
-  uint32_t idx = packets_received_count;
-  if (first_drop_pkt == 0) first_drop_pkt = idx;
-  last_drop_pkt = idx;
-  drop_ring[drop_ring_idx & 7u] = idx;
-  drop_ring_idx++;
-}
 
 // UDP transmission
 uint32_t udp_packets_sent = 0;
@@ -117,32 +110,9 @@ uint32_t udp_send_errors = 0;
 uint32_t udp_dest_ip = 0;      // Will be initialized in main()
 uint16_t udp_dest_port = DEFAULT_UDP_DEST_PORT;
 
-// Pre-allocated packet buffer for UDP (sized for maximum packet)
-// Use __attribute__((aligned(64))) to align to cache line boundary for optimal performance
-// Used as the packet buffer only on the BRAM_READ_SINGLE path; unused under DMA.
-static uint32_t udp_packet_buffer[MAX_WORDS_PER_PACKET] __attribute__((aligned(64), unused));
 
-// ---- Capture-BRAM read method ----------------------------------------------
-// The PS M_AXI_GP master corrupts long *burst* reads of the capture BRAM (the
-// 0xFF dual-port dropout). What we learned chasing it:
-//   SINGLE - word-by-word Xil_In32. CLEAN by construction: each read is its own
-//            1-beat AXI transaction, so it never issues the burst that the GP
-//            master mishandles. But it is latency-bound and too slow to sustain
-//            0xFF (256 ch, 150-word packets) at the 131.25 MHz AXI clock.
-//            Raising the AXI clock to 210 MHz DID make single-beat fast enough --
-//            but 210 MHz is over the -1 part's M_AXI_GP ~150 MHz spec
-//            (clk_out2 also clocks the GP master), so it is bench-only, not
-//            shippable. Kept here as the conceptual reference / fallback.
-//   DMA    - an AXI CDMA (a PL master) copies each packet BRAM -> DDR over
-//            S_AXI_HP0 (see pl_dma.c), taking the PS GP master off the bulk-read
-//            path entirely. Clean at full bandwidth, in-spec at 131.25 MHz, and
-//            it frees core 0. This is the fix. DEFAULT.
-// (A removed third option, inline-`ldmia` chunked CPU bursts, was a burst over
-//  the same broken GP master AND its asm scrambled word order -> wrong magic;
-//  see git history. Don't reintroduce CPU bursts of the BRAM.)
-#define BRAM_READ_DMA     0
-#define BRAM_READ_SINGLE  1
-#define BRAM_READ_METHOD  BRAM_READ_DMA
+// The two stream services live in stream.c; the capture-BRAM read method they
+// use is selected in main.h.
 
 // ============================================================================
 // PACKET SIZE CALCULATION FUNCTIONS
@@ -190,182 +160,9 @@ void update_current_packet_size(void) {
 // BRAM ACCESS FUNCTIONS
 // ============================================================================
 
-int n_words_available;
 
 // Check how many complete packets are available to read
-static int packets_available(void) {
-  uint32_t pl_write_addr = pl_get_bram_write_address();
 
-  if (pl_write_addr >= ps_read_address) {
-    n_words_available = pl_write_addr - ps_read_address;
-  } else {
-    // Handle wrap-around
-    n_words_available = (BRAM_SIZE_WORDS - ps_read_address) + pl_write_addr;
-  }
-
-  // No guard band: the exposed write pointer (packet_boundary_address in
-  // fifo_bram_interface.sv) advances ONLY at packet boundaries, so every packet
-  // in [ps_read_address, pl_write_addr) is already fully committed -- the
-  // in-progress packet is excluded by construction, so there is no
-  // read-during-write to guard against. The CDC on that pointer is handled by the
-  // read-twice deglitch in pl_get_bram_write_address(), and the per-packet magic
-  // check is the safety net. (A former one-packet guard band here was a
-  // misattributed band-aid for the M_AXI_GP burst corruption that the DMA fixed;
-  // it also held back the last packet of any finite loop_count, so loop_count=1
-  // streamed nothing.)
-  return n_words_available / current_packet_size;  // complete packets available
-}
-
-// Read and validate one packet directly from BRAM with UDP transmission
-static int process_packet_from_bram(void) {
-  XTime t_loop0; XTime_GetTime(&t_loop0);   // perf: receive->transmit timer
-  // Unified packet format: header word 0 = MAGIC (0xCAFEBABE), word 1 = TYPE_VER
-  // with stream_type=1 (broadband), version=1 in the low 16 bits. The capture
-  // BRAM only ever holds broadband packets, so we validate both the magic AND
-  // the broadband stream_type/version.
-  uint32_t magic_offset    = ps_read_address; // should always be < BRAM_SIZE_WORDS
-  uint32_t typever_offset  = (ps_read_address + 1) % BRAM_SIZE_WORDS;
-
-  uint32_t magic_word   = Xil_In32(BRAM_BASE_ADDR + (magic_offset * 4));   // DMA-EXEMPT: 2-word header peek (clean 1-beat reads; bulk payload moves by CDMA below)
-  uint32_t typever_word = Xil_In32(BRAM_BASE_ADDR + (typever_offset * 4)); // DMA-EXEMPT: 2-word header peek (clean 1-beat reads; bulk payload moves by CDMA below)
-
-  uint32_t expected_typever =
-      (uint32_t)STREAM_TYPE_BROADBAND | ((uint32_t)UNIFIED_VERSION << 8);
-
-  // Validate the unified header (magic + broadband type/version, low 16 bits)
-  if (magic_word != UNIFIED_MAGIC ||
-      (typever_word & 0xFFFFu) != (expected_typever & 0xFFFFu)) {
-    // Invalid header - could be BRAM overflow, corruption, or misalignment.
-    // Jump directly to write pointer to sync with fresh data.
-    uint32_t pl_write_addr = pl_get_bram_write_address();
-    ps_read_address = pl_write_addr;
-    error_count++; // ERROR TO TRACK
-    send_message("Header validation failed (magic=0x%08X type_ver=0x%08X), jumping to write position %u\r\n",
-                 magic_word, typever_word, pl_write_addr);
-    return 0; // Packet validation failed, now synced to fresh data
-  }
-
-  // TODO: If we are in an error state, we could track how long we stay there
-  //    by measuring the timestamp gap when we recover.
-
-  // UDP transmission (always enabled) - zero-copy with pre-allocated buffer.
-  //
-  // Read the packet out of the capture BRAM into pkt_buf (see "read method"
-  // above). DMA: the CDMA copies BRAM -> a non-cacheable DDR buffer, split at
-  // the BRAM wrap into two contiguous transfers. SINGLE: clean but slow
-  // word-by-word Xil_In32 (the conceptual reference / 210 MHz fallback).
-  uint32_t *pkt_buf;
-#if BRAM_READ_METHOD == BRAM_READ_DMA
-  // Staging RING: the send is zero-copy (PBUF_REF), so rotate the staging slot to
-  // avoid clobbering a slot whose TX BD is still pending (see the broadband no-loss
-  // notes). 128 * 2 KB = 256 KB inside the 1 MB pl_dma_staging.
-  #define STAGING_SLOT_BYTES 2048u
-  #define N_STAGING_SLOTS    128u
-  pkt_buf = (uint32_t *)(DMA_BUF_ADDR + (uintptr_t)staging_slot * STAGING_SLOT_BYTES);
-  staging_slot = (staging_slot + 1u) % N_STAGING_SLOTS;
-  int derr;
-  XTime t_dma0; XTime_GetTime(&t_dma0);     // perf: CDMA transfer timer
-  if ((ps_read_address + current_packet_size) <= BRAM_SIZE_WORDS) {
-    derr = pl_dma_read_bram(pkt_buf, ps_read_address, current_packet_size);
-  } else {
-    uint32_t first = BRAM_SIZE_WORDS - ps_read_address;
-    derr  = pl_dma_read_bram(pkt_buf, ps_read_address, first);
-    derr |= pl_dma_read_bram(pkt_buf + first, 0, current_packet_size - first);
-  }
-  XTime t_dma1; XTime_GetTime(&t_dma1);
-  dma_ticks_last = (uint32_t)(t_dma1 - t_dma0);
-  if (dma_ticks_last > dma_ticks_max) dma_ticks_max = dma_ticks_last;
-  if (derr) dma_errors++;
-#else  // BRAM_READ_SINGLE -- clean 1-beat reads, but too slow for 0xFF at 131 MHz
-  pkt_buf = udp_packet_buffer;
-  for (uint32_t i = 0; i < current_packet_size; i++) {
-    uint32_t src = (ps_read_address + i) % BRAM_SIZE_WORDS;
-    pkt_buf[i] = Xil_In32(BRAM_BASE_ADDR + src * 4);  // DMA-EXEMPT: BRAM_READ_SINGLE reference reader (compile-time fallback, not the default DMA path)
-  }
-#endif
-
-  // NO-LOSS bounded retry (broadband is archival): retry the send instead of
-  // dropping. udp_sendto returns ERR_MEM on a transient TX-BD-ring-full (the GEM
-  // reaps lazily, no TX-done ISR); the ring drains autonomously and each udp_sendto
-  // reaps completed BDs, so a fresh attempt recovers the packet. Bounded so a
-  // sustained stall degrades to a drop; the staging ring + ~100-packet PL BRAM
-  // absorb the backlog. (PAUSErx=0/TXSR=TXGO confirmed these drops are benign
-  // transient ring-full, not flow control or a TX error.)
-  #define TX_MAX_ATTEMPTS 64
-  uint32_t packet_bytes = current_packet_size * BYTES_PER_WORD;
-  ip_addr_t dest_ip;
-  dest_ip.addr = udp_dest_ip;
-
-  XTime t_send0; XTime_GetTime(&t_send0);
-  err_t result = ERR_MEM;
-  uint32_t attempt = 0;
-  for (; attempt < TX_MAX_ATTEMPTS; attempt++) {
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, packet_bytes, PBUF_REF);
-    if (p != NULL) {
-      p->payload = (void*)pkt_buf;
-      result = udp_sendto(udp, p, &dest_ip, udp_dest_port);
-      pbuf_free(p);
-      if (result == ERR_OK) break;
-      bb_send_retries++;
-    } else {
-      bb_pbuf_retries++;
-    }
-    for (volatile int s = 0; s < 120; s++) { }   // let the GEM make TX progress
-  }
-  XTime t_send1; XTime_GetTime(&t_send1);
-  send_ticks_last = (uint32_t)(t_send1 - t_send0);
-  if (send_ticks_last > send_ticks_max) send_ticks_max = send_ticks_last;
-
-  if (result == ERR_OK) {
-    udp_packets_sent++;
-    if (attempt > 0) bb_send_recovered++;   // needed >=1 retry but got through (no loss)
-  } else {
-    send_message("UDP Send Error: %d (after %u retries)\r\n", result, (unsigned)attempt);
-    udp_send_errors++;
-    bb_send_err++;
-    bb_last_send_err = (int32_t)result;
-    record_bb_drop();
-  }
-
-  // Update read pointer with variable packet size
-  ps_read_address = (ps_read_address + current_packet_size) % BRAM_SIZE_WORDS;
-  packets_received_count++;
-
-  // perf: full receive->transmit time for this packet (the 33us-budget metric)
-  XTime t_loop1; XTime_GetTime(&t_loop1);
-  loop_ticks_last = (uint32_t)(t_loop1 - t_loop0);
-
-  // perf: worst-case capture -- snapshot the breakdown the instant a new max is
-  // set, so we see WHAT dominated the worst packet (cdma vs send vs other).
-  if (loop_ticks_last > loop_ticks_max) {
-    loop_ticks_max = loop_ticks_last;
-    worst_pkt_index   = packets_received_count;
-    worst_cdma_ticks  = dma_ticks_last;
-    worst_send_ticks  = send_ticks_last;
-    // other = loop - cdma - send (clamp; the three samples are taken at slightly
-    // different instants so rounding can make the sum momentarily exceed loop)
-    uint32_t accounted = dma_ticks_last + send_ticks_last;
-    worst_other_ticks = (loop_ticks_last > accounted) ? (loop_ticks_last - accounted) : 0;
-  }
-
-  // perf: distribution + over-budget frequency. Convert this packet's
-  // recv->transmit ticks to microseconds against the histogram edges. The 33.3 us
-  // budget is one sample period at 30 kHz.
-  if (perf_timer_hz) {
-    uint32_t loop_us = (uint32_t)(((uint64_t)loop_ticks_last * 1000000ULL) / perf_timer_hz);
-    int b;
-    if      (loop_us <  16) b = 0;
-    else if (loop_us <  25) b = 1;
-    else if (loop_us <  33) b = 2;
-    else if (loop_us <  50) b = 3;
-    else if (loop_us < 100) b = 4;
-    else                    b = 5;
-    loop_hist[b]++;
-    if (loop_us >= 33) over_budget_count++;   // 33.3 us budget; >=33 us is over
-  }
-
-  return 1;  // Success
-}
 
 // ============================================================================
 // STREAMING CONTROL
@@ -498,7 +295,7 @@ void process_command_flags(void) {
 // Publish a binary status snapshot to shared memory for core 1 to format/print.
 // Cheap, bounded, non-blocking: ~15 PL register reads + plain stores, no string
 // formatting and no print ring. seqlock (odd while writing) lets core 1 read a
-// consistent snapshot. This is what replaces the old core-0 console flood.
+// consistent snapshot. Core 0 does no console I/O of its own on this path.
 static void publish_status_snapshot(void) {
   uint32_t s0 = psmon->seq;
   psmon->seq = s0 | 1u;          // mark odd: update in progress
@@ -545,11 +342,11 @@ static void publish_status_snapshot(void) {
 // ---- GEM RX-hang self-heal (Zynq-7000 SI#692601) ---------------------------
 // The GEM RX can latch up ("used-bit hang"): RXSR sets BUFFNA (b0) and/or RXOVR
 // (b2), the RX DMA stops, and the MAC receives nothing (even though TX keeps
-// working) until reset. This was the "connect during boot -> unreachable until
-// power-cycle" failure. Recover by toggling RXEN (vendor SI#692601 workaround) and
-// clearing the sticky RX status bits, GATED on the actual hang bits so a healthy/
-// idle RX is never touched (the old resetrx toggled on merely-idle RX and regressed
-// normal boots). Cheap: one register read per call when there's no hang.
+// working) until reset. It presents as "connect during boot -> board unreachable
+// until power-cycle". Recover by toggling RXEN (vendor SI#692601 workaround) and
+// clearing the sticky RX status bits, GATED on the actual hang bits: toggling
+// RXEN on a merely-idle RX disturbs a healthy boot, so a healthy/idle RX must
+// never be touched. Cheap: one register read per call when there's no hang.
 #define GEM_BASE          XPAR_XEMACPS_0_BASEADDR
 #define GEM_NWCTRL_OFF    0x000u
 #define GEM_RXSR_OFF      0x020u
@@ -685,6 +482,13 @@ int main() {
 #if BRAM_READ_METHOD == BRAM_READ_DMA
   pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
 #endif
+
+  // Load the LFP cascade's configuration but leave the engine OFF. Its filters
+  // come from the bitstream, so enabling it is a single command and needs no
+  // host setup -- but it costs core-0 time in the same loop as the broadband
+  // pump, and broadband is the stream with a hard 33 us budget. Anything that
+  // competes with it is opt-in. Decimation is structural (/2 then /5 -> 3 kHz).
+  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
   // ========================================================================
 
   // ========================================================================
@@ -758,6 +562,7 @@ int main() {
 
   // Initialize UDP (always enabled)
   udp_stream_init();
+  lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
   
@@ -791,20 +596,16 @@ int main() {
   // Main event loop
   while (1) {
     network_maintenance_loop();
-    
-    if (stream_enabled) {
-      // Process all available packets with direct BRAM access and UDP transmission
-      while (packets_available() > 0) { 
-        process_packet_from_bram();
-        
-        // Periodic status (every 30k packets)
-        if (packets_received_count % 30000 == 0) {
-          send_message("Processed %u packets, %u errors, %u nwa, UDP: %u sent/%u errors\r\n",
-               packets_received_count, error_count, n_words_available,
-               udp_packets_sent, udp_send_errors);
-        }
-      }
-    }
+
+    // Broadband first, and unconditionally: it is the 30 kHz path with the
+    // 33 us budget, and nothing may come between it and the PL.
+    broadband_stream_service();
+
+    // LFP after it, deliberately. The decimated stream is 3 kHz and its 16K-word
+    // ring tolerates bursty servicing, so it yields to broadband every time.
+    // Kept on its own line rather than inside the network loop so that ordering
+    // is a visible scheduling decision instead of an implementation detail.
+    lfp_stream_service();
   }
   
   cleanup_platform();
