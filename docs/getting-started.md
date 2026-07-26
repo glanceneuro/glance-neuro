@@ -56,20 +56,38 @@ bitstream must be re-staged into the path `boot.bif` references before running `
 
 Needs **Vivado + Vitis 2025.1**.
 
+The repo ships a bootable image at `blobs/BOOT.bin`, built from the source beside it, so
+you only need this if you are changing the design.
+
 ```bash
-# PL bitstream
+rm -rf vivado_project vitis_workspace BOOT.bin        # start clean -- see the warning below
+
 source <vivado>/settings64.sh
 vivado -mode batch -source scripts/create_vivado_project.tcl   # -> vivado_project/
-vivado -mode batch -source scripts/build_bitstream.tcl         # -> vivado_project/klab_project.xsa
+vivado -mode batch -source scripts/build_bitstream.tcl         # -> klab_project.xsa  (~15 min)
 
-# PS firmware (both cores)
 source <vitis>/settings64.sh
-vitis -s scripts/create_vitis_project.py     # platform + both apps (clean vitis_workspace/ first)
-vitis -s scripts/build_vitis_project.py      # incremental firmware-only rebuild
+vitis -s scripts/create_vitis_project.py     # platform from the NEW .xsa + both apps
+vitis -s scripts/build_vitis_project.py
+
+bootgen -image scripts/boot.bif -arch zynq -o BOOT.bin -w
 ```
-The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`. A PL-only change
-needs only a bitstream re-stage + `bootgen` (the firmware ELFs don't depend on PL clocks).
-Full build notes and gotchas are in [`../CLAUDE.md`](../CLAUDE.md).
+
+The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`.
+
+> **Start from a clean tree after a PL change.** `build_vitis_project.py` recompiles the
+> apps only — its `update_hw(...)` is commented out — and `scripts/boot.bif` packs the
+> bitstream from a *copy* under `vitis_workspace/`, not from the `.xsa`. Reusing an old
+> workspace therefore produces a perfectly valid image containing the **previous** fabric,
+> with no warning anywhere. After building, confirm the packed bitstream is the one you
+> just made:
+> ```bash
+> cmp vivado_project/klab_project.runs/impl_1/design_1_wrapper.bit \
+>     vitis_workspace/klab-firmware/_ide/bitstream/klab_project.bit
+> ```
+
+Build notes and the full verification checklist are in [`../CLAUDE.md`](../CLAUDE.md) and
+the `build-image` skill (`.claude/skills/build-image/`).
 
 ## 5. First connection
 
