@@ -33,8 +33,11 @@ These are not preferences. Violating one is a reason to stop and ask.
 
 **1. Never ship source and binary out of step.** Any commit touching
 `programmable_logic/` or `firmware/` carries a `blobs/BOOT.bin` built from that exact
-source. Use the `build-image` skill, which encodes the three ways this build silently
-ships stale artefacts. If you cannot build, refuse to commit and say why.
+source. Run `scripts/build.sh` — it is the only supported way to build, it decides for
+itself what needs rebuilding, and it verifies what it produced. Don't hand-run the
+underlying Vivado/Vitis steps: doing so is how stale artefacts get shipped, which is the
+whole reason that script exists. If it fails, bring the failure to the user rather than
+working around it, and refuse to commit.
 
 **2. Single-sample latency is the reason this exists.** One 30 kHz sample per
 datagram. Never propose batching samples, coalescing datagrams, jumbo frames, or an

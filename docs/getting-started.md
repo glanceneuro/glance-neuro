@@ -60,34 +60,24 @@ The repo ships a bootable image at `blobs/BOOT.bin`, built from the source besid
 you only need this if you are changing the design.
 
 ```bash
-rm -rf vivado_project vitis_workspace BOOT.bin        # start clean -- see the warning below
-
-source <vivado>/settings64.sh
-vivado -mode batch -source scripts/create_vivado_project.tcl   # -> vivado_project/
-vivado -mode batch -source scripts/build_bitstream.tcl         # -> klab_project.xsa  (~15 min)
-
-source <vitis>/settings64.sh
-vitis -s scripts/create_vitis_project.py     # platform from the NEW .xsa + both apps
-vitis -s scripts/build_vitis_project.py
-
-bootgen -image scripts/boot.bif -arch zynq -o BOOT.bin -w
+scripts/build.sh
 ```
 
+That is the whole build. It fingerprints the PL sources to decide whether the fabric needs
+re-synthesising (~18 min) or can be reused (~3 min), regenerates the firmware against the
+current hardware definition either way, produces `blobs/BOOT.bin`, and then checks what it
+made — timing closed, and the bitstream inside the image identical to the one
+implementation produced. It fails rather than emit an image it cannot vouch for.
+
+```bash
+scripts/build.sh --check      # say what would be rebuilt, change nothing
+scripts/build.sh --force-pl   # re-synthesise the PL even if unchanged
+```
+
+Needs **Vivado + Vitis 2025.1**; set `XILINX_ROOT` if they are not at `/opt/Xilinx/2025.1`.
 The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`.
 
-> **Start from a clean tree after a PL change.** `build_vitis_project.py` recompiles the
-> apps only — its `update_hw(...)` is commented out — and `scripts/boot.bif` packs the
-> bitstream from a *copy* under `vitis_workspace/`, not from the `.xsa`. Reusing an old
-> workspace therefore produces a perfectly valid image containing the **previous** fabric,
-> with no warning anywhere. After building, confirm the packed bitstream is the one you
-> just made:
-> ```bash
-> cmp vivado_project/klab_project.runs/impl_1/design_1_wrapper.bit \
->     vitis_workspace/klab-firmware/_ide/bitstream/klab_project.bit
-> ```
-
-Build notes and the full verification checklist are in [`../CLAUDE.md`](../CLAUDE.md) and
-the `build-image` skill (`.claude/skills/build-image/`).
+Copy `blobs/BOOT.bin` to the FAT32 boot partition of the SD card to flash it.
 
 ## 5. First connection
 
