@@ -1,6 +1,12 @@
-# GLANCE
+<table><tr>
+<td valign="middle"><img src="resources/logo.png" height="60" alt="GLANCE logo"></td>
+<td valign="middle">
 
-## **G**igabit **L**ow-latency **A**cquisition for **N**euroscience & **C**losed-loop **E**xperiments.
+# GLANCE
+**G**igabit **L**ow-latency **A**cquisition for **N**euroscience & **C**losed-loop **E**xperiments
+
+</td>
+</tr></table>
 
 An FPGA data-acquisition interface for **Intan RHD2000-style neural recording chips**, built
 on a **MicroZed** (Xilinx Zynq-7020) with a custom carrier PCB. The PL talks to up to two
