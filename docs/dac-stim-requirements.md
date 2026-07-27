@@ -380,29 +380,41 @@ master, ~37 min at mono 30 kS/s, hours at larger k). That requires a PL fetch pa
 and must not contend with the acquisition CDMA on the 33 µs budget. Phase 2 (§8);
 the v1 register map shall not preclude it (indices already 32-bit-clean).
 
-## 5. Recommended architecture (informative)
+## 5. Architecture notes (informative)
 
-Adopt the reference design's core (`spi_dac_controller_core` + `spi_ram_index_engine`
-+ `spi_frame_master`, MIT-licensed, proven on this carrier) as a new self-contained
-AXI-Lite peripheral in glance-neuro, with these deltas:
+The stimulus engine is a new self-contained AXI-Lite peripheral in the 84 MHz
+domain, following the repo's CDC and reset conventions (reset from
+`proc_sys_reset_0_84M`; toggle/2-FF crossings). Whether it reuses reference-design
+RTL or is written fresh is an implementation choice these requirements
+deliberately do not make. What **shall** carry over from the reference project is
+its bench-validated hardware facts:
 
-1. **Fixed 240 kf/s master + integer-divider register** replacing the compile-time
-   `CS_HIGH_CLKS` (R11–R13): frame period = 350·k clocks at 84 MHz, k ≥ 1.
+- **Pin constraints**: W18 (SCLK), R18 (SYNC_N), T17 (SDIN) — LVCMOS33, bank 34 —
+  tested on this carrier against this DAC. Do **not** carry the reference's debug
+  SPI mirror pins (W16/V16/W20): they collide with `digital_in_0[0..2]`.
+- **SPI electrical timing**: mode 1 (CPOL = 0, CPHA = 1) at 42 MHz (84 MHz ÷ 2),
+  CS_SETUP = 2 and CS_HOLD = 1 engine clocks — scope-verified.
+- **Playback semantics** (§3.2: START/LOOP/END, graceful stop, sticky errors) are
+  what the reference implements; its RTL can serve as an executable cross-check
+  in simulation.
+
+Blocks the implementation must provide, however built:
+
+1. **Frame-tick pacing**: fixed 240 kf/s master ÷ integer k (R11–R13), i.e. frame
+   period = 350·k clocks at 84 MHz, k ≥ 1.
 2. **Trigger block**: `digital_in_0` tap → sync/filter → line/polarity/mode mux →
-   start/stop pulses ORed with the AXI toggle pulses (R14–R17).
+   start/stop pulses merged with the software start/stop path (R14–R17).
 3. **Timestamp latches** on start/stop from the acquisition timestamp counter (R18).
-4. **Idle-code sequencer** for the stop path and STIM_ZERO (R19).
-5. **RAM_DEPTH = 16,384** (the reference default — ports unchanged), aperture as
-   in the reference (128 K); frame-RAM readback serves R3.
-6. Drop the debug SPI mirror (pin conflict with `digital_in_0[0..2]`); constraints
-   add only W18/R18/T17.
-7. New AXI-Lite base for the peripheral (registers + frame-RAM window in one
-   aperture, as in the reference). This needs a SmartConnect `NUM_MI` bump and an
-   `assign_bd_address` in the block design — both masters are currently fully
-   populated. Alternative (no BD change): fold registers into the existing
-   `axi_lite_registers` bank and upload via the toggle-strobe idiom — workable, but
-   forfeits memory-mapped readback (R3) and pushes ~16 K strobed writes through the
-   hot control path, so the dedicated aperture is preferred.
+4. **Idle-state sequencer** for the stop path, STIM_ZERO, and power-down (R19/R22).
+5. **Frame RAM**: 16,384 × 24-bit frames (one per 32-bit word), 128 K AXI aperture,
+   memory-mapped readback for R3.
+6. New AXI-Lite base for the peripheral (registers + frame-RAM window in one
+   aperture). This needs a SmartConnect `NUM_MI` bump and an `assign_bd_address`
+   in the block design — both masters are currently fully populated. Alternative
+   (no BD change): fold registers into the existing `axi_lite_registers` bank and
+   upload via the toggle-strobe idiom — workable, but forfeits memory-mapped
+   readback (R3) and pushes ~16 K strobed writes through the hot control path, so
+   the dedicated aperture is preferred.
 
 Firmware: `pl_stim.c` with typed helpers mirroring the `pl_*` conventions; command
 dispatch additions in `network.c`; upload sink for STIM_UPLOAD. All cold-path.
