@@ -2685,6 +2685,37 @@ def stim_upload(sock, frames, start_index=0, verify=True):
         print(f"[STIM] CRC verified 0x{local:08X}")
     return True
 
+def stim_dc(sock, volts_a=None, volts_b=None):
+    """Hold constant output level(s) with no ongoing SPI traffic.
+
+    Sets the requested level(s) as the driven idle codes, then plays a short
+    finite pass (wake + gain + the sample frames); when it completes, the
+    engine's stop path re-asserts the codes and sits idle with the outputs
+    actively driving them. A channel passed as None is driven to 0 V.
+    Revert with stim_dc_off (power-down idle restored) -- until then, any
+    stimulus that stops will also park at these codes."""
+    ca = dac_code(volts_a) if volts_a is not None else 0
+    cb = dac_code(volts_b) if volts_b is not None else 0
+    ok, _ = send_binary_command(sock, CMD_STIM_SET_IDLE, 1, (cb << 16) | ca)
+    if not ok:
+        return False
+    frames = list(STIM_WAKE_FRAMES)
+    frames.append((STIM_REG_DAC_A << 16) | ca)
+    frames.append((STIM_REG_DAC_B << 16) | cb)
+    if not stim_upload(sock, frames):
+        return False
+    send_binary_command(sock, CMD_STIM_SET_WINDOW, 0, len(frames) - 1)
+    send_binary_command(sock, CMD_STIM_SET_LOOP, 0, len(frames))
+    send_binary_command(sock, CMD_STIM_SET_RATE, 8)
+    ok, _ = send_binary_command(sock, CMD_STIM_START, 0)   # finite pass -> idle codes hold
+    return ok
+
+def stim_dc_off(sock):
+    """Back to the safe default: power-down idle, outputs -> 1 kOhm to AGND."""
+    send_binary_command(sock, CMD_STIM_SET_IDLE, 0, 0)
+    ok, _ = send_binary_command(sock, CMD_STIM_POWERDOWN)
+    return ok
+
 # STIM_GET_STATUS reply layout -- must match firmware stim_status_response_t
 STIM_STATUS_FORMAT = '<8I3Q3I'
 STIM_STATUS_SIZE = struct.calcsize(STIM_STATUS_FORMAT)   # 68 bytes
@@ -2935,6 +2966,7 @@ def tcp_control():
         print(f"         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
         print(f"  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
         print(f"  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
+        print(f"        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
         print(f"        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
         print(f"        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
         print(f"  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
@@ -3024,6 +3056,22 @@ def tcp_control():
                 elif cmd == "stim_trigger":
                     ok, _ = send_binary_command(sock, CMD_STIM_TRIGGER)
                     print("[STIM] triggered" if ok else "[STIM] trigger refused")
+                elif cmd == "stim_dc_off":
+                    print("[STIM] power-down idle restored" if stim_dc_off(sock)
+                          else "[STIM] stim_dc_off failed")
+                elif cmd.startswith("stim_dc"):
+                    try:
+                        parts = cmd.split()
+                        va = float(parts[1])
+                        vb = float(parts[2]) if len(parts) > 2 else None
+                        if stim_dc(sock, va, vb):
+                            print(f"[STIM] holding DAC-A at {va} V"
+                                  + (f", DAC-B at {vb} V" if vb is not None else ", DAC-B at 0 V")
+                                  + " (stim_dc_off to release)")
+                        else:
+                            print("[STIM] stim_dc failed (acquisition streaming? check stim_status)")
+                    except (ValueError, IndexError):
+                        print("Usage: stim_dc <volts_a> [volts_b] | stim_dc_off")
                 elif cmd == "stim_zero":
                     send_binary_command(sock, CMD_STIM_ZERO)
                 elif cmd == "stim_powerdown":
