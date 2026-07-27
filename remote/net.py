@@ -10,6 +10,7 @@ import time
 import random
 import queue
 import math
+import zlib
 import ipaddress
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -254,6 +255,25 @@ CMD_LFP_WRITE_COEF = 0x83   # param1 = [0] clear-ptr-first | [1] stage; param2 =
 LFP_STAGE_HALFBAND = 0      # stage 1: 11-tap halfband, 30 -> 15 kHz
 LFP_STAGE_DECIMATOR = 1     # stage 2: <=120-tap decimator, 15 -> 3 kHz
 CMD_PERF_RESET = 0x91       # clear recv->transmit sticky maxes + histogram + counts
+
+# DAC70502 stimulus playback (docs/dac-stim-requirements.md; PL stim_top)
+CMD_STIM_SET_WINDOW   = 0xA0  # param1 = start_index; param2 = end_index
+CMD_STIM_SET_LOOP     = 0xA1  # param1 = loop_index;  param2 = frame_count (finite total; 0 with continuous)
+CMD_STIM_SET_RATE     = 0xA2  # param1 = divider k (frame rate = 240 kf/s / k)
+CMD_STIM_SET_TRIGGER  = 0xA3  # param1 = line|pol<<3|mode<<4|retrig<<6|arm<<7; param2 = min_pulse_us
+CMD_STIM_START        = 0xA4  # param1 = 0 finite / 1 continuous
+CMD_STIM_STOP         = 0xA5
+CMD_STIM_TRIGGER      = 0xA6  # software single-shot (finite start)
+CMD_STIM_ZERO         = 0xA7  # force configured idle state now (disarms hw trigger)
+CMD_STIM_UPLOAD_BEGIN = 0xA8  # param1 = start_index; param2 = total word count
+CMD_STIM_WRITE        = 0xA9  # param1/param2 = two frame words (auto-increment)
+CMD_STIM_VERIFY       = 0xAA  # param1 = offset; param2 = count -> 4-byte CRC32 reply
+CMD_STIM_GET_STATUS   = 0xAB  # -> stim_status struct
+CMD_STIM_SET_IDLE     = 0xAC  # param1 = 1 drive codes / 0 power-down; param2 = codeB<<16|codeA
+CMD_STIM_POWERDOWN    = 0xAD  # outputs -> 1k to AGND (disarms hw trigger)
+
+STIM_RAM_DEPTH = 16384
+STIM_MASTER_RATE_HZ = 240000.0   # 84 MHz / 350, fixed in the PL
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
@@ -1595,8 +1615,15 @@ def send_binary_command(sock, cmd_id, param1=0, param2=0, timeout=0.5):
             if len(response) == 5:
                 data_len = (response[3] << 8) | response[4]
                 if data_len > 0:
-                    # Read the data
-                    data = sock.recv(data_len)
+                    # Read the whole payload: one recv() is not guaranteed to
+                    # return data_len bytes (a 68/288-byte status can split),
+                    # and a short read here desyncs every later ack.
+                    data = b''
+                    while len(data) < data_len:
+                        part = sock.recv(data_len - len(data))
+                        if not part:
+                            break
+                        data += part
                     return (True, data)
             
             return (True, None)
@@ -2507,6 +2534,217 @@ def manual_cable_test(sock):
         manual_cable_test_mode = False
 
 # ============================================================================
+# DAC70502 stimulus playback (PL stim_top peripheral)
+# ============================================================================
+# Frames are 24-bit DAC70502 SPI words stored one per 32-bit RAM entry:
+# register byte in [23:16], 16-bit MSB-aligned data in [15:0]. The PL plays
+# them at 240 kf/s / k. Channel modes are upload conventions, not engine
+# features -- see docs/dac-stim-requirements.md section 3.8.
+
+STIM_REG_DAC_A   = 0x08
+STIM_REG_DAC_B   = 0x09
+STIM_REG_SYNC    = 0x02
+STIM_REG_CONFIG  = 0x03
+STIM_REG_GAIN    = 0x04
+STIM_REG_TRIGGER = 0x05
+STIM_FRAME_WAKE  = (STIM_REG_CONFIG << 16) | 0x0000   # exit power-down
+# REF-DIV=1, both buffers gain 2 -> 2.5 V full-scale. The power-on default
+# (REF-DIV=0, gain 2) means 5 V full-scale, which both breaks dac_code()'s
+# 2.5 V assumption and violates the reference-headroom rule at VDD=3.3 V
+# (datasheet 8.3.2: REF-ALARM trips and the outputs force to 0 V). The
+# reference project's init wrote this same value for the same reason.
+STIM_FRAME_GAIN  = (STIM_REG_GAIN << 16) | 0x0103
+STIM_FRAME_LDAC  = (STIM_REG_TRIGGER << 16) | 0x0010  # TRIGGER.LDAC
+STIM_WAKE_FRAMES = [STIM_FRAME_WAKE, STIM_FRAME_GAIN]
+
+def dac_code(volts, full_scale=2.5):
+    """Volts -> 16-bit MSB-aligned DAC70502 code (14-bit device).
+    full_scale must match the GAIN/REF-DIV configuration (default 2.5 V)."""
+    code14 = round(max(0.0, min(1.0, volts / full_scale)) * 16383)
+    return (code14 << 2) & 0xFFFC
+
+def stim_frames_mono(codes, channel='A', wake=True):
+    """One frame per sample on a single DAC channel. Per-channel rate = 240k/k."""
+    reg = STIM_REG_DAC_A if channel.upper() == 'A' else STIM_REG_DAC_B
+    frames = list(STIM_WAKE_FRAMES) if wake else []
+    frames += [(reg << 16) | (c & 0xFFFC) for c in codes]
+    return frames
+
+def stim_frames_interleaved(codes_a, codes_b, wake=True, skew_compensate=False):
+    """A,B,A,B... Per-channel rate = 120k/k; B lags A by one frame period.
+    skew_compensate shifts the B sequence forward half a sample (nearest
+    neighbour) so the two analog outputs align in time on average."""
+    if len(codes_a) != len(codes_b):
+        raise ValueError("stereo waveforms must be equal length")
+    b = list(codes_b)
+    if skew_compensate and len(b) > 1:
+        b = b[1:] + b[-1:]   # crude half-sample advance: use the next sample
+    frames = list(STIM_WAKE_FRAMES) if wake else []
+    for ca, cb in zip(codes_a, b):
+        frames.append((STIM_REG_DAC_A << 16) | (ca & 0xFFFC))
+        frames.append((STIM_REG_DAC_B << 16) | (cb & 0xFFFC))
+    return frames
+
+def stim_frames_ldac(codes_a, codes_b, wake=True):
+    """A,B,LDAC triplets: both outputs step simultaneously. Per-channel rate
+    = 80k/k. Prepends the SYNC-register frame that arms synchronous mode."""
+    if len(codes_a) != len(codes_b):
+        raise ValueError("stereo waveforms must be equal length")
+    frames = list(STIM_WAKE_FRAMES) if wake else []
+    frames.append((STIM_REG_SYNC << 16) | 0x0003)   # DAC-A/B SYNC-EN
+    for ca, cb in zip(codes_a, codes_b):
+        frames.append((STIM_REG_DAC_A << 16) | (ca & 0xFFFC))
+        frames.append((STIM_REG_DAC_B << 16) | (cb & 0xFFFC))
+        frames.append(STIM_FRAME_LDAC)
+    return frames
+
+def gaussian_pulse_codes(amplitude_v, sigma_ms, rate_hz, baseline_v=0.0,
+                         full_scale=2.5, span_sigmas=4.0):
+    """Sampled Gaussian pulse, span_sigmas either side of the peak."""
+    n = max(3, int(round(2 * span_sigmas * sigma_ms * 1e-3 * rate_hz)) | 1)
+    mid = (n - 1) / 2.0
+    sig = sigma_ms * 1e-3 * rate_hz
+    return [dac_code(baseline_v + amplitude_v * math.exp(-0.5 * ((i - mid) / sig) ** 2),
+                     full_scale) for i in range(n)]
+
+def stim_crc32(frames):
+    """The upload-integrity CRC: zlib CRC32 over the little-endian words."""
+    return zlib.crc32(struct.pack('<%dI' % len(frames), *frames)) & 0xFFFFFFFF
+
+def stim_upload(sock, frames, start_index=0, verify=True):
+    """Upload frames into the PL stimulus RAM, pipelined, then CRC-verify.
+
+    The board acks every command; we pipeline the writes (send them all
+    without waiting) and then drain the 3-byte acks in order, matching
+    ack_ids -- TCP guarantees ordering, so any mismatch means a real
+    protocol fault, not reordering. Uploads are rejected by firmware while
+    acquisition is streaming (and by the PL while playback runs)."""
+    n = len(frames)
+    if n == 0:
+        raise ValueError("no frames")
+    if start_index + n > STIM_RAM_DEPTH:
+        raise ValueError(f"frames [{start_index}..{start_index+n}) exceed RAM depth {STIM_RAM_DEPTH}")
+
+    # Drain anything stale (e.g. the ack of a previously timed-out command):
+    # the pipelined drain below counts raw bytes, and one leftover ack would
+    # shift every id comparison.
+    sock.setblocking(False)
+    try:
+        while sock.recv(4096):
+            pass
+    except (BlockingIOError, InterruptedError):
+        pass
+    finally:
+        sock.setblocking(True)
+
+    ok, _ = send_binary_command(sock, CMD_STIM_UPLOAD_BEGIN, start_index, n)
+    if not ok:
+        print("[STIM] upload begin refused (acquisition streaming or playback running?)")
+        return False
+
+    padded = frames + [0] if n % 2 else frames
+    ack_ids = []
+    chunks = []
+    for i in range(0, len(padded), 2):
+        ack_id = ((i >> 1) & 0x7FFF) + 1
+        ack_ids.append(ack_id)
+        chunks.append(struct.pack('<IIIII', CMD_MAGIC, CMD_STIM_WRITE,
+                                  ack_id, padded[i], padded[i + 1]))
+    t0 = time.time()
+    sock.settimeout(5.0)
+    try:
+        sock.sendall(b''.join(chunks))
+        need = 3 * len(ack_ids)
+        buf = bytearray()
+        while len(buf) < need:
+            part = sock.recv(need - len(buf))
+            if not part:
+                print("[STIM] connection closed during upload")
+                return False
+            buf += part
+    finally:
+        sock.settimeout(None)
+    for idx, ack_id in enumerate(ack_ids):
+        got = (buf[3 * idx] << 8) | buf[3 * idx + 1]
+        if got != ack_id or buf[3 * idx + 2] != ACK_SUCCESS:
+            print(f"[STIM] write {idx} bad ack (id {got} vs {ack_id}, status 0x{buf[3*idx+2]:02X})")
+            return False
+    dt = time.time() - t0
+    print(f"[STIM] uploaded {n} frames in {dt*1000:.0f} ms ({n/max(dt,1e-9):.0f} frames/s)")
+
+    if verify:
+        ok, data = send_binary_command(sock, CMD_STIM_VERIFY, start_index, n, timeout=5.0)
+        if not ok or data is None or len(data) < 4:
+            print("[STIM] verify command failed")
+            return False
+        board = struct.unpack('<I', data[:4])[0]
+        local = stim_crc32(frames)
+        if board != local:
+            print(f"[STIM] CRC MISMATCH board=0x{board:08X} local=0x{local:08X}")
+            return False
+        print(f"[STIM] CRC verified 0x{local:08X}")
+    return True
+
+# STIM_GET_STATUS reply layout -- must match firmware stim_status_response_t
+STIM_STATUS_FORMAT = '<8I3Q3I'
+STIM_STATUS_SIZE = struct.calcsize(STIM_STATUS_FORMAT)   # 68 bytes
+
+def stim_get_status(sock):
+    ok, data = send_binary_command(sock, CMD_STIM_GET_STATUS)
+    if not ok or data is None or len(data) < STIM_STATUS_SIZE:
+        return None
+    f = struct.unpack(STIM_STATUS_FORMAT, data[:STIM_STATUS_SIZE])
+    return {
+        'status_raw': f[0],
+        'running': bool(f[0] & 1), 'busy': bool(f[0] & 2),
+        'armed': bool(f[0] & 4), 'cfg_valid': bool(f[0] & 8),
+        'sticky_ram_write': bool(f[0] & 16), 'sticky_bad_start': bool(f[0] & 32),
+        'idle_seq_active': bool(f[0] & 64), 'digital_in': (f[0] >> 8) & 0xFF,
+        'mode': f[1], 'rate_k': f[2], 'start_index': f[3], 'end_index': f[4],
+        'loop_index': f[5], 'frame_count': f[6], 'current_index': f[7],
+        'completed': f[8], 'ts_start': f[9], 'ts_stop': f[10],
+        'idle_codes': f[11], 'ram_depth': f[12], 'version': f[13],
+    }
+
+def print_stim_status(s):
+    if not s:
+        print("[STIM] no status")
+        return
+    rate = STIM_MASTER_RATE_HZ / max(1, s['rate_k'])
+    print(f"[STIM] running={s['running']} armed={s['armed']} idle_seq={s['idle_seq_active']} "
+          f"cfg_valid={s['cfg_valid']}")
+    print(f"[STIM] window {s['start_index']}..{s['end_index']} loop@{s['loop_index']} "
+          f"count={s['frame_count']} k={s['rate_k']} ({rate:.0f} f/s)")
+    print(f"[STIM] current={s['current_index']} completed={s['completed']} "
+          f"ts_start={s['ts_start']} ts_stop={s['ts_stop']}")
+    if s['sticky_ram_write'] or s['sticky_bad_start']:
+        print(f"[STIM] STICKY: ram_write_while_running={s['sticky_ram_write']} "
+              f"bad_start={s['sticky_bad_start']}")
+    print(f"[STIM] digital_in=0x{s['digital_in']:02X} ram_depth={s['ram_depth']} "
+          f"version=0x{s['version']:08X}")
+
+def stim_play(sock, frames, rate_k=8, continuous=False, start_index=0):
+    """Upload + configure + start in one call. Loop wraps past the wake/init
+    frames: the loop region re-plays only the sample frames."""
+    if not stim_upload(sock, frames, start_index):
+        return False
+    # Init frames = everything before the first DAC-data write (any register
+    # that is not a channel/broadcast data write is setup: CONFIG, SYNC, GAIN,
+    # ...). Counting only known setup registers would silently mis-place the
+    # loop point for waveforms that configure e.g. GAIN.
+    n_init = 0
+    while n_init < len(frames) and \
+            (frames[n_init] >> 16) not in (STIM_REG_DAC_A, STIM_REG_DAC_B, 0x06):
+        n_init += 1
+    end = start_index + len(frames) - 1
+    send_binary_command(sock, CMD_STIM_SET_WINDOW, start_index, end)
+    send_binary_command(sock, CMD_STIM_SET_LOOP, start_index + n_init,
+                        0 if continuous else len(frames))
+    send_binary_command(sock, CMD_STIM_SET_RATE, rate_k)
+    ok, _ = send_binary_command(sock, CMD_STIM_START, 1 if continuous else 0)
+    return ok
+
+# ============================================================================
 # AUTOMATED CABLE DETECTION FUNCTION
 # ============================================================================
 
@@ -2696,6 +2934,9 @@ def tcp_control():
         print(f"  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
         print(f"         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
         print(f"  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
+        print(f"  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
+        print(f"        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
+        print(f"        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
         print(f"  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
         print(f"  auto_cable_detect - Automated cable detection!")
         print(f"  Aux: aux_demo, aux_bank <slot> <bank>, aux")
@@ -2738,6 +2979,82 @@ def tcp_control():
                 elif cmd == "perf_reset":
                     ok, _ = send_binary_command(sock, CMD_PERF_RESET)
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
+                elif cmd == "stim_status":
+                    print_stim_status(stim_get_status(sock))
+                elif cmd.startswith("stim_gaussian"):
+                    try:
+                        parts = cmd.split()
+                        amp = float(parts[1]) if len(parts) > 1 else 1.0
+                        sigma = float(parts[2]) if len(parts) > 2 else 5.0
+                        k = int(parts[3]) if len(parts) > 3 else 8
+                        rate = STIM_MASTER_RATE_HZ / k
+                        codes = gaussian_pulse_codes(amp, sigma, rate)
+                        frames = stim_frames_mono(codes, 'A')
+                        print(f"[STIM] gaussian: {amp} V, sigma {sigma} ms, "
+                              f"{len(codes)} samples at {rate:.0f} S/s")
+                        if stim_play(sock, frames, rate_k=k, continuous=False):
+                            print("[STIM] single-shot started")
+                    except (ValueError, IndexError):
+                        print("Usage: stim_gaussian [amp_v] [sigma_ms] [k]")
+                elif cmd.startswith("stim_sine"):
+                    try:
+                        parts = cmd.split()
+                        freq = float(parts[1]) if len(parts) > 1 else 10.0
+                        amp = float(parts[2]) if len(parts) > 2 else 1.0
+                        k = int(parts[3]) if len(parts) > 3 else 8
+                        rate = STIM_MASTER_RATE_HZ / k
+                        n = max(2, int(round(rate / freq)))
+                        if n > STIM_RAM_DEPTH - 1:
+                            print(f"[STIM] {n} samples/cycle won't fit; raise k")
+                        else:
+                            codes = [dac_code(amp / 2 * (1 + math.sin(2 * math.pi * i / n)))
+                                     for i in range(n)]
+                            print(f"[STIM] sine: {rate/n:.2f} Hz actual, {n} samples/cycle, looping")
+                            if stim_play(sock, stim_frames_mono(codes, 'A'),
+                                         rate_k=k, continuous=True):
+                                print("[STIM] continuous loop started")
+                    except (ValueError, IndexError):
+                        print("Usage: stim_sine [hz] [amp_v] [k]")
+                elif cmd.startswith("stim_start"):
+                    cont = 1 if "cont" in cmd else 0
+                    ok, _ = send_binary_command(sock, CMD_STIM_START, cont)
+                    print("[STIM] started" if ok else "[STIM] start refused (check stim_status)")
+                elif cmd == "stim_stop":
+                    send_binary_command(sock, CMD_STIM_STOP)
+                elif cmd == "stim_trigger":
+                    ok, _ = send_binary_command(sock, CMD_STIM_TRIGGER)
+                    print("[STIM] triggered" if ok else "[STIM] trigger refused")
+                elif cmd == "stim_zero":
+                    send_binary_command(sock, CMD_STIM_ZERO)
+                elif cmd == "stim_powerdown":
+                    send_binary_command(sock, CMD_STIM_POWERDOWN)
+                elif cmd.startswith("stim_rate "):
+                    try:
+                        k = int(cmd.split()[1])
+                        ok, _ = send_binary_command(sock, CMD_STIM_SET_RATE, k)
+                        if ok:
+                            print(f"[STIM] k={k}: {STIM_MASTER_RATE_HZ/k:.1f} f/s "
+                                  f"(mono {STIM_MASTER_RATE_HZ/k:.0f}, "
+                                  f"interleaved {STIM_MASTER_RATE_HZ/k/2:.0f}, "
+                                  f"ldac {STIM_MASTER_RATE_HZ/k/3:.0f} S/s per ch)")
+                    except (ValueError, IndexError):
+                        print("Usage: stim_rate <k>")
+                elif cmd.startswith("stim_arm"):
+                    try:
+                        parts = cmd.split()
+                        line = int(parts[1])
+                        mode = {'edge': 1, 'gate': 2}[parts[2]]
+                        pol = int(parts[3]) if len(parts) > 3 else 0
+                        mp_us = int(parts[4]) if len(parts) > 4 else 1
+                        retrig = int(parts[5]) if len(parts) > 5 else 0
+                        p1 = (line & 7) | (pol << 3) | (mode << 4) | (retrig << 6) | (1 << 7)
+                        ok, _ = send_binary_command(sock, CMD_STIM_SET_TRIGGER, p1, mp_us)
+                        print(f"[STIM] armed line {line} {parts[2]}" if ok else "[STIM] arm failed")
+                    except (ValueError, IndexError, KeyError):
+                        print("Usage: stim_arm <line 0-7> <edge|gate> [pol] [minpulse_us] [retrig]")
+                elif cmd == "stim_disarm":
+                    ok, _ = send_binary_command(sock, CMD_STIM_SET_TRIGGER, 0, 1)
+                    print("[STIM] disarmed" if ok else "[STIM] disarm failed")
                 elif cmd == "ping":
                     ping(sock)
                 elif cmd.startswith("loop "):

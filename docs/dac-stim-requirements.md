@@ -342,12 +342,12 @@ explicit desync/timeout story — as a follow-on change.**
 
 ## 4. Memory budget — how long can a stimulus be?
 
-Device: XC7Z020 — **140 BRAM36 tiles** total. Current design usage from the last
-build's placed utilization report: 16 RAMB36 + 2 RAMB18 (capture BRAM + LFP filter
-delay lines). The LFP *output* BRAM now in source adds ~16 RAMB36 (report predates
-it; rebuild to confirm), giving **~33 tiles used, ~107 free (~76%)**. LUTs are at
-21%, FFs 17%, and **all 220 DSP48s are free** — BRAM is the only budget that
-matters here.
+Device: XC7Z020 — **140 BRAM36 tiles** total. Measured from a clean rebuild of
+current source (2026-07-27, LFP output BRAM included): **53.5 tiles used
+(48 RAMB36 + 11 RAMB18, 38%) — ~86 tiles free**. LUTs at 26%, and all 220
+DSP48s free — BRAM is the only budget that matters here. These are measured
+numbers from a placed utilization report, not source-derived estimates; re-check
+them after any change that adds memories.
 
 Frame storage is one 32-bit word per 24-bit frame → 1024 frames per BRAM36.
 
@@ -363,7 +363,7 @@ Loop duration = frames × k / 240 kf/s, i.e. 68.3 ms × k for a full 16 K RAM:
 | **cap (chosen)** | **16 (11%)** | **16,384** | **68 ms** | **0.55 s** | **16.4 s** | **164 s** |
 
 Durations are wall-clock loop lengths and are mode-agnostic (stereo halves the
-per-channel sample count, not the duration). At 16 tiles, ~91 tiles (~65% of the
+per-channel sample count, not the duration). At 16 tiles, ~70 tiles (~50% of the
 device) remain free after the acquisition BRAMs. For scale: a 5 ms Gaussian pulse
 at mono 30 kS/s is 150 frames — under 1% of the RAM (1,200 frames / 7% at the
 full master rate). A stimulus that overflows the RAM at the desired rate is the

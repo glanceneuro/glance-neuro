@@ -30,6 +30,10 @@ module data_generator #(
     // Digital input (eventually should add analog input here!)
     input  wire [7:0]  digital_in,
 
+    // Live master sample count, exported for the stimulus engine's start/stop
+    // timestamp latches (same 84 MHz domain -- no CDC on the consumer side).
+    output wire [63:0] master_timestamp,
+
     // BRAM Port A interface (32-bit)
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA CLK" *)
     output wire            bram_clk,
@@ -136,6 +140,7 @@ module data_generator #(
     wire [5:0]   dsp_sample_slot;
     wire         dsp_packet_tick;
     wire [63:0]  dsp_master_timestamp;   // live master sample count (LFP frame stamp)
+    assign master_timestamp = dsp_master_timestamp;
     wire [7:0]   dsp_channel_enable;     // broadband mask -> LFP lane_mask (single source)
     wire [15:0]  lfp_wr_addr;
     wire         lfp_overrun;
