@@ -1,12 +1,13 @@
-<table><tr>
-<td valign="middle"><img src="resources/logo.png" height="60" alt="GLANCE logo"></td>
-<td valign="middle">
+<div align="center">
 
-# GLANCE
-**G**igabit **L**ow-latency **A**cquisition for **N**euroscience & **C**losed-loop **E**xperiments
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="resources/logo-darkmode.png">
+  <img src="resources/logo.png" alt="GLANCE — Gigabit Low-latency Acquisition for Neuroscience & Closed-loop Experiments" width="680">
+</picture>
 
-</td>
-</tr></table>
+by the [Kemere Lab](https://kemerelab.com) at [Rice University](https://neuroengineering.rice.edu)
+
+</div>
 
 An FPGA data-acquisition interface for **Intan RHD2000-style neural recording chips**, built
 on a **MicroZed** (Xilinx Zynq-7020) with a custom carrier PCB. The PL talks to up to two
