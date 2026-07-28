@@ -294,7 +294,8 @@ def detect_imu(sock):
     detect bitstream's two AXI IIC controllers) and print a per-port verdict."""
     ok, data = send_binary_command(sock, CMD_DETECT_IMU, timeout=2.0)
     if not ok or data is None or len(data) < 12:
-        print("[DETECT] no/short response -- is the detect bitstream loaded?")
+        print("[DETECT] no fabric to probe -- baked detect image not loaded, or the "
+              "deferred-boot image has a blank PL (run load_pl detect first).")
         return None
     ra, rb, ver = struct.unpack('<III', data[:12])
     if ver != IMUDET_VERSION:
@@ -316,6 +317,42 @@ def detect_imu(sock):
         else:
             print(f"Port {port}: no IMU (nothing answered at 0x28) {diag}")
     return res
+
+# Deferred PL load (step 2, docs/deferred-boot.md): the loader image boots with a
+# blank PL and programs a fabric from the SD card via PCAP on command.
+CMD_LOAD_PL = 0xB2
+PL_LOAD_VERSION = 0x4C4F4144   # "LOAD"
+PL_IMAGES = {"detect": 0}      # name -> param1 selector (firmware pl_image_name)
+_PL_STATUS = {
+    0: "ok", 1: "SD mount failed", 2: "bitstream not found on SD",
+    3: "SD read failed", 4: "empty bitstream file", 5: "bitstream too large",
+    6: "devcfg init failed", 7: "fabric init timeout", 8: "PCAP transfer rejected",
+    9: "PCAP DMA never done", 10: "FPGA done never asserted", 11: "PCAP error flags set",
+    0xFFFFFFFF: "unknown image selector",
+}
+
+def load_pl(sock, name="detect"):
+    """Ask the loader image to program a fabric from SD via PCAP. `name` picks the
+    <name>.bin file on the SD card (must be in PL_IMAGES)."""
+    if name not in PL_IMAGES:
+        print(f"[LOAD] unknown image '{name}'; known: {', '.join(sorted(PL_IMAGES))}")
+        return None
+    # PCAP program + a multi-MB SD read can take a couple of seconds; be generous.
+    ok, data = send_binary_command(sock, CMD_LOAD_PL, param1=PL_IMAGES[name], timeout=15.0)
+    if not ok or data is None or len(data) < 12:
+        print("[LOAD] no/short response -- is the loader (deferred-boot) image running?")
+        return None
+    status, nbytes, ver = struct.unpack('<III', data[:12])
+    if ver != PL_LOAD_VERSION:
+        print(f"[LOAD] unexpected version 0x{ver:08X} (expected 0x{PL_LOAD_VERSION:08X}); "
+              f"wrong image?")
+    msg = _PL_STATUS.get(status, f"error {status}")
+    if status == 0:
+        print(f"Loaded '{name}.bin' into the PL: {nbytes} bytes, PCAP OK. "
+              f"The fabric is live -- try detect_imu.")
+    else:
+        print(f"Load of '{name}.bin' FAILED: {msg} (status={status}, {nbytes} bytes read)")
+    return {"status": status, "bytes": nbytes}
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
@@ -3008,6 +3045,7 @@ def tcp_control():
         print(f"         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
         print(f"  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
         print(f"  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
+        print(f"  PL:  load_pl [name]  (deferred-boot image: program a fabric from SD via PCAP; default 'detect')")
         print(f"  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
         print(f"        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
         print(f"        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
@@ -3056,6 +3094,9 @@ def tcp_control():
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
                 elif cmd == "detect_imu":
                     detect_imu(sock)
+                elif cmd == "load_pl" or cmd.startswith("load_pl "):
+                    parts = cmd.split()
+                    load_pl(sock, parts[1] if len(parts) > 1 else "detect")
                 elif cmd == "stim_status":
                     print_stim_status(stim_get_status(sock))
                 elif cmd.startswith("stim_gaussian"):

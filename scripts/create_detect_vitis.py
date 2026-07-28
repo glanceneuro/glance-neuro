@@ -25,6 +25,9 @@ domain = platform.get_domain(name='standalone_ps7_cortexa9_0')
 domain.set_config('lib', lib_name='xiltimer', param='XILTIMER_tick_timer', value='ps7_scutimer_0')
 domain.set_lib('lwip220')
 domain.set_config('lib', lib_name='lwip220', param='lwip220_no_sys_no_timers', value='false')
+# xilffs (FatFs) for reading bitstream files off the SD card in the deferred-load
+# path (pl_loader.c). Short 8.3 names only, so no long-filename support needed.
+domain.set_lib('xilffs')
 
 app = client.create_app_component(
     name="klab-detect",

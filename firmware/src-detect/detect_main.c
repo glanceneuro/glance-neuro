@@ -24,6 +24,7 @@
 
 #include "platform.h"
 #include "pl_imu_detect.h"
+#include "pl_loader.h"
 // eth_link_detect() is declared by netif/xadapter.h (the lwIP EMAC adapter).
 
 #define TCP_PORT         0x6900
@@ -38,8 +39,33 @@
 
 #define CMD_PING         0x60
 #define CMD_DETECT_IMU   0xB0
+#define CMD_LOAD_PL      0xB2
+
+#define PL_LOAD_VERSION  0x4C4F4144   // "LOAD"
+
+// Host param1 -> bitstream file on the SD card (without the .bin suffix). Kept a
+// small fixed table so the 20-byte command frame needs no string field.
+static const char *pl_image_name(uint32_t idx) {
+    switch (idx) {
+        case 0:  return "detect";
+        default: return NULL;
+    }
+}
+
+// CMD_LOAD_PL reply (12 bytes), decoded by net.py load_pl().
+typedef struct __attribute__((packed)) {
+    uint32_t status;   // 0 = ok, else pl_status_t; 0xFFFFFFFF = unknown selector
+    uint32_t bytes;    // bitstream bytes programmed
+    uint32_t version;  // PL_LOAD_VERSION
+} pl_load_response_t;
+_Static_assert(sizeof(pl_load_response_t) == 12, "pl load reply must stay 12 bytes");
 
 struct netif server_netif;
+
+// Whether a PL fabric is currently live. In the deferred-boot image the PL is
+// blank until CMD_LOAD_PL, so touching the detect peripheral's AXI (0x43D00000)
+// before then would hang the core -- guard CMD_DETECT_IMU on this.
+static int pl_ready = 0;
 
 // lwIP's timer subsystem needs a millisecond tick (same as the acquisition fw).
 uint32_t sys_now(void) {
@@ -91,12 +117,38 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             send_ack(tpcb, cmd->ack_id, ACK_SUCCESS);
             break;
         case CMD_DETECT_IMU: {
+            if (!pl_ready) {
+                // No fabric loaded -- refuse rather than hang on blank-PL AXI.
+                // net.py reports this and points at load_pl.
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                break;
+            }
             imu_detect_response_t resp;
             int rc = pl_imu_detect_run(&resp);
             // Reply with the struct regardless (rc<0 => PL never reported done,
             // results zeroed); net.py flags the version mismatch / absence.
             (void)rc;
             send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
+            break;
+        }
+        case CMD_LOAD_PL: {
+            // Deferred load: program a fabric from SD via PCAP (docs/deferred-boot.md).
+            pl_load_response_t r = { .status = 0xFFFFFFFFu, .bytes = 0,
+                                     .version = PL_LOAD_VERSION };
+            const char *nm = pl_image_name(cmd->param1);
+            if (nm) {
+                uint32_t bytes = 0;
+                pl_status_t st = pl_loader_load(nm, &bytes);
+                r.status = (uint32_t)st;
+                r.bytes  = bytes;
+                if (st == PL_OK) pl_ready = 1;   // fabric is now live
+                xil_printf("LOAD_PL '%s': %s (%lu bytes)\r\n",
+                           nm, pl_status_str(st), (unsigned long)bytes);
+            } else {
+                xil_printf("LOAD_PL: unknown image selector %lu\r\n",
+                           (unsigned long)cmd->param1);
+            }
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
             break;
         }
         default:
@@ -191,6 +243,17 @@ int main(void) {
         eth_link_detect(&server_netif);
     }
     xil_printf("Network link UP. IP 192.168.18.10, TCP port 0x%04X\r\n", TCP_PORT);
+
+    // Deferred-load path: init PCAP + mount SD so CMD_LOAD_PL can program a
+    // fabric from the card. Non-fatal if there is no SD (the baked-in detect
+    // image needs neither); the load command retries the mount.
+    int lr = pl_loader_init();
+    // A fabric baked into the boot image is already live (PCFG_DONE); a
+    // deferred-boot image starts blank and needs CMD_LOAD_PL first.
+    pl_ready = (lr == 0) ? pl_loader_pl_configured() : 0;
+    xil_printf("PL loader: %s; fabric %s\r\n",
+               lr == 0 ? "ready (SD mounted, PCAP init)" : pl_status_str((pl_status_t)(-lr)),
+               pl_ready ? "LIVE at boot" : "blank -- run load_pl");
 
     start_tcp_server();
     beacon_init();
