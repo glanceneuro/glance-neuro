@@ -108,6 +108,10 @@ Measure before theorising. This is the lesson that cost the most.
 - Source files carry SPDX headers. This repo is MIT; the plugin repo is GPL-3 and the
   hardware repo is CERN-OHL-P. When moving code between them, keep the destination's
   header — copying a file verbatim from another tree silently strips it.
-- Plain forward commits. Don't rebase shared branches.
-- Commit or push only when asked. No AI attribution trailers.
+- Plain forward commits. Don't rebase shared branches. No AI attribution trailers.
+- **Always push your work; never leave it local, never push straight to `main`.** The
+  build host sits in the lab but has no link to the board (separate subnet, no JTAG, no
+  SD card), so the user can only test what has been pushed — unpushed work is
+  untestable. Stage everything on a `testing/<topic>` branch to keep `main` and other
+  shared branches clean; the user pulls that branch to flash and test.
 - See `docs/TESTING.md` for what earns a test and what gets retired.

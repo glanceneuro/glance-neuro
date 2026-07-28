@@ -22,10 +22,14 @@
 // Per-port result word (packed into the CMD_DETECT_IMU reply):
 //   [0] present (device ACKed AND chip_id == 0xA0)
 //   [1] ack     (device ACKed its address at 0x28)
-//   [15:8] chip_id byte read back
+//   [15:8]  chip_id byte read back
+//   [31:24] AXI IIC Status Register (post-init) — diagnostic. A live core reads
+//           its reset value (~0xC0, both FIFOs empty); 0x00/0xFF means the base
+//           address is wrong or the controller isn't there.
 #define IMUDET_R_PRESENT (1u << 0)
 #define IMUDET_R_ACK     (1u << 1)
 #define IMUDET_R_ID_SHIFT 8
+#define IMUDET_R_SR_SHIFT 24
 
 // 12-byte reply, decoded by net.py detect_imu().
 typedef struct __attribute__((packed)) {

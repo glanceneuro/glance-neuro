@@ -286,6 +286,7 @@ def _decode_imu_result(word):
         'present': bool(word & 0x1),   # ACKed AND chip_id == 0xA0
         'ack':     bool(word & 0x2),   # a device ACKed its address at 0x28
         'chip_id': (word >> 8) & 0xFF,
+        'iic_sr':  (word >> 24) & 0xFF,  # AXI IIC status reg post-init (diag)
     }
 
 def detect_imu(sock):
@@ -302,13 +303,18 @@ def detect_imu(sock):
     res = {'A': _decode_imu_result(ra), 'B': _decode_imu_result(rb)}
     for port in ('A', 'B'):
         r = res[port]
+        # AXI IIC status register post-init: a live core reads ~0xC0 (both FIFOs
+        # empty). 0x00/0xFF means the controller isn't answering at its base.
+        sr = r['iic_sr']
+        ctrl = "controller alive" if sr not in (0x00, 0xFF) else "CONTROLLER NOT RESPONDING"
+        diag = f"[iic_sr=0x{sr:02X}, {ctrl}]"
         if r['present']:
-            print(f"Port {port}: IMU present (BNO055, chip_id=0x{r['chip_id']:02X})")
+            print(f"Port {port}: IMU present (BNO055, chip_id=0x{r['chip_id']:02X}) {diag}")
         elif r['ack']:
             print(f"Port {port}: device answered at 0x28 but chip_id=0x{r['chip_id']:02X} "
-                  f"!= 0xA0 (not a BNO055)")
+                  f"!= 0xA0 (not a BNO055) {diag}")
         else:
-            print(f"Port {port}: no IMU (nothing answered at 0x28)")
+            print(f"Port {port}: no IMU (nothing answered at 0x28) {diag}")
     return res
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,

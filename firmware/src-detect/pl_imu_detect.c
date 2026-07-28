@@ -4,19 +4,31 @@
 #include "pl_imu_detect.h"
 #include "xiic_l.h"
 
-// Probe one port's AXI IIC master: write the CHIP_ID register pointer to the
-// BNO055 at 0x28, then read one byte back. XIic_Send returns the number of
-// bytes ACKed, so 0 means nothing answered at 0x28 (no device / no IMU).
+// Probe one port's AXI IIC master for a BNO055 CHIP_ID.
+//
+// XIic_DynInit() soft-resets the core and puts it in dynamic mode (the plain
+// XIic_Send/XIic_Recv assume an already-initialised core, which is why the
+// first cut saw no transactions at all). Then a dynamic write of the register
+// pointer with a repeated start, and a 1-byte read. XIic_DynSend returns the
+// number of bytes ACKed -> 0 means nothing answered at 0x28.
+//
+// The core's Status Register (post-init) is folded into the result as a
+// diagnostic: a live controller reads its reset SR (~0xC0, both FIFOs empty);
+// 0x00 / 0xFF would mean the base address or the controller is wrong.
 static uint32_t probe_port(UINTPTR base)
 {
-    uint8_t reg = BNO055_CHIP_REG;
-    uint8_t val = 0;
     uint32_t result = 0;
 
-    unsigned sent = XIic_Send(base, BNO055_I2C_ADDR, &reg, 1, XIIC_STOP);
+    XIic_DynInit(base);
+    uint32_t sr = XIic_ReadReg(base, XIIC_SR_REG_OFFSET) & 0xFF;
+    result |= (sr << IMUDET_R_SR_SHIFT);
+
+    uint8_t reg = BNO055_CHIP_REG;
+    uint8_t val = 0;
+    unsigned sent = XIic_DynSend(base, BNO055_I2C_ADDR, &reg, 1, XIIC_REPEATED_START);
     if (sent == 1) {
-        result |= IMUDET_R_ACK;                 // address ACKed -> a device is there
-        unsigned rcvd = XIic_Recv(base, BNO055_I2C_ADDR, &val, 1, XIIC_STOP);
+        result |= IMUDET_R_ACK;
+        unsigned rcvd = XIic_DynRecv(base, BNO055_I2C_ADDR, &val, 1);
         if (rcvd == 1) {
             result |= ((uint32_t)val) << IMUDET_R_ID_SHIFT;
             if (val == BNO055_CHIP_ID)

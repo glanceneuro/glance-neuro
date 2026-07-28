@@ -9,6 +9,7 @@
 #
 #   scripts/build_detect.sh            # build PL + app + BOOT-detect.bin
 #   scripts/build_detect.sh --app-only # skip the ~10 min PL build, reuse the XSA
+#   scripts/build_detect.sh --swap     # SDA/SCL-swapped pin map -> BOOT-detect-swap.bin
 set -euo pipefail
 XILINX_ROOT="${XILINX_ROOT:-/opt/Xilinx/2025.1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +17,23 @@ cd "$ROOT"
 die() { echo "" >&2; echo "DETECT BUILD FAILED: $*" >&2; exit 1; }
 
 app_only=0
-[ "${1:-}" = "--app-only" ] && app_only=1
+swap=0
+for a in "$@"; do
+  case "$a" in
+    --app-only) app_only=1 ;;
+    --swap)     swap=1 ;;
+    *) die "unknown arg: $a" ;;
+  esac
+done
+
+# Swap variant: same firmware/ELF, only the pin map differs. Distinct output so
+# the two images can be flashed and compared without a rebuild in between.
+if [ "$swap" = 1 ]; then
+  export DETECT_XDC="./programmable_logic/constraints/detect_pins_swap.xdc"
+  OUT="blobs/BOOT-detect-swap.bin"
+else
+  OUT="blobs/BOOT-detect.bin"
+fi
 
 if [ "$app_only" = 0 ]; then
   echo "== [1/3] PL: detect bitstream (~10 min) =="
@@ -41,11 +58,11 @@ vitis -s scripts/create_detect_vitis.py > vitis_detect_build.log 2>&1 \
   || die "Vitis detect build failed (see vitis_detect_build.log)"
 [ -f vitis_detect/klab-detect/build/klab-detect.elf ] || die "detect app ELF not produced"
 
-echo "== [3/3] BOOT-detect.bin =="
+echo "== [3/3] $(basename "$OUT") =="
 bootgen -image scripts/boot_detect.bif -arch zynq -o BOOT-detect.bin -w >/dev/null \
   || die "bootgen failed"
-mkdir -p blobs && mv -f BOOT-detect.bin blobs/BOOT-detect.bin
+mkdir -p blobs && mv -f BOOT-detect.bin "$OUT"
 
 echo ""
-echo "   image : blobs/BOOT-detect.bin ($(stat -c%s blobs/BOOT-detect.bin) bytes, md5 $(md5sum blobs/BOOT-detect.bin | cut -c1-32))"
+echo "   image : $OUT ($(stat -c%s "$OUT") bytes, md5 $(md5sum "$OUT" | cut -c1-32))"
 echo "   test  : flash to SD, boot, then  python3 remote/net.py  ->  detect_imu"
