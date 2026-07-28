@@ -9,7 +9,6 @@
 #
 #   scripts/build_detect.sh            # build PL + app + BOOT-detect.bin
 #   scripts/build_detect.sh --app-only # skip the ~10 min PL build, reuse the XSA
-#   scripts/build_detect.sh --swap     # SDA/SCL-swapped pin map -> BOOT-detect-swap.bin
 set -euo pipefail
 XILINX_ROOT="${XILINX_ROOT:-/opt/Xilinx/2025.1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,23 +16,8 @@ cd "$ROOT"
 die() { echo "" >&2; echo "DETECT BUILD FAILED: $*" >&2; exit 1; }
 
 app_only=0
-swap=0
-for a in "$@"; do
-  case "$a" in
-    --app-only) app_only=1 ;;
-    --swap)     swap=1 ;;
-    *) die "unknown arg: $a" ;;
-  esac
-done
-
-# Swap variant: same firmware/ELF, only the pin map differs. Distinct output so
-# the two images can be flashed and compared without a rebuild in between.
-if [ "$swap" = 1 ]; then
-  export DETECT_XDC="./programmable_logic/constraints/detect_pins_swap.xdc"
-  OUT="blobs/BOOT-detect-swap.bin"
-else
-  OUT="blobs/BOOT-detect.bin"
-fi
+[ "${1:-}" = "--app-only" ] && app_only=1
+OUT="blobs/BOOT-detect.bin"
 
 if [ "$app_only" = 0 ]; then
   echo "== [1/3] PL: detect bitstream (~10 min) =="

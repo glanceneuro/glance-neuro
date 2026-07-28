@@ -9,12 +9,8 @@ create_project detect_project ./vivado_detect -part $part_name -force
 set_property target_language Verilog [current_project]
 
 # no custom RTL: the two I2C masters are the Xilinx axi_iic IP (from the catalog)
-# detect-only constraints (those pins are LVCMOS25 here, LVDS in the acq image).
-# DETECT_XDC selects the normal or SDA/SCL-swapped pin map (build_detect.sh --swap).
-set xdc "./programmable_logic/constraints/detect_pins.xdc"
-if {[info exists ::env(DETECT_XDC)]} { set xdc $::env(DETECT_XDC) }
-puts "DETECT_XDC=$xdc"
-add_files -fileset constrs_1 $xdc
+# detect-only constraints (those pins are LVCMOS25 here, LVDS in the acq image)
+add_files -fileset constrs_1 ./programmable_logic/constraints/detect_pins.xdc
 
 source programmable_logic/block_design/detect_bd.tcl
 
