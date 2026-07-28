@@ -31,13 +31,26 @@ implementation detail — see the hard rules.
 
 These are not preferences. Violating one is a reason to stop and ask.
 
-**1. Never ship source and binary out of step.** Any commit touching
-`programmable_logic/` or `firmware/` carries a `blobs/BOOT.bin` built from that exact
-source. Run `scripts/build.sh` — it is the only supported way to build, it decides for
-itself what needs rebuilding, and it verifies what it produced. Don't hand-run the
-underlying Vivado/Vitis steps: doing so is how stale artefacts get shipped, which is the
-whole reason that script exists. If it fails, bring the failure to the user rather than
-working around it, and refuse to commit.
+**1. Never ship source and binary out of step.** The repo now holds more than one
+image, each built from its **own** source subtree by its **own** script. A commit that
+changes an image's source carries that image's rebuilt blob(s):
+
+| blob(s) | built from | script |
+|---|---|---|
+| `blobs/BOOT.bin` | `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
+| `blobs/BOOT-detect.bin` | `firmware/src-detect`, detect BD + `detect_pins.xdc` | `scripts/build_detect.sh` |
+| `blobs/BOOT-loader.bin`, `blobs/detect.bin` | `firmware/src-detect`, detect BD (deferred boot) | `scripts/build_loader.sh` |
+
+The corollary bit me once: a blob that changed source subtree wasn't rebuilt (the
+`src-detect` app grew the loader, so the baked `BOOT-detect.bin` went stale). So: after
+touching a subtree, rebuild every blob that lists it, and **don't leave a superseded or
+foreign image's stale blob on a branch where it isn't the product** — remove it (e.g. the
+deferred-boot branch delivers detect via `BOOT-loader.bin` + `detect.bin`, so the baked
+`BOOT-detect.bin` does not belong there). These are the only supported build scripts; each
+decides for itself what to rebuild and verifies what it produced. Don't hand-run the
+underlying Vivado/Vitis steps — that is how stale artefacts ship. If a build fails, bring
+it to the user rather than working around it, and refuse to commit. (A `blobs` manifest +
+`check_blobs.sh` to enforce this across images is planned — see `docs/deferred-boot.md`.)
 
 **2. Single-sample latency is the reason this exists.** One 30 kHz sample per
 datagram. Never propose batching samples, coalescing datagrams, jumbo frames, or an
