@@ -322,7 +322,8 @@ def detect_imu(sock):
 # blank PL and programs a fabric from the SD card via PCAP on command.
 CMD_LOAD_PL = 0xB2
 PL_LOAD_VERSION = 0x4C4F4144   # "LOAD"
-PL_IMAGES = {"detect": 0}      # name -> param1 selector (firmware pl_image_name)
+PL_IMAGES = {"detect": 0, "acq": 1}   # name -> param1 selector (firmware pl_image_name)
+PL_R_LINK_UP = 1 << 16         # status bit: PHY link up right after the reconfig
 _PL_STATUS = {
     0: "ok", 1: "SD mount failed", 2: "bitstream not found on SD",
     3: "SD read failed", 4: "empty bitstream file", 5: "bitstream too large",
@@ -342,17 +343,21 @@ def load_pl(sock, name="detect"):
     if not ok or data is None or len(data) < 12:
         print("[LOAD] no/short response -- is the loader (deferred-boot) image running?")
         return None
-    status, nbytes, ver = struct.unpack('<III', data[:12])
+    status_word, nbytes, ver = struct.unpack('<III', data[:12])
     if ver != PL_LOAD_VERSION:
         print(f"[LOAD] unexpected version 0x{ver:08X} (expected 0x{PL_LOAD_VERSION:08X}); "
               f"wrong image?")
+    link_up = bool(status_word & PL_R_LINK_UP)
+    status = status_word & 0xFFFF          # low half is pl_status_t
     msg = _PL_STATUS.get(status, f"error {status}")
+    # We received this reply over the same TCP link, so the connection SURVIVED
+    # the reconfig -- the key runtime-swap result. link_up confirms the PHY, too.
+    link = "link UP" if link_up else "link DOWN(!)"
     if status == 0:
-        print(f"Loaded '{name}.bin' into the PL: {nbytes} bytes, PCAP OK. "
-              f"The fabric is live -- try detect_imu.")
+        print(f"Loaded '{name}.bin': {nbytes} bytes, PCAP OK, TCP survived, {link}.")
     else:
-        print(f"Load of '{name}.bin' FAILED: {msg} (status={status}, {nbytes} bytes read)")
-    return {"status": status, "bytes": nbytes}
+        print(f"Load of '{name}.bin' FAILED: {msg} (status={status}, {nbytes} bytes read); {link}")
+    return {"status": status, "bytes": nbytes, "link_up": link_up}
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)

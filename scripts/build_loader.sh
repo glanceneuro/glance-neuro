@@ -51,22 +51,26 @@ bootgen -image scripts/boot_loader.bif -arch zynq -o BOOT.bin -w >/dev/null \
   || die "bootgen (BOOT.bin) failed"
 mkdir -p blobs && mv -f BOOT.bin blobs/BOOT.bin
 
-echo "== [4/4] detect.bin (PCAP bitstream for SD) =="
-BIT="vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit"
-[ -f "$BIT" ] || die "detect bitstream .bit not found ($BIT)"
 # bootgen -process_bitstream bin strips the .bit header and byte-orders the data
 # for XDcfg/PCAP, emitting <name>.bit.bin next to the input.
-printf 'all:\n{\n\t%s\n}\n' "$BIT" > .detect_bit.bif
-bootgen -image .detect_bit.bif -arch zynq -process_bitstream bin -w >/dev/null \
-  || die "bootgen -process_bitstream failed"
-rm -f .detect_bit.bif
-PCAP_BIN="${BIT}.bin"
-[ -f "$PCAP_BIN" ] || PCAP_BIN="$(dirname "$BIT")/$(basename "$BIT" .bit).bit.bin"
-[ -f "$PCAP_BIN" ] || die "PCAP .bin not produced (looked for ${BIT}.bin)"
-cp -f "$PCAP_BIN" blobs/detect.bin
+bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
+  local bit="$1" dst="$2"
+  [ -f "$bit" ] || die "bitstream .bit not found ($bit)"
+  printf 'all:\n{\n\t%s\n}\n' "$bit" > .pcap.bif
+  bootgen -image .pcap.bif -arch zynq -process_bitstream bin -w >/dev/null \
+    || die "bootgen -process_bitstream failed for $bit"
+  rm -f .pcap.bif
+  cp -f "${bit}.bin" "$dst"
+}
+
+echo "== [4/4] fabrics for SD: detect.bin + acq.bin =="
+bit_to_pcap "vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit" blobs/detect.bin
+# acq.bin is the full acquisition fabric (big) -- the runtime-swap test's payload.
+# Reuses the acquisition bitstream from scripts/build.sh (run it once if missing).
+bit_to_pcap "vivado_project/klab_project.runs/impl_1/design_1_wrapper.bit" blobs/acq.bin
 
 echo ""
 echo "   blobs/ is the SD image -- copy its contents verbatim to the SD FAT root:"
 echo "   boot   : blobs/BOOT.bin   ($(stat -c%s blobs/BOOT.bin) bytes, md5 $(md5sum blobs/BOOT.bin | cut -c1-32))"
-echo "   fabric : blobs/detect.bin ($(stat -c%s blobs/detect.bin) bytes, md5 $(md5sum blobs/detect.bin | cut -c1-32))"
-echo "   test   : cp blobs/* -> SD root; boot (PL blank) -> net.py -> load_pl detect -> detect_imu"
+echo "   fabric : blobs/detect.bin ($(stat -c%s blobs/detect.bin) bytes) + blobs/acq.bin ($(stat -c%s blobs/acq.bin) bytes)"
+echo "   test   : cp blobs/* -> SD root; boot -> net.py -> load_pl detect / load_pl acq (swap), watch link"

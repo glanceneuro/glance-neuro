@@ -48,9 +48,15 @@
 static const char *pl_image_name(uint32_t idx) {
     switch (idx) {
         case 0:  return "detect";
+        case 1:  return "acq";    // full acquisition fabric (big) -- runtime-swap test
         default: return NULL;
     }
 }
+
+// Bit OR'd into the reply's status to report the Ethernet link state right after
+// the PCAP reconfig -- the runtime-swap test's key signal (did the big fabric's
+// activation transient drop the link?).
+#define PL_R_LINK_UP (1u << 16)
 
 // CMD_LOAD_PL reply (12 bytes), decoded by net.py load_pl().
 typedef struct __attribute__((packed)) {
@@ -142,8 +148,15 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
                 r.status = (uint32_t)st;
                 r.bytes  = bytes;
                 if (st == PL_OK) pl_ready = 1;   // fabric is now live
-                xil_printf("LOAD_PL '%s': %s (%lu bytes)\r\n",
-                           nm, pl_status_str(st), (unsigned long)bytes);
+                // Report the link state immediately after the reconfig: if this
+                // reply reaches the host at all the TCP link survived, and this
+                // bit says whether the PHY link itself stayed up. detect_imu
+                // still works after a detect load; acq has no driver here -- the
+                // point is only whether the big fabric's load drops the network.
+                if (netif_is_link_up(&server_netif)) r.status |= PL_R_LINK_UP;
+                xil_printf("LOAD_PL '%s': %s (%lu bytes), link %s\r\n",
+                           nm, pl_status_str(st), (unsigned long)bytes,
+                           netif_is_link_up(&server_netif) ? "UP" : "DOWN");
             } else {
                 xil_printf("LOAD_PL: unknown image selector %lu\r\n",
                            (unsigned long)cmd->param1);
