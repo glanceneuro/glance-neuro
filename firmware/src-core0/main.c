@@ -15,6 +15,7 @@
 //#include "xuartps.h"
 #include "shared_print.h"
 #include "pl_dma.h"
+#include "pl_loader.h"  // deferred fabric load from SD via PCAP (docs/deferred-boot.md)
 #include "xiltimer.h"  // XTime_GetTime / COUNTS_PER_SECOND for perf instrumentation
 
 // Forward declare eth_link_detect from xemacpsif adapter
@@ -480,16 +481,9 @@ int main() {
   memset((void *)command_flags, 0, sizeof(command_flags_t));
   psmon_init();   // zero the status snapshot before core 1 reads it
   pl_rhd_shadow_init();   // seed the RHD register mirror from the init defaults
-#if BRAM_READ_METHOD == BRAM_READ_DMA
-  pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
-#endif
-
-  // Load the LFP cascade's configuration but leave the engine OFF. Its filters
-  // come from the bitstream, so enabling it is a single command and needs no
-  // host setup -- but it costs core-0 time in the same loop as the broadband
-  // pump, and broadband is the stream with a hard 33 us budget. Anything that
-  // competes with it is opt-in. Decimation is structural (/2 then /5 -> 3 kHz).
-  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+  // pl_dma_init() and pl_lfp_set_config() used to run here, but they touch the
+  // PL (CDMA self-test, LFP CTRL write). In this deferred-boot image the fabric
+  // is not loaded yet, so they moved to just after the PCAP load below.
   // ========================================================================
 
   // ========================================================================
@@ -566,7 +560,39 @@ int main() {
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
-  
+
+  // ---- Deferred fabric load (docs/deferred-boot.md) --------------------------
+  // The PL is blank at boot in this image; the network came up over MIO GEM
+  // independently of it. Load the acquisition fabric from SD via PCAP now, then
+  // do every PL-touching init below. The loader's fabric_enable() is what turns
+  // on the PS<->PL level shifters and releases the PL resets -- until it runs,
+  // AXI-Lite to 0x40000000 / CDMA / BRAM would not respond, so nothing above
+  // this line may touch the PL.
+  pl_loader_init();
+  uint32_t fabric_bytes = 0;
+  pl_status_t fabric_st = pl_loader_load("acq", &fabric_bytes);
+  if (fabric_st != PL_OK) {
+    send_message("FATAL: acquisition fabric load failed: %s. "
+                 "Acquisition disabled; network stays up for diagnosis.\r\n",
+                 pl_status_str(fabric_st));
+    // With no fabric, any PL AXI access would hang -- keep only the network
+    // alive so the host can still reach the board and see the error.
+    while (1) { service_network(); }
+  }
+  send_message("Acquisition fabric loaded from SD via PCAP (%lu bytes).\r\n",
+               (unsigned long)fabric_bytes);
+
+  // PL-touching init relocated here from before the network block: the CDMA
+  // self-test reads capture BRAM and the LFP config writes the CTRL register,
+  // both of which need a live fabric.
+#if BRAM_READ_METHOD == BRAM_READ_DMA
+  pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
+#endif
+  // LFP cascade configured but left OFF (filters come from the bitstream; enable
+  // is a single command). It costs core-0 time in the broadband loop's 33 us
+  // budget, so it is opt-in. Decimation is structural (/2 then /5 -> 3 kHz).
+  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+
   // Initialize PL
   pl_set_transmission(0);
   pl_set_loop_count(0);

@@ -1,0 +1,10 @@
+//arch = zynq; split = false; format = BIN
+// Deferred-load acquisition BOOT: FSBL + both core ELFs, NO bitstream. The PL is
+// blank at boot; core0 brings up the network then loads the acquisition fabric
+// (acq.bin) from SD via PCAP before any PL-touching init. See docs/deferred-boot.md.
+the_ROM_image:
+{
+	[bootloader]./vitis_workspace/klab-platform/export/klab-platform/sw/boot/fsbl.elf
+	./vitis_workspace/klab-firmware/build/klab-firmware.elf
+	./vitis_workspace/klab-firmware-core1/build/klab-firmware-core1.elf
+}

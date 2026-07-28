@@ -29,6 +29,9 @@ domain.set_config('lib', lib_name='lwip220', param='lwip220_no_sys_no_timers', v
 # drops (v1.6 instrumentation: pbuf_alloc never failed, so it is NOT memp_n_pbuf).
 domain.set_config('lib', lib_name='lwip220', param='lwip220_n_tx_descriptors', value='256')
 domain.set_config('lib', lib_name='lwip220', param='lwip220_mem_size', value='262144')
+# xilffs (FatFs) so core0 can read the acquisition fabric off the SD card in the
+# deferred-boot model (src-loader/pl_loader.c). Short 8.3 names, no LFN needed.
+domain.set_lib('xilffs')
 
 
 domain = platform.add_domain(cpu = "ps7_cortexa9_1",os = "standalone",
@@ -44,7 +47,7 @@ app = client.create_app_component(name="klab-firmware",
                                   platform = "./vitis_workspace/klab-platform/export/klab-platform/klab-platform.xpfm",
                                   domain = "standalone_ps7_cortexa9_0")
 app = client.get_component(name="klab-firmware")
-status = app.import_files(from_loc="firmware", files=['src-core0', 'src-shared', 'include'], is_skip_copy_sources=True)
+status = app.import_files(from_loc="firmware", files=['src-core0', 'src-shared', 'src-loader', 'include'], is_skip_copy_sources=True)
 app.set_app_config('USER_INCLUDE_DIRECTORIES','../../../firmware/include')
 app.set_app_config('USER_COMPILE_OPTIMIZATION_LEVEL','-O3') # We can't make timing with the default -O0!!
 lscript = app.get_ld_script()

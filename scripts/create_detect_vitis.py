@@ -34,7 +34,7 @@ app = client.create_app_component(
     platform="./vitis_detect/detect-platform/export/detect-platform/detect-platform.xpfm",
     domain="standalone_ps7_cortexa9_0")
 app = client.get_component(name="klab-detect")
-app.import_files(from_loc="firmware", files=['src-detect', 'include'], is_skip_copy_sources=True)
+app.import_files(from_loc="firmware", files=['src-detect', 'src-loader', 'include'], is_skip_copy_sources=True)
 app.set_app_config('USER_INCLUDE_DIRECTORIES', '../../../firmware/include')
 app.set_app_config('USER_COMPILE_OPTIMIZATION_LEVEL', '-O2')
 lscript = app.get_ld_script()

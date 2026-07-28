@@ -10,10 +10,11 @@
 
 #include <stdint.h>
 
-// Scratch DDR buffer for the raw bitstream. The app lives at 0x00100000; the
-// detect domain's DDR region runs to 0x1ff00000, so 0x10000000 is clear of the
-// app/heap/stack. A full xc7z020 bitstream is ~3.9 MB; cap at 8 MB.
-#define PL_LOAD_BUF_ADDR 0x10000000u
+// Scratch DDR buffer for the raw bitstream. Both users' core0 DDR region runs
+// 0x00100000..0x20000000; 0x18000000 (384 MB) is clear above the app/.bss/heap
+// (which sit near the base, incl. the acquisition's 1 MB DMA staging buffers)
+// and below core1 at 0x20000000. A full xc7z020 bitstream is ~3.9 MB; cap 8 MB.
+#define PL_LOAD_BUF_ADDR 0x18000000u
 #define PL_LOAD_BUF_MAX  0x00800000u
 
 typedef enum {
