@@ -63,3 +63,9 @@ programmable_logic/sim/*.png
 # Belt and braces: the coefficients are the filter that ships in the bitstream,
 # so never let a broader pattern above hide them.
 !programmable_logic/sim/*_coefs.hex
+
+# IMU-detect build outputs (generated)
+vivado_detect/
+vitis_detect/
+vivado_detect_build.log
+vitis_detect_build.log

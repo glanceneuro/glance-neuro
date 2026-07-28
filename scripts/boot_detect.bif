@@ -1,0 +1,7 @@
+//arch = zynq; split = false; format = BIN
+the_ROM_image:
+{
+	[bootloader]./vitis_detect/detect-platform/export/detect-platform/sw/boot/fsbl.elf
+	./vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit
+	./vitis_detect/klab-detect/build/klab-detect.elf
+}

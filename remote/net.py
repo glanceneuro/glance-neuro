@@ -275,6 +275,51 @@ CMD_STIM_POWERDOWN    = 0xAD  # outputs -> 1k to AGND (disarms hw trigger)
 STIM_RAM_DEPTH = 16384
 STIM_MASTER_RATE_HZ = 240000.0   # 84 MHz / 350, fixed in the PL
 
+# BNO055 IMU presence detection (the separate "detect" bitstream; imu_detect_top).
+# Reply is 12 bytes: result_a(u32), result_b(u32), version(u32) -- keep in sync
+# with firmware imu_detect_response_t and imu_detect_top.sv bitfields.
+CMD_DETECT_IMU = 0xB0
+IMUDET_VERSION = 0x494D5531   # "IMU1"
+
+def _decode_imu_result(word):
+    return {
+        'present':  bool(word & 0x1),
+        'ack':      bool(word & 0x2),
+        'timeout':  bool(word & 0x4),
+        'idle_sda': bool(word & 0x08),   # bit3
+        'idle_scl': bool(word & 0x10),   # bit4
+        'chip_id':  (word >> 8) & 0xFF,
+    }
+
+def detect_imu(sock):
+    """Ask the detect bitstream to probe both headstage ports for a BNO055,
+    and print a per-port verdict. Safe: the PL senses idle levels first and
+    only drives I2C when both lines idle high (no LVDS-headstage contention)."""
+    ok, data = send_binary_command(sock, CMD_DETECT_IMU, timeout=2.0)
+    if not ok or data is None or len(data) < 12:
+        print("[DETECT] no/short response -- is the detect bitstream loaded?")
+        return None
+    ra, rb, ver = struct.unpack('<III', data[:12])
+    if ver != IMUDET_VERSION:
+        print(f"[DETECT] unexpected peripheral version 0x{ver:08X} "
+              f"(expected 0x{IMUDET_VERSION:08X}); wrong bitstream?")
+    res = {'A': _decode_imu_result(ra), 'B': _decode_imu_result(rb)}
+    for port in ('A', 'B'):
+        r = res[port]
+        if r['present']:
+            print(f"Port {port}: IMU present (BNO055, chip_id=0x{r['chip_id']:02X})")
+        else:
+            idle = f"{int(r['idle_scl'])}{int(r['idle_sda'])}"  # scl,sda
+            if idle == '11' and r['ack']:
+                why = f"device ACKed but chip_id=0x{r['chip_id']:02X} != 0xA0"
+            elif idle == '11':
+                why = "lines idle high but no I2C response (no device)"
+            else:
+                why = f"lines not both-high (idle scl,sda={idle}) -- LVDS/absent headstage, did not probe"
+            extra = " [I2C timeout]" if r['timeout'] else ""
+            print(f"Port {port}: no IMU -- {why}{extra}")
+    return res
+
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
 # drains 5000 promiscuously and fans the LFP frames out to subscribers, so the
@@ -2965,6 +3010,7 @@ def tcp_control():
         print(f"  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
         print(f"         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
         print(f"  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
+        print(f"  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
         print(f"  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
         print(f"        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
         print(f"        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
@@ -3011,6 +3057,8 @@ def tcp_control():
                 elif cmd == "perf_reset":
                     ok, _ = send_binary_command(sock, CMD_PERF_RESET)
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
+                elif cmd == "detect_imu":
+                    detect_imu(sock)
                 elif cmd == "stim_status":
                     print_stim_status(stim_get_status(sock))
                 elif cmd.startswith("stim_gaussian"):
