@@ -67,8 +67,9 @@ while the board swaps fabrics under it.
 
 ## Bitstream inventory (files on the SD FAT partition)
 
-`BOOT.bin` shrinks to **FSBL + orchestrator app ELF — no bitstream**. The
-fabrics live beside it as plain files:
+`blobs/` **is** the SD card image — its contents are copied verbatim to the FAT
+root. `BOOT.bin` shrinks to **FSBL + orchestrator app ELF — no bitstream**, and
+the fabrics live beside it as plain files:
 
 | file | fabric | when |
 |---|---|---|
@@ -115,12 +116,14 @@ explicitly for bring-up and testing.
 
 ## Increments
 
-- **2a — deferred-load proof** *(in progress)*: orchestrator app boots with a
-  blank PL, network comes up, a host command loads `detect.bin` from SD via
-  PCAP + the level-shifter/reset sequence, and `detect_imu` then works *through
-  the just-loaded fabric*. Proves network-first + PCAP-from-SD + post-load driver
-  use end to end, reusing the already-validated detect bitstream as the payload.
-  New `BOOT.bin` (FSBL+app, no bitstream); `detect.bin` on SD; `net.py load_pl`.
+- **2a — deferred-load proof** *(done, validated on hardware)*: orchestrator app
+  boots with a blank PL, network comes up, `load_pl detect` loads `detect.bin`
+  from SD via PCAP + the level-shifter/reset sequence, and `detect_imu` then reads
+  chip_id 0xA0 *through the just-loaded fabric*. Proves network-first +
+  PCAP-from-SD + post-load driver use end to end, reusing the validated detect
+  bitstream as the payload. `BOOT.bin` (FSBL+app, no bitstream) + `detect.bin` in
+  `blobs/`; `net.py load_pl`; `pl_ready` guard so `detect_imu` refuses on a blank
+  PL instead of hanging on unconfigured PL AXI.
 - **2b — multi-image + manifest**: `build.sh` emits FSBL+app + all fabrics +
   `MANIFEST.sha256`; `check_blobs.sh`; SD provisioning; the auto
   detect→select→load state machine.
@@ -137,3 +140,10 @@ explicitly for bring-up and testing.
   dead" failure.
 - **Blob provisioning discipline** (above) is the real cost — get the manifest
   right or the "can't ship stale" guarantee quietly erodes across N files.
+- **No boot-time serial console on this board.** The console UART (UART1) is
+  routed through the PL — EMIO to the FT230 on M14/M15 (`constraints/uart.xdc`),
+  not MIO — so it only exists once a fabric that routes it is loaded. The blank-PL
+  phase (FSBL → network → first `load_pl`) is therefore silent on serial by
+  construction; use the network for status there. A fabric can route EMIO UART to
+  M14/M15 for a post-load console (acquisition parity), but the early boot log
+  needs another channel (e.g. a "boot log over TCP" command) if wanted.

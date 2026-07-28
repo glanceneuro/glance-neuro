@@ -2,16 +2,17 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
 #
-# Build the DEFERRED-LOAD image (step 2, docs/deferred-boot.md):
-#   - blobs/BOOT-loader.bin : FSBL + orchestrator app, NO bitstream (PL blank at boot)
-#   - blobs/detect.bin      : the detect fabric as a PCAP bitstream, for the SD card
+# Build the DEFERRED-LOAD image (step 2, docs/deferred-boot.md). blobs/ is the SD
+# card image -- copy its contents verbatim to the FAT root:
+#   - blobs/BOOT.bin   : FSBL + orchestrator app, NO bitstream (PL blank at boot)
+#   - blobs/detect.bin : the detect fabric as a PCAP bitstream, loaded at runtime
 #
 # The app is the same src-detect app as the detect image (it now also carries the
 # PCAP loader + CMD_LOAD_PL); only the boot packaging differs. To test:
-#   copy BOTH files to the SD FAT root, BOOT-loader.bin renamed to BOOT.bin.
+#   cp blobs/* -> SD FAT root (BOOT.bin is already named as the BootROM requires).
 #   boot (PL blank) -> net.py connects -> load_pl detect -> detect_imu.
 #
-#   scripts/build_loader.sh            # PL XSA + app + BOOT-loader.bin + detect.bin
+#   scripts/build_loader.sh            # PL XSA + app + BOOT.bin + detect.bin
 #   scripts/build_loader.sh --app-only # reuse existing detect XSA (skip ~10 min PL)
 set -euo pipefail
 XILINX_ROOT="${XILINX_ROOT:-/opt/Xilinx/2025.1}"
@@ -45,10 +46,10 @@ vitis -s scripts/create_detect_vitis.py > vitis_detect_build.log 2>&1 \
   || die "Vitis build failed (see vitis_detect_build.log)"
 [ -f vitis_detect/klab-detect/build/klab-detect.elf ] || die "app ELF not produced"
 
-echo "== [3/4] BOOT-loader.bin (FSBL + app, no bitstream) =="
-bootgen -image scripts/boot_loader.bif -arch zynq -o BOOT-loader.bin -w >/dev/null \
-  || die "bootgen (BOOT-loader) failed"
-mkdir -p blobs && mv -f BOOT-loader.bin blobs/BOOT-loader.bin
+echo "== [3/4] BOOT.bin (FSBL + app, no bitstream) =="
+bootgen -image scripts/boot_loader.bif -arch zynq -o BOOT.bin -w >/dev/null \
+  || die "bootgen (BOOT.bin) failed"
+mkdir -p blobs && mv -f BOOT.bin blobs/BOOT.bin
 
 echo "== [4/4] detect.bin (PCAP bitstream for SD) =="
 BIT="vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit"
@@ -65,7 +66,7 @@ PCAP_BIN="${BIT}.bin"
 cp -f "$PCAP_BIN" blobs/detect.bin
 
 echo ""
-echo "   image  : blobs/BOOT-loader.bin ($(stat -c%s blobs/BOOT-loader.bin) bytes, md5 $(md5sum blobs/BOOT-loader.bin | cut -c1-32))"
-echo "   fabric : blobs/detect.bin      ($(stat -c%s blobs/detect.bin) bytes, md5 $(md5sum blobs/detect.bin | cut -c1-32))"
-echo "   test   : SD FAT root gets BOTH -- BOOT-loader.bin AS BOOT.bin, plus detect.bin."
-echo "            boot (PL blank) -> net.py -> load_pl detect -> detect_imu"
+echo "   blobs/ is the SD image -- copy its contents verbatim to the SD FAT root:"
+echo "   boot   : blobs/BOOT.bin   ($(stat -c%s blobs/BOOT.bin) bytes, md5 $(md5sum blobs/BOOT.bin | cut -c1-32))"
+echo "   fabric : blobs/detect.bin ($(stat -c%s blobs/detect.bin) bytes, md5 $(md5sum blobs/detect.bin | cut -c1-32))"
+echo "   test   : cp blobs/* -> SD root; boot (PL blank) -> net.py -> load_pl detect -> detect_imu"

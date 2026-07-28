@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
 #
-# Build the standalone IMU-DETECT image -> blobs/BOOT-detect.bin.
-# Separate from build.sh (the acquisition BOOT.bin): the shared 2nd-CIPO pins
-# are single-ended I2C here and LVDS there, so it is a distinct bitstream + a
-# minimal firmware. Flash BOOT-detect.bin, then: net.py -> detect_imu.
+# Build the standalone IMU-DETECT image (baked bitstream) into blobs/, which IS
+# the SD card image: BOOT.bin is the whole thing here. Separate from build.sh
+# (the acquisition image): the shared 2nd-CIPO pins are single-ended I2C here and
+# LVDS there, so it is a distinct bitstream + a minimal firmware. cp blobs/* to
+# the SD root, then: net.py -> detect_imu. (This baked config and the deferred
+# loader config are different SD images -- only one lives in blobs/ per branch.)
 #
-#   scripts/build_detect.sh            # build PL + app + BOOT-detect.bin
+#   scripts/build_detect.sh            # build PL + app + BOOT.bin
 #   scripts/build_detect.sh --app-only # skip the ~10 min PL build, reuse the XSA
 set -euo pipefail
 XILINX_ROOT="${XILINX_ROOT:-/opt/Xilinx/2025.1}"
@@ -17,7 +19,7 @@ die() { echo "" >&2; echo "DETECT BUILD FAILED: $*" >&2; exit 1; }
 
 app_only=0
 [ "${1:-}" = "--app-only" ] && app_only=1
-OUT="blobs/BOOT-detect.bin"
+OUT="blobs/BOOT.bin"
 
 if [ "$app_only" = 0 ]; then
   echo "== [1/3] PL: detect bitstream (~10 min) =="

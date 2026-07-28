@@ -24,33 +24,35 @@ implementation detail — see the hard rules.
 | `firmware/src-core0/` | network, streaming, PL control |
 | `firmware/include/main.h` | the PS side of the register/packet contract |
 | `remote/net.py` | reference host client and diagnostic tool |
-| `blobs/BOOT.bin` | the bootable image, matching the source in the same commit |
+| `blobs/` | the SD card image (copied verbatim to the FAT root): `BOOT.bin` + any runtime fabrics, matching the source in the same commit — see rule 1 |
 | `docs/` | protocol, register map, LFP cascade, testing |
 
 ## Hard rules
 
 These are not preferences. Violating one is a reason to stop and ask.
 
-**1. Never ship source and binary out of step.** The repo now holds more than one
-image, each built from its **own** source subtree by its **own** script. A commit that
-changes an image's source carries that image's rebuilt blob(s):
+**1. Never ship source and binary out of step.** `blobs/` **is the SD card image** —
+its contents are copied verbatim to the FAT root. It always holds `BOOT.bin` (the boot
+image; the BootROM requires exactly that name) and, in the deferred-boot model, the
+fabric `*.bin` files loaded at runtime. One config's image lives in `blobs/` per branch;
+`BOOT.bin` is built from different source depending on that config:
 
-| blob(s) | built from | script |
+| config (branch) | `blobs/` contents = the SD card | built by |
 |---|---|---|
-| `blobs/BOOT.bin` | `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
-| `blobs/BOOT-detect.bin` | `firmware/src-detect`, detect BD + `detect_pins.xdc` | `scripts/build_detect.sh` |
-| `blobs/BOOT-loader.bin`, `blobs/detect.bin` | `firmware/src-detect`, detect BD (deferred boot) | `scripts/build_loader.sh` |
+| acquisition | `BOOT.bin` ← `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
+| detect (baked) | `BOOT.bin` ← `firmware/src-detect`, detect BD + `detect_pins.xdc` | `scripts/build_detect.sh` |
+| deferred boot | `BOOT.bin` ← `firmware/src-detect` app (no bitstream); `detect.bin`/`acq_*.bin` ← the respective PL | `scripts/build_loader.sh` |
 
-The corollary bit me once: a blob that changed source subtree wasn't rebuilt (the
-`src-detect` app grew the loader, so the baked `BOOT-detect.bin` went stale). So: after
-touching a subtree, rebuild every blob that lists it, and **don't leave a superseded or
-foreign image's stale blob on a branch where it isn't the product** — remove it (e.g. the
-deferred-boot branch delivers detect via `BOOT-loader.bin` + `detect.bin`, so the baked
-`BOOT-detect.bin` does not belong there). These are the only supported build scripts; each
-decides for itself what to rebuild and verifies what it produced. Don't hand-run the
-underlying Vivado/Vitis steps — that is how stale artefacts ship. If a build fails, bring
-it to the user rather than working around it, and refuse to commit. (A `blobs` manifest +
-`check_blobs.sh` to enforce this across images is planned — see `docs/deferred-boot.md`.)
+A commit that changes a source subtree rebuilds every artefact that lists it. The
+corollary bit me once: the `src-detect` app grew the loader but the baked `BOOT.bin`
+image wasn't rebuilt, so it went stale. So: after touching a subtree, rebuild its
+artefact(s), and **don't leave a superseded or foreign config's blob in `blobs/`** on a
+branch where it isn't the product (the deferred-boot branch's `BOOT.bin` is the loader,
+not the monolithic acquisition image). These are the only supported build scripts; each
+decides what to rebuild and verifies what it produced. Don't hand-run the underlying
+Vivado/Vitis steps — that is how stale artefacts ship. If a build fails, bring it to the
+user rather than working around it, and refuse to commit. (A `blobs` manifest +
+`check_blobs.sh` to enforce this across artefacts is planned — see `docs/deferred-boot.md`.)
 
 **2. Single-sample latency is the reason this exists.** One 30 kHz sample per
 datagram. Never propose batching samples, coalescing datagrams, jumbo frames, or an
