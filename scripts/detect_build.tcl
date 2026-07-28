@@ -8,12 +8,7 @@ set part_name "xc7z020clg400-1"
 create_project detect_project ./vivado_detect -part $part_name -force
 set_property target_language Verilog [current_project]
 
-# only the detect RTL -- no acquisition sources, no intan IP repo
-add_files -fileset sources_1 [list \
-    ./programmable_logic/src/i2c_probe.sv \
-    ./programmable_logic/src/imu_detect_top.v ]
-update_compile_order -fileset sources_1
-
+# no custom RTL: the two I2C masters are the Xilinx axi_iic IP (from the catalog)
 # detect-only constraints (those pins are LVCMOS25 here, LVDS in the acq image)
 add_files -fileset constrs_1 ./programmable_logic/constraints/detect_pins.xdc
 

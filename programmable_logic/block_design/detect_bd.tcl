@@ -9,11 +9,7 @@ proc create_root_design { parentCell } {
   current_bd_design "detect_bd"
   set parentObj [get_bd_cells /]
 
-  # external open-drain I2C pins (constrained in detect_pins.xdc)
-  create_bd_port -dir IO sda_a
-  create_bd_port -dir IO scl_a
-  create_bd_port -dir IO sda_b
-  create_bd_port -dir IO scl_b
+  # I2C pins are created by the axi_iic external interfaces (iic_a / iic_b).
 
     set processing_system7_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 processing_system7_0 ]
     set_property -dict [list \
@@ -344,39 +340,41 @@ proc create_root_design { parentCell } {
       CONFIG.PCW_USE_S_AXI_HP0 {0} \
     ] $processing_system7_0
 
-  # reset + AXI interconnect for GP0
+  # reset + interconnect (one axi_iic master per headstage port)
   set rst_ps7 [ create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_ps7 ]
   set sc [ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect_0 ]
-  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $sc
+  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2}] $sc
 
-  # the detect peripheral (module reference; s_axi_* infer an AXI4-Lite slave)
-  if { [catch {set imu [create_bd_cell -type module -reference imu_detect_top imu_detect_top]} e] } {
-    catch {common::send_gid_msg -ssname BD::TCL -id 2095 -severity "ERROR" "Add imu_detect_top sources to the project first."}
-    return 1
-  }
+  # silicon-proven I2C masters (handle clock stretching + real bus timing)
+  set iic_a [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_iic:2.1 axi_iic_a ]
+  set iic_b [ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_iic:2.1 axi_iic_b ]
+  set_property -dict [list CONFIG.C_SCL_INERTIAL_DELAY {5} CONFIG.IIC_FREQ_KHZ {100}] $iic_a
+  set_property -dict [list CONFIG.C_SCL_INERTIAL_DELAY {5} CONFIG.IIC_FREQ_KHZ {100}] $iic_b
 
-  # AXI: GP0 -> smartconnect -> imu_detect_top/s_axi
   connect_bd_intf_net [get_bd_intf_pins processing_system7_0/M_AXI_GP0] [get_bd_intf_pins smartconnect_0/S00_AXI]
-  connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M00_AXI] [get_bd_intf_pins imu_detect_top/s_axi]
+  connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M00_AXI] [get_bd_intf_pins axi_iic_a/S_AXI]
+  connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M01_AXI] [get_bd_intf_pins axi_iic_b/S_AXI]
 
-  # clock (FCLK_CLK0 = 100 MHz) + reset
+  # external IIC interfaces (Vivado inserts the open-drain IOBUFs)
+  make_bd_intf_pins_external [get_bd_intf_pins axi_iic_a/IIC]
+  set_property name iic_a [get_bd_intf_ports IIC_0]
+  make_bd_intf_pins_external [get_bd_intf_pins axi_iic_b/IIC]
+  set_property name iic_b [get_bd_intf_ports IIC_0]
+
   connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0] \
                  [get_bd_pins processing_system7_0/M_AXI_GP0_ACLK] \
                  [get_bd_pins smartconnect_0/aclk] \
                  [get_bd_pins rst_ps7/slowest_sync_clk] \
-                 [get_bd_pins imu_detect_top/s_axi_aclk]
+                 [get_bd_pins axi_iic_a/s_axi_aclk] \
+                 [get_bd_pins axi_iic_b/s_axi_aclk]
   connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_pins rst_ps7/ext_reset_in]
   connect_bd_net [get_bd_pins rst_ps7/peripheral_aresetn] \
                  [get_bd_pins smartconnect_0/aresetn] \
-                 [get_bd_pins imu_detect_top/s_axi_aresetn]
+                 [get_bd_pins axi_iic_a/s_axi_aresetn] \
+                 [get_bd_pins axi_iic_b/s_axi_aresetn]
 
-  # external I2C pins
-  connect_bd_net [get_bd_ports sda_a] [get_bd_pins imu_detect_top/sda_a]
-  connect_bd_net [get_bd_ports scl_a] [get_bd_pins imu_detect_top/scl_a]
-  connect_bd_net [get_bd_ports sda_b] [get_bd_pins imu_detect_top/sda_b]
-  connect_bd_net [get_bd_ports scl_b] [get_bd_pins imu_detect_top/scl_b]
-
-  assign_bd_address -offset 0x43D00000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs imu_detect_top/s_axi/reg0] -force
+  assign_bd_address -offset 0x43D00000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs axi_iic_a/S_AXI/Reg] -force
+  assign_bd_address -offset 0x43D10000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs axi_iic_b/S_AXI/Reg] -force
 
   validate_bd_design
   save_bd_design

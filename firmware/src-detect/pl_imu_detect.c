@@ -2,28 +2,34 @@
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
 
 #include "pl_imu_detect.h"
-#include "xil_io.h"
-#include "sleep.h"
+#include "xiic_l.h"
 
-static inline void imudet_wr(uint32_t off, uint32_t v) { Xil_Out32(IMUDET_BASE_ADDR + off, v); }
-static inline uint32_t imudet_rd(uint32_t off)         { return Xil_In32(IMUDET_BASE_ADDR + off); }
+// Probe one port's AXI IIC master: write the CHIP_ID register pointer to the
+// BNO055 at 0x28, then read one byte back. XIic_Send returns the number of
+// bytes ACKed, so 0 means nothing answered at 0x28 (no device / no IMU).
+static uint32_t probe_port(UINTPTR base)
+{
+    uint8_t reg = BNO055_CHIP_REG;
+    uint8_t val = 0;
+    uint32_t result = 0;
+
+    unsigned sent = XIic_Send(base, BNO055_I2C_ADDR, &reg, 1, XIIC_STOP);
+    if (sent == 1) {
+        result |= IMUDET_R_ACK;                 // address ACKed -> a device is there
+        unsigned rcvd = XIic_Recv(base, BNO055_I2C_ADDR, &val, 1, XIIC_STOP);
+        if (rcvd == 1) {
+            result |= ((uint32_t)val) << IMUDET_R_ID_SHIFT;
+            if (val == BNO055_CHIP_ID)
+                result |= IMUDET_R_PRESENT;
+        }
+    }
+    return result;
+}
 
 int pl_imu_detect_run(imu_detect_response_t *out)
 {
-    imudet_wr(IMUDET_REG_CONTROL, 1u);   // start both ports
-
-    // Both probes are slow I2C; a full probe is well under a millisecond even
-    // with clock stretching, but poll with a generous ceiling. Cold path.
-    for (int i = 0; i < 100000; i++) {
-        if (imudet_rd(IMUDET_REG_STATUS) & IMUDET_STATUS_DONE) {
-            out->result_a = imudet_rd(IMUDET_REG_RESULT_A);
-            out->result_b = imudet_rd(IMUDET_REG_RESULT_B);
-            out->version  = imudet_rd(IMUDET_REG_VERSION);
-            return 0;
-        }
-        usleep(10);
-    }
-    out->result_a = 0; out->result_b = 0;
-    out->version  = imudet_rd(IMUDET_REG_VERSION);
-    return -1;   // PL never reported done
+    out->result_a = probe_port(IMUDET_A_BASE);
+    out->result_b = probe_port(IMUDET_B_BASE);
+    out->version  = IMUDET_VERSION;
+    return 0;
 }

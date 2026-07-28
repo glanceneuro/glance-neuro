@@ -279,22 +279,18 @@ STIM_MASTER_RATE_HZ = 240000.0   # 84 MHz / 350, fixed in the PL
 # Reply is 12 bytes: result_a(u32), result_b(u32), version(u32) -- keep in sync
 # with firmware imu_detect_response_t and imu_detect_top.sv bitfields.
 CMD_DETECT_IMU = 0xB0
-IMUDET_VERSION = 0x494D5531   # "IMU1"
+IMUDET_VERSION = 0x494D5532   # "IMU2" (axi_iic revision)
 
 def _decode_imu_result(word):
     return {
-        'present':  bool(word & 0x1),
-        'ack':      bool(word & 0x2),
-        'timeout':  bool(word & 0x4),
-        'idle_sda': bool(word & 0x08),   # bit3
-        'idle_scl': bool(word & 0x10),   # bit4
-        'chip_id':  (word >> 8) & 0xFF,
+        'present': bool(word & 0x1),   # ACKed AND chip_id == 0xA0
+        'ack':     bool(word & 0x2),   # a device ACKed its address at 0x28
+        'chip_id': (word >> 8) & 0xFF,
     }
 
 def detect_imu(sock):
-    """Ask the detect bitstream to probe both headstage ports for a BNO055,
-    and print a per-port verdict. Safe: the PL senses idle levels first and
-    only drives I2C when both lines idle high (no LVDS-headstage contention)."""
+    """Probe both headstage ports for a BNO055 over the shared-lane I2C (via the
+    detect bitstream's two AXI IIC controllers) and print a per-port verdict."""
     ok, data = send_binary_command(sock, CMD_DETECT_IMU, timeout=2.0)
     if not ok or data is None or len(data) < 12:
         print("[DETECT] no/short response -- is the detect bitstream loaded?")
@@ -308,16 +304,11 @@ def detect_imu(sock):
         r = res[port]
         if r['present']:
             print(f"Port {port}: IMU present (BNO055, chip_id=0x{r['chip_id']:02X})")
+        elif r['ack']:
+            print(f"Port {port}: device answered at 0x28 but chip_id=0x{r['chip_id']:02X} "
+                  f"!= 0xA0 (not a BNO055)")
         else:
-            idle = f"{int(r['idle_scl'])}{int(r['idle_sda'])}"  # scl,sda
-            if idle == '11' and r['ack']:
-                why = f"device ACKed but chip_id=0x{r['chip_id']:02X} != 0xA0"
-            elif idle == '11':
-                why = "lines idle high but no I2C response (no device)"
-            else:
-                why = f"lines not both-high (idle scl,sda={idle}) -- LVDS/absent headstage, did not probe"
-            extra = " [I2C timeout]" if r['timeout'] else ""
-            print(f"Port {port}: no IMU -- {why}{extra}")
+            print(f"Port {port}: no IMU (nothing answered at 0x28)")
     return res
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
