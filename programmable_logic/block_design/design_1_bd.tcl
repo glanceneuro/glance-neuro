@@ -171,6 +171,7 @@ led_status_controller\
 axi_lite_registers\
 data_generator\
 intan_spi_lvds_buffer\
+stim_top\
 "
 
    set list_mods_missing ""
@@ -249,6 +250,11 @@ proc create_root_design { parentCell } {
   set UART1_TX_0 [ create_bd_port -dir O UART1_TX_0 ]
   set UART1_RX_0 [ create_bd_port -dir I UART1_RX_0 ]
   set digital_in_0 [ create_bd_port -dir I -from 7 -to 0 digital_in_0 ]
+
+  # DAC70502 stimulus SPI pins (constraints/dac_pins.xdc: W18/R18/T17)
+  set dac_sclk [ create_bd_port -dir O dac_sclk ]
+  set dac_sync_n [ create_bd_port -dir O dac_sync_n ]
+  set dac_sdin [ create_bd_port -dir O dac_sdin ]
 
   # Create instance: processing_system7_0, and set properties
   set processing_system7_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 processing_system7_0 ]
@@ -627,7 +633,7 @@ proc create_root_design { parentCell } {
   # Create instance: smartconnect_0, and set properties
   # GP0 (1 SI) -> { axi_lite_registers, axi_cdma_0/S_AXI_LITE } (2 MI)
   set smartconnect_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect_0 ]
-  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2}] $smartconnect_0
+  set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {3}] $smartconnect_0
 
 
   # Create instance: smartconnect_1, and set properties
@@ -706,6 +712,17 @@ proc create_root_design { parentCell } {
      return 1
    }
   
+  # Create instance: stim_top (DAC70502 stimulus peripheral), and set properties
+  set block_name stim_top
+  set block_cell_name stim_top
+  if { [catch {set stim_top [create_bd_cell -type module -reference $block_name $block_cell_name] } errmsg] } {
+     catch {common::send_gid_msg -ssname BD::TCL -id 2095 -severity "ERROR" "Unable to add referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+   } elseif { $stim_top eq "" } {
+     catch {common::send_gid_msg -ssname BD::TCL -id 2096 -severity "ERROR" "Unable to referenced block <$block_name>. Please add the files for ${block_name}'s definition into the project."}
+     return 1
+   }
+
   # Create instance: data_generator, and set properties
   set block_name data_generator
   set block_cell_name data_generator
@@ -754,6 +771,9 @@ proc create_root_design { parentCell } {
   connect_bd_intf_net -intf_net smartconnect_1_M00_AXI [get_bd_intf_pins axi_bram_ctrl_0/S_AXI] [get_bd_intf_pins smartconnect_1/M00_AXI]
   # CDMA control regs from GP0 (smartconnect_0 second master)
   connect_bd_intf_net -intf_net smartconnect_0_M01_AXI [get_bd_intf_pins smartconnect_0/M01_AXI] [get_bd_intf_pins axi_cdma_0/S_AXI_LITE]
+
+  # Stimulus peripheral from GP0 (smartconnect_0 third master)
+  connect_bd_intf_net -intf_net smartconnect_0_M02_AXI [get_bd_intf_pins smartconnect_0/M02_AXI] [get_bd_intf_pins stim_top/s_axi]
   # CDMA data-mover master into smartconnect_1 (reaches BRAM + HP0/DDR)
   connect_bd_intf_net -intf_net axi_cdma_0_M_AXI [get_bd_intf_pins axi_cdma_0/M_AXI] [get_bd_intf_pins smartconnect_1/S01_AXI]
   # smartconnect_1 second master -> PS HP0 slave (DDR write path)
@@ -772,8 +792,10 @@ proc create_root_design { parentCell } {
   [get_bd_pins proc_sys_reset_0_84M/slowest_sync_clk] \
   [get_bd_pins axi_lite_registers/pl_clk] \
   [get_bd_pins led_status_controller/clk] \
+  [get_bd_pins stim_top/pl_clk] \
   [get_bd_pins data_generator/clk]
   connect_bd_net -net clk_wiz_0_84M_clk_out2  [get_bd_pins clk_wiz_0_84M_175M/clk_out2] \
+  [get_bd_pins stim_top/s_axi_aclk] \
   [get_bd_pins smartconnect_0/aclk] \
   [get_bd_pins smartconnect_1/aclk] \
   [get_bd_pins processing_system7_0/M_AXI_GP1_ACLK] \
@@ -792,7 +814,16 @@ proc create_root_design { parentCell } {
   [get_bd_pins axi_lite_registers/status_regs_pl] \
   [get_bd_pins led_status_controller/status_regs_pl]
   connect_bd_net -net digital_in_0_1  [get_bd_ports digital_in_0] \
-  [get_bd_pins data_generator/digital_in]
+  [get_bd_pins data_generator/digital_in] \
+  [get_bd_pins stim_top/digital_in]
+  connect_bd_net -net data_generator_master_timestamp  [get_bd_pins data_generator/master_timestamp] \
+  [get_bd_pins stim_top/master_timestamp]
+  connect_bd_net -net stim_top_dac_sclk  [get_bd_pins stim_top/dac_sclk] \
+  [get_bd_ports dac_sclk]
+  connect_bd_net -net stim_top_dac_sync_n  [get_bd_pins stim_top/dac_sync_n] \
+  [get_bd_ports dac_sync_n]
+  connect_bd_net -net stim_top_dac_sdin  [get_bd_pins stim_top/dac_sdin] \
+  [get_bd_ports dac_sdin]
   connect_bd_net -net led_status_controller_0_led0  [get_bd_pins led_status_controller/led0] \
   [get_bd_ports led0]
   connect_bd_net -net led_status_controller_0_led1  [get_bd_pins led_status_controller/led1] \
@@ -800,6 +831,7 @@ proc create_root_design { parentCell } {
   connect_bd_net -net proc_sys_reset_0_peripheral_aresetn  [get_bd_pins proc_sys_reset_0_84M/peripheral_aresetn] \
   [get_bd_pins axi_lite_registers/pl_rstn] \
   [get_bd_pins led_status_controller/rstn] \
+  [get_bd_pins stim_top/pl_rstn] \
   [get_bd_pins data_generator/rstn]
   connect_bd_net -net proc_sys_reset_175MHz_interconnect_aresetn  [get_bd_pins proc_sys_reset_175MHz/interconnect_aresetn] \
   [get_bd_pins smartconnect_0/aresetn] \
@@ -807,7 +839,8 @@ proc create_root_design { parentCell } {
   [get_bd_pins axi_cdma_0/s_axi_lite_aresetn] \
   [get_bd_pins axi_bram_ctrl_0/s_axi_aresetn] \
   [get_bd_pins axi_bram_ctrl_1/s_axi_aresetn] \
-  [get_bd_pins axi_lite_registers/s_axi_aresetn]
+  [get_bd_pins axi_lite_registers/s_axi_aresetn] \
+  [get_bd_pins stim_top/s_axi_aresetn]
   connect_bd_net -net processing_system7_0_FCLK_CLK0  [get_bd_pins processing_system7_0/FCLK_CLK0] \
   [get_bd_pins rst_ps7_0_100M/slowest_sync_clk] \
   [get_bd_pins clk_wiz_0_84M_175M/clk_in1]
@@ -827,6 +860,10 @@ proc create_root_design { parentCell } {
   assign_bd_address -offset 0x40000000 -range 0x00010000 -with_name SEG_axi_lite_registers_0_reg0 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs axi_lite_registers/s_axi/reg0] -force
   # CDMA control registers in the PS GP address space
   assign_bd_address -offset 0x44A00000 -range 0x00010000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs axi_cdma_0/S_AXI_LITE/Reg] -force
+  # Stimulus peripheral: registers + 64K frame-RAM window in one 128K aperture.
+  # The base must stay 128K-aligned -- stim_axi_regs decodes absolute address
+  # bits, which only equals the aperture offset at aligned bases.
+  assign_bd_address -offset 0x43C00000 -range 0x00020000 -target_address_space [get_bd_addr_spaces processing_system7_0/Data] [get_bd_addr_segs stim_top/s_axi/reg0] -force
   # CDMA master view: it must reach the capture BRAM (read src), the LFP output
   # BRAM (read src -- the PL builds the whole LFP wire packet there and the PS
   # CDMAs it straight into the pbuf), and DDR via HP0 (write dst).

@@ -323,7 +323,13 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define PROTOCOL_VERSION               1
 #define FIRMWARE_VERSION_MAJOR         2
 // MAJOR bumps when the wire contract breaks; MINOR when it only grows.
-#define FIRMWARE_VERSION_MINOR         1   // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
+#define FIRMWARE_VERSION_MINOR         2   // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
+                                           //      + firmware driver + host API, TCP cmds 0xA0..0xAD).
+                                           //      ADDITIVE over 2.1.0.0 -- the broadband/aux/LFP wire
+                                           //      contract is UNCHANGED (stim is control-only + a PL
+                                           //      peripheral; no new UDP stream), so a 2.1.x host still
+                                           //      interoperates. See docs/stim.md.
+                                           // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
                                            //      (a stream_type=2 producer). ADDITIVE over 2.0.0.0 --
                                            //      the broadband + aux wire contract is UNCHANGED, so a
                                            //      2.0.x host still interoperates. LFP is a second stream

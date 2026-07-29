@@ -3,6 +3,7 @@
 
 #include "main.h"
 #include "platform.h"
+#include "pl_stim.h"
 #include "sleep.h"
 #include <string.h>
 #include <stdio.h>
@@ -575,6 +576,10 @@ int main() {
 
   pl_set_copi_commands(initialization_cmd_sequence);
   service_network();   // keep the RX pool drained across PL init
+
+  // Stimulus DAC to its safe state: soft-reset, then power-down (outputs
+  // parked at 1k-to-AGND until the first playback). See docs/stim.md.
+  pl_stim_boot_init();
   
   send_message("System ready. Commands: start, stop, reset_timestamp, status\r\n");
   send_message("debug> ");

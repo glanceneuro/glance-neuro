@@ -55,6 +55,7 @@ Most commands reply with a small ack; `GET_STATUS`, `READ_REGISTER`, etc. reply 
 | `0x74` | WRITE_REGISTER | p1 = reg, p2 = value | inject a one-shot RHD `WRITE(reg,value)` on aux slot 2 → 4-byte echo |
 | `0x75` | SET_FAST_SETTLE | p1 = amp cfg, p2 = dsp cfg | `sw \| gpio_en<<1 \| pin<<4` per field |
 | `0x76` | SET_DIGOUT | p1 = sw \| gpio_en<<1 \| pin<<4; p2 = reg3 static byte | digital-out control |
+| `0xA0`–`0xAD` | STIM_* | see `docs/stim.md` | DAC70502 stimulus playback: window/loop/rate/trigger config, start/stop/trigger, safe-state, upload + CRC verify, status |
 
 > **Removed in v2:** `0x72 AUX_SEQ_EN`. The aux command engine is **always on** — there is no
 > enable step — so the command was retired. (A v1 host that sends it will not interoperate;
