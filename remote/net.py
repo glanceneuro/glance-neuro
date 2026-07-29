@@ -385,6 +385,34 @@ def set_config(sock, name):
         print(f"Config '{name}' FAILED: {_PL_STATUS.get(rc, f'error {rc}')} (rc={rc})")
     return {"rc": rc, "bytes": nbytes, "is_acq": is_acq, "link_up": link_up}
 
+def print_command_help():
+    """The single command menu -- printed at connect AND by the `help` command,
+    so the two can't drift. (The `help` command used to be a separate stale copy
+    missing stim / IMU / PL / set_config.)"""
+    print("\n[TCP] Available commands:")
+    print("  Basic: start, stop, reset_timestamp, loop <count>")
+    print("  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
+    print("  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
+    print("  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
+    print("  Debug: dump_bram [start] [count], stats, hex")
+    print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], lfp_sink  (UDP_PORT, stream_type=2)")
+    print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
+    print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
+    print("  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
+    print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
+    print("       set_config <acquisition|scan>  (PCAP-swap the whole fabric; only when NOT streaming)")
+    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
+    print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
+    print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
+    print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
+    print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
+    print("  auto_cable_detect - Automated cable detection!")
+    print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
+    print("       read_reg <r>, write_reg <r> <v>, aux_selftest")
+    print("       fast_settle <0|1> [dsp] | gpio <pin> | off")
+    print("       digout <0|1> | gpio <pin> | hiz")
+    print("  Utility: help, quit")
+
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
 # drains 5000 promiscuously and fans the LFP frames out to subscribers, so the
@@ -752,6 +780,13 @@ class CableDetection:
         normal convert sequence (mirror applyDetectionConfig)."""
         if not result.success:
             return False
+
+        # Stop before applying the mask: control registers latch only while
+        # transmission is inactive, so setting channel_enable mid-stream keeps the
+        # old (0xFF, 616-byte) detection size flowing until a stop/start. Stopping
+        # here lets the applied mask take effect and the pipe drain to the new size.
+        self.send_cmd(CMD_STOP)
+        time.sleep(0.02)
 
         ok = (self.send_cmd(CMD_SET_PHASE, result.best_phase0, result.best_phase0)[0] and
               self.send_cmd(CMD_SET_PHASE_B, result.best_phase1, result.best_phase1)[0] and
@@ -1349,9 +1384,12 @@ class DataValidator:
             self.last_stats_time = self.start_time
 
         if len(data) != self.expected_packet_size_bytes:
-            self.size_errors += 1
-            self.error_count += 1
-            print(f"[ERROR] Packet {self.packet_count}: Wrong size {len(data)}, expected {self.expected_packet_size_bytes}")
+            # During cable detection the expected size churns (0xFF -> the detected
+            # mask) while packets are still in flight -- don't flag those as errors.
+            if self.cable_detector is None:
+                self.size_errors += 1
+                self.error_count += 1
+                print(f"[ERROR] Packet {self.packet_count}: Wrong size {len(data)}, expected {self.expected_packet_size_bytes}")
             return None
 
         try:
@@ -1386,7 +1424,10 @@ class DataValidator:
 
             # SEQ continuity check: each broadband packet's SEQ must be exactly
             # +1 (mod 2^32) from the previous. A gap = lost broadband packet(s).
-            if self.last_seq is not None:
+            # During cable detection the stream is stopped/restarted per phase, so
+            # the sequence legitimately resets -- those are not losses, so don't
+            # count/print them while a detector is attached.
+            if self.last_seq is not None and self.cable_detector is None:
                 expected_seq = (self.last_seq + 1) & 0xFFFFFFFF
                 if seq != expected_seq:
                     self.seq_gaps += 1
@@ -2928,6 +2969,10 @@ def run_detection(sock, verbose=True):
     
     finally:
         validator.set_cable_detector(None)
+        # Detection stopped/restarted the stream and reset the master timestamp,
+        # so re-baseline the sequence tracker -- the first real packet after this
+        # must not be scored as a gap against a stale last_seq.
+        validator.last_seq = None
 
 
 def configure_tcp_keepalive(sock):
@@ -3066,28 +3111,7 @@ def tcp_control():
             print_status(status)
             validator.set_channel_enable(status['channel_enable'])
         
-        print(f"\n[TCP] Available commands:")
-        print(f"  Basic: start, stop, reset_timestamp, loop <count>")
-        print(f"  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
-        print(f"  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
-        print(f"  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
-        print(f"  Debug: dump_bram [start] [count], stats, hex")
-        print(f"  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
-        print(f"         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
-        print(f"  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
-        print(f"  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
-        print(f"  PL:  load_pl [name]  (deferred-boot image: program a fabric from SD via PCAP; default 'detect')")
-        print(f"  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
-        print(f"        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
-        print(f"        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
-        print(f"        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
-        print(f"  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
-        print(f"  auto_cable_detect - Automated cable detection!")
-        print(f"  Aux: aux_demo, aux_bank <slot> <bank>, aux")
-        print(f"       read_reg <r>, write_reg <r> <v>, aux_selftest")
-        print(f"       fast_settle <0|1> [dsp] | gpio <pin> | off")
-        print(f"       digout <0|1> | gpio <pin> | hiz")
-        print(f"  Utility: help, quit")
+        print_command_help()
         
         while True:
             try:
@@ -3406,33 +3430,7 @@ def tcp_control():
                     except (ValueError, IndexError):
                         print("Usage: digout <0|1> | gpio <pin> | hiz")
                 elif cmd == "help":
-                    print("Commands:")
-                    print("  start, stop, reset_timestamp")
-                    print("  loop <count>, set_phase <p0> <p1>")
-                    print("  set_debug <0|1>, set_channels <0x00-0xFF>")
-                    print("  convert, init, cable_test")
-                    print("  full_cable_test, manual_cable_test")
-                    print("  auto_cable_detect - NEW: Automated detection!")
-                    print("  set_udp <ip> <port>, get_status, perf_reset, ping")
-                    print("  dump_bram [start] [count]")
-                    print("  stats, hex, quit")
-                    print("LFP / Tier-1 (unified UDP 0x6800, stream_type=2):")
-                    print("  lfp_config [linear|minimum] [taps] - upload the stage-2 filter")
-                    print("  lfp_on / lfp_off    - enable / disable the engine")
-                    print("  lfp_recv [n]        - capture + print decoded LFP frames")
-                    print("  sink                - live per-stream counters: packet counts,")
-                    print("                        per-stream SEQ gaps, host ring drops")
-                    print("  (LFP lane mask = the broadband channel_enable mask -- pick lanes")
-                    print("   with set_channels; run lfp_config + set_channels BEFORE lfp_on)")
-                    print("Aux sequencer (bank-programmable aux commands):")
-                    print("  aux_demo            - load the default slot programs")
-                    print("  aux_bank <slot> <bank> - atomic bank swap (live)")
-                    print("  aux                 - decode last packet's command echo")
-                    print("  read_reg <r> / write_reg <r> <v> - runtime RHD register access")
-                    print("  aux_selftest        - read the INTAN ROM back via slot-2 inject (validates the")
-                    print("                        aux register path + headstage; needs streaming)")
-                    print("  fast_settle <0|1> [dsp] | gpio <pin> | off")
-                    print("  digout <0|1> | gpio <pin> | hiz")
+                    print_command_help()
                 else:
                     print(f"Unknown command: '{cmd}'. Type 'help' for list.")
 
