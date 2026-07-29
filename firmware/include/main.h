@@ -14,7 +14,7 @@
 // ============================================================================
 // Ports chosen to avoid common OS conflicts (macOS AirPlay 5000/7000, X11 6000,
 // Windows Hyper-V reserved ranges) and to sit below every ephemeral-port floor.
-#define UDP_PORT 0x6800   // 26624 -- unified data stream (broadband)
+#define UDP_PORT 0x6800   // 26624 -- unified data stream (broadband + LFP)
 #define TCP_PORT 0x6900   // 26880 -- control channel
 
 // Default UDP destination (can be changed via TCP command)
@@ -72,11 +72,11 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 // ============================================================================
 // UNIFIED PACKET FORMAT (docs/unified-packet-format.md)
 // ----------------------------------------------------------------------------
-// The PL stream emits an 8 x 32-bit little-endian common header, then a
-// stream-specific payload, on UDP_PORT. The host demuxes by stream_type (this
-// broadband-only build produces stream_type=1 only). The PL builds the whole
-// header in its BRAM; the PS does NO header math (DMA-into-pbuf rule). Keep this
-// in sync with the PL builder (data_generator_core.sv) and net.py.
+// Every PL stream (broadband + LFP) emits the SAME 8 x 32-bit little-endian
+// common header, then a stream-specific payload, all on ONE UDP port (UDP_PORT).
+// The host demuxes by stream_type. The PL builds the whole header in its BRAM;
+// the PS does NO header math (DMA-into-pbuf rule). Keep this in sync with the
+// PL builders (data_generator_core.sv / lfp_dsp_block.sv) and net.py.
 //
 //   word 0  MAGIC      = 0xCAFEBABE
 //   word 1  TYPE_VER   = stream_type[7:0] | version[15:8] | flags[31:16]
@@ -89,6 +89,8 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define UNIFIED_VERSION         1
 #define UNIFIED_HEADER_WORDS    8
 #define STREAM_TYPE_BROADBAND   1
+#define STREAM_TYPE_LFP         2
+// stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
 
 // Packet size calculation based on channel_enable bits.
 // channel_enable is now 8 bits: [3:0] = port 0 streams, [7:4] = port 1 (dual
@@ -107,6 +109,28 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define MAX_WORDS_PER_PACKET    (PACKET_HEADER_WORDS + MAX_PACKET_DATA_WORDS) // 154 words
 #define MIN_WORDS_PER_PACKET    (PACKET_HEADER_WORDS + MIN_PACKET_DATA_WORDS) // 32 words
 
+// ---- Capture-BRAM read method ----------------------------------------------
+// The PS M_AXI_GP master corrupts long *burst* reads of the capture BRAM (the
+// 0xFF dual-port dropout). What we learned chasing it:
+//   SINGLE - word-by-word Xil_In32. CLEAN by construction: each read is its own
+//            1-beat AXI transaction, so it never issues the burst that the GP
+//            master mishandles. But it is latency-bound and too slow to sustain
+//            0xFF (256 ch, 150-word packets) at the 131.25 MHz AXI clock.
+//            Raising the AXI clock to 210 MHz DID make single-beat fast enough --
+//            but 210 MHz is over the -1 part's M_AXI_GP ~150 MHz spec
+//            (clk_out2 also clocks the GP master), so it is bench-only, not
+//            shippable. Kept here as the conceptual reference / fallback.
+//   DMA    - an AXI CDMA (a PL master) copies each packet BRAM -> DDR over
+//            S_AXI_HP0 (see pl_dma.c), taking the PS GP master off the bulk-read
+//            path entirely. Clean at full bandwidth, in-spec at 131.25 MHz, and
+//            it frees core 0. This is the fix. DEFAULT.
+// (A removed third option, inline-`ldmia` chunked CPU bursts, was a burst over
+//  the same broken GP master AND its asm scrambled word order -> wrong magic;
+//  see git history. Don't reintroduce CPU bursts of the BRAM.)
+#define BRAM_READ_DMA     0
+#define BRAM_READ_SINGLE  1
+#define BRAM_READ_METHOD  BRAM_READ_DMA
+
 // ============================================================================
 // AXI LITE CONTROL INTERFACE
 // ============================================================================
@@ -116,7 +140,7 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 
 // Number of PL control registers (must match axi_lite_registers N_CTRL --
 // the status registers are read back starting right after the control block)
-#define PL_N_CTRL_REGS      25
+#define PL_N_CTRL_REGS      28
 
 // Control register offsets
 #define CTRL_REG_0_OFFSET   (0 * 4)   // Enable transmission, reset timestamp, debug mode
@@ -140,6 +164,34 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define CTRL_REG_AUX_CTRL_OFFSET    (22 * 4)  // prog bank select + fast settle/digout/dsp config
 #define CTRL_REG_AUX_WRITE_OFFSET   (23 * 4)  // write port payload (RT reg / program)
 #define CTRL_REG_AUX_STROBE_OFFSET  (24 * 4)  // write/inject toggles + inject command
+
+// LFP/DSP engine control registers (PL regs 25..27; see lfp_dsp_block.sv)
+// Decimation is structural (/2 then /5 = /10), so only the enable and the
+// stage-2 tap count are configurable. [15:8] lane_mask and [23:16] decim_R are
+// retained on the wire for the host's benefit: the lane mask mirrors the
+// broadband channel_enable and decim_R always reads 10.
+#define CTRL_REG_LFP_CFG_OFFSET     (25 * 4)  // [0]en [15:8]lane_mask [23:16]decim_R [31:24]num_taps
+#define CTRL_REG_LFP_COEF_OFFSET    (26 * 4)  // [17:0] signed Q1.17 coefficient data
+#define CTRL_REG_LFP_STROBE_OFFSET  (27 * 4)  // [0] coef toggle, [1] ptr clear, [2] stage select
+#define LFP_STROBE_COEF_TOGGLE      (1u << 0)
+#define LFP_STROBE_PTR_CLR          (1u << 1)
+// Which filter the coefficient writes land in. Clear the pointer, then push.
+#define LFP_STROBE_STAGE_SEL        (1u << 2)  // 0 = stage 1 halfband, 1 = stage 2 decimator
+// Cascade geometry -- mirrors lfp_dsp_block.sv. The host reads these back in
+// get_status; changing them means changing the RTL parameters too.
+#define LFP_DECIM_STAGE1            2       // halfband:  30 kHz -> 15 kHz
+#define LFP_DECIM_STAGE2            5       // decimator: 15 kHz ->  3 kHz
+#define LFP_DECIM_TOTAL             (LFP_DECIM_STAGE1 * LFP_DECIM_STAGE2)  // 10
+#define LFP_HB_TAPS                 11      // stage-1 length (fixed)
+#define LFP_MAX_POLY_TAPS           120     // stage-2 maximum length
+#define LFP_STAGE_HALFBAND          0
+#define LFP_STAGE_DECIMATOR         1
+// LFP output BRAM (decimated stream, PS read via 2nd axi_bram_ctrl)
+#define LFP_BRAM_BASE_ADDR          0x84000000
+#define LFP_BRAM_SIZE_WORDS         16384      // 64 KB ring of 32-bit words (2x16-bit samples)
+// Unified-port format: the LFP band streams on the SAME UDP port as broadband
+// (udp_dest_port, default UDP_PORT), demuxed host-side by stream_type. There is
+// deliberately no second data port -- every PL stream shares this one.
 
 // CTRL_REG_AUX_CTRL bit fields
 // Program live-bank select: only slot 0 (the sole cycling program -- the accel
@@ -200,6 +252,7 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define STATUS_REG_10_OFFSET (STATUS_REG_BASE + 10 * 4)  // BRAM write address + FIFO count (added by wrapper)
 #define STATUS_REG_11_OFFSET (STATUS_REG_BASE + 11 * 4)  // Aux sequencer status
 #define STATUS_REG_12_OFFSET (STATUS_REG_BASE + 12 * 4)  // Aux injected-command read result
+#define STATUS_REG_13_OFFSET (STATUS_REG_BASE + 13 * 4)  // LFP: [15:0] BRAM wr byte-addr, [16] overrun
 
 // STATUS_REG_11 bit fields. Only slot 0 (the accel program) cycles: its bank bit
 // and index are the only ones that move. Slots 1 and 2 are fixed registers -- their
@@ -269,42 +322,22 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 // Protocol version
 #define PROTOCOL_VERSION               1
 #define FIRMWARE_VERSION_MAJOR         2
-#define FIRMWARE_VERSION_MINOR         0   // 2.0.0.0: aux command-path re-architecture -- MAJOR bump because the
-                                           //      aux wire contract broke: the aux_seq_en path is retired
-                                           //      (CMD_AUX_SEQ_EN 0x72 gone), the new aux_command_engine changes
-                                           //      the reg22 semantics, and the accel sweep is always-on on slot 0
-                                           //      (intra-packet reply @ data word 34). A 1.x host/plugin will not
-                                           //      interoperate -- PL + firmware + plugin move together. slot 1 =
-                                           //      fs register (default 'I' = READ(40)), slot 2 = inject register
-                                           //      (default temp = CONVERT(49)); program bank-select -> reg22[0].
-                                           //      No on-PL LFP/DSP engine: PL N_CTRL 25, N_STATUS 13,
-                                           //      status_response_t wire size 264 B; keep net.py get_status +
-                                           //      the _Static_assert in sync. Unified 8-word header UNCHANGED
-                                           //      (broadband = stream_type=1).
-                                           // 1.0.0.0: GLANCE broadband-only release (LFP/DSP stripped).
-                                           //      --- prior internal history ---
-                                           // 1.7: lwIP TX headroom -- n_tx_descriptors 64->256, mem_size
-                                           //      128K->256K (BSP lwip220 config) to eliminate the rare
-                                           //      udp_sendto ERR_MEM drops under ISR-stall catch-up bursts.
-                                           //      NOT the pbuf pool (pbuf_alloc never failed). Firmware
-                                           //      sources + struct unchanged (still 288 B); BSP regen only.
-                                           // 1.6: OCM staging REVERTED (back to DDR; OCM didn't help --
-                                           //      the recv->transmit tail is EMAC TX-done ISR preemption,
-                                           //      not DDR contention). Adds TX-drop instrumentation: split
-                                           //      udp_send_errors into bb/lfp pbuf-alloc-fail vs sendto-err
-                                           //      (+ err code), first/last drop packet index, and an 8-deep
-                                           //      drop-index ring; reports MEMP_NUM_PBUF. get_status -> 288 B.
-                                           // 1.4: recv->transmit spike instrumentation -- split the
-                                           //      timed window into CDMA / udp_sendto / other, capture
-                                           //      the worst packet's breakdown, a 6-bucket recv->transmit
-                                           //      histogram + over-budget count, and CMD_PERF_RESET to
-                                           //      clear the window. get_status grows to 220 bytes.
-                                           // 1.3: LFP default R=10 (3 kHz) + dual-MAC engine;
-                                           //      analytic chirp NCO (CTRL_REG_3). get_status adds
-                                           //      chirp config. Status wire = 168 bytes.
-                                           // 1.2: AXI-CDMA read path; get_status config tracking
-                                           //      (aux_ctrl + RHD register mirror); fast-settle/DSP/
-                                           //      digout via TTL/GPIO.
+// MAJOR bumps when the wire contract breaks; MINOR when it only grows.
+#define FIRMWARE_VERSION_MINOR         1   // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
+                                           //      (a stream_type=2 producer). ADDITIVE over 2.0.0.0 --
+                                           //      the broadband + aux wire contract is UNCHANGED, so a
+                                           //      2.0.x host still interoperates. LFP is a second stream
+                                           //      on the SAME unified port (0x6800, stream_type=2), with
+                                           //      the unified 8-word header unchanged. LFP control regs
+                                           //      25..27 + status reg 13; PL N_CTRL 28, N_STATUS 14.
+                                           //      status_response_t wire size 288 B (264 aux + 24 LFP):
+                                           //      keep net.py get_status, the _Static_assert, AND the
+                                           //      plugin parseStatusResponse in sync.
+                                           // 2.0.0.0: the current contract baseline. There is no aux
+                                           //      enable command (0x72 unassigned), the aux command
+                                           //      engine is always on, reg22 carries the override
+                                           //      semantics, and the accel slot-0 reply rides in-frame at
+                                           //      data word 34. A 1.x host does not interoperate.
 #define FIRMWARE_VERSION_PATCH         0
 #define FIRMWARE_VERSION_BUILD         0
 #define FIRMWARE_VERSION_WORD          ((FIRMWARE_VERSION_MAJOR << 24) | \
@@ -364,7 +397,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  aux_idx[3];        // per-slot sequence index
     uint8_t  reserved5[3];
 
-    // DMA / performance instrumentation (24 bytes; appended -- keep net.py in sync)
+    // DMA / performance instrumentation (24 bytes -- keep net.py in sync)
     // Raw global-timer ticks; host converts to us with timer_hz.
     uint32_t dma_errors;        // CDMA read failures since boot
     uint32_t dma_ticks_last;    // last CDMA transfer (ticks)
@@ -383,6 +416,16 @@ typedef struct __attribute__((packed)) {
     // (live D5/digout are in aux_ctrl/aux_flags). 22 bytes.
     uint8_t  rhd_reg[22];
 
+    // LFP/DSP engine configuration + status (CTRL_REG_LFP_CFG + STATUS_REG_13).
+    // Per the "get_status reports everything configurable" rule. 12 bytes.
+    uint8_t  lfp_enable;        // engine enabled
+    uint8_t  lfp_lane_mask;     // which of 8 streams are LFP-filtered
+    uint8_t  lfp_decim_R;       // decimation factor (packets per output)
+    uint8_t  lfp_num_taps;      // active FIR length
+    uint32_t lfp_packets_sent;  // LFP UDP packets emitted
+    uint8_t  lfp_overrun;       // sticky compute-overrun flag
+    uint8_t  lfp_reserved[3];
+
     // Analytic chirp NCO config (CTRL_REG_3 read-back). Per the "get_status
     // reports everything configurable" rule. 8 bytes.
     uint8_t  chirp_mode;        // 1 = chirp debug signal enabled
@@ -391,8 +434,8 @@ typedef struct __attribute__((packed)) {
     uint16_t chirp_rate;        // sweep_rate field (12-bit)
     uint8_t  chirp_reserved[2];
 
-    // recv->transmit spike instrumentation (52 bytes; appended -- keep net.py in
-    // sync). All times are raw global-timer ticks (host converts with timer_hz).
+    // recv->transmit spike instrumentation (52 bytes -- keep net.py in sync).
+    // All times are raw global-timer ticks (host converts with timer_hz).
     // The recv->transmit window (loop_ticks) is split into CDMA / udp_sendto /
     // other so the host can attribute the occasional ~40 us spike. The worst-case
     // snapshot is captured the instant a new loop_ticks_max is set, so we see WHAT
@@ -408,14 +451,18 @@ typedef struct __attribute__((packed)) {
     // recv->transmit histogram, microsecond bucket edges [<16,16-25,25-33,33-50,50-100,>=100]
     uint32_t loop_hist[6];      // counts per bucket
 
-    // TX drop diagnostics (v1.6): split udp_send_errors by failure mode, and
-    // record WHEN drops happen. Each zero-copy PBUF_REF send holds one MEMP_PBUF
-    // entry (MEMP_NUM_PBUF) until the GEM TX-done reaps it; pbuf_alloc()==NULL =>
-    // that pool was momentarily empty, a udp_sendto err (ERR_MEM) => no TX BD/mem.
-    // Cleared by CMD_PERF_RESET. 56 bytes (keep net.py + _Static_assert in sync).
+    // TX drop diagnostics: split udp_send_errors by stream + failure mode,
+    // and record WHEN drops happen. Each zero-copy PBUF_REF send holds one
+    // MEMP_PBUF entry (MEMP_NUM_PBUF, shared by broadband + LFP) until the GEM
+    // TX-done reaps it; pbuf_alloc()==NULL => that pool was momentarily empty,
+    // a udp_sendto err (ERR_MEM) => no TX BD/mem. Cleared by CMD_PERF_RESET.
+    // 68 bytes (keep net.py + _Static_assert in sync).
     uint32_t bb_pbuf_alloc_fail;  // broadband: pbuf_alloc returned NULL
     uint32_t bb_send_err;         // broadband: udp_sendto() != ERR_OK
     int32_t  bb_last_send_err;    // broadband: last err_t (ERR_MEM = -1, ...)
+    uint32_t lfp_pbuf_alloc_fail; // LFP: pbuf_alloc returned NULL
+    uint32_t lfp_send_err;        // LFP: udp_sendto() != ERR_OK
+    int32_t  lfp_last_send_err;   // LFP: last err_t
     uint32_t first_drop_pkt;      // packets_received_count at the first broadband drop
     uint32_t last_drop_pkt;       // ... at the most recent broadband drop
     uint32_t memp_num_pbuf;       // = MEMP_NUM_PBUF (shared zero-copy pool size)
@@ -469,9 +516,15 @@ extern uint32_t send_ticks_last, send_ticks_max;
 extern uint32_t over_budget_count;
 extern uint32_t worst_pkt_index, worst_cdma_ticks, worst_send_ticks, worst_other_ticks;
 extern uint32_t loop_hist[PERF_HIST_BUCKETS];
-// TX drop diagnostics (v1.6)
+// TX drop diagnostics
 extern uint32_t bb_pbuf_alloc_fail, bb_send_err;
+// Broadband NO-LOSS retry stats: bb_send_err counts only the drops that
+// survived every retry, so these say how often the retry actually saved a packet.
+extern uint32_t bb_send_retries, bb_pbuf_retries, bb_send_recovered;
+extern uint32_t staging_slot;   // rotating zero-copy staging-ring slot
 extern int32_t  bb_last_send_err;
+extern uint32_t lfp_pbuf_alloc_fail, lfp_send_err;
+extern int32_t  lfp_last_send_err;
 extern uint32_t first_drop_pkt, last_drop_pkt;
 extern uint32_t drop_ring[8];
 extern uint32_t drop_ring_idx;
@@ -601,5 +654,34 @@ void collect_status_data(status_response_t* status);
 void abort_tcp_connections(void);
 void stop_tcp_server(void);
 void stop_udp_stream(void);
+
+// ============================================================================
+// LFP/DSP ENGINE (Tier-1) -- control + streaming
+// ============================================================================
+// Control (pl_control.c): config latches while streaming is stopped.
+// NOTE: the LFP lane mask is NOT a separate parameter -- it MIRRORS the
+// broadband channel-enable mask in the PL (single source of truth). The PL
+// builds the complete LFP wire packet (header + samples) in its output BRAM, so
+// the PS just CDMAs it into a pbuf and sends it.
+void pl_lfp_set_config(uint8_t enable, uint8_t num_taps);  // decimation is structural (/10)
+void pl_lfp_coef_begin(int stage);                        // select a filter, clear its write pointer
+void pl_lfp_coef_push(int32_t coef);                      // write one 18-bit Q1.17 tap
+void pl_lfp_upload_coeffs(int stage, const int32_t *coeffs, int n);  // begin + push array
+uint32_t pl_lfp_read_status(void);                        // STATUS_REG_13
+
+// Streaming (network.c): drain the LFP output BRAM -> UDP on the unified port
+// (udp_dest_port, default UDP_PORT), demuxed host-side by stream_type=2.
+// The two PL -> host stream services (src-core0/stream.c). Each turns a packet
+// the PL has already assembled in a BRAM ring into a UDP datagram; they differ
+// only in retry policy.
+void broadband_stream_service(void);   // broadband: drain every ready packet
+void lfp_stream_init(void);
+void lfp_stream_service(void);   // call from the core-0 main loop, after broadband
+void lfp_stream_resync(void);    // re-align the PS read pointer after a lane-mask change
+
+// Tracked config / counters (mirrored into status_response_t). The lane mask is
+// the broadband channel_enable (reported via pl_get_current_channel_enable()).
+extern uint8_t  lfp_cfg_enable, lfp_cfg_decim_R, lfp_cfg_num_taps;
+extern uint32_t lfp_udp_packets_sent;
 
 #endif // MAIN_H

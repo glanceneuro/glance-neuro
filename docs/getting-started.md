@@ -56,20 +56,28 @@ bitstream must be re-staged into the path `boot.bif` references before running `
 
 Needs **Vivado + Vitis 2025.1**.
 
-```bash
-# PL bitstream
-source <vivado>/settings64.sh
-vivado -mode batch -source scripts/create_vivado_project.tcl   # -> vivado_project/
-vivado -mode batch -source scripts/build_bitstream.tcl         # -> vivado_project/klab_project.xsa
+The repo ships a bootable image at `blobs/BOOT.bin`, built from the source beside it, so
+you only need this if you are changing the design.
 
-# PS firmware (both cores)
-source <vitis>/settings64.sh
-vitis -s scripts/create_vitis_project.py     # platform + both apps (clean vitis_workspace/ first)
-vitis -s scripts/build_vitis_project.py      # incremental firmware-only rebuild
+```bash
+scripts/build.sh
 ```
-The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`. A PL-only change
-needs only a bitstream re-stage + `bootgen` (the firmware ELFs don't depend on PL clocks).
-Full build notes and gotchas are in [`../CLAUDE.md`](../CLAUDE.md).
+
+That is the whole build. It fingerprints the PL sources to decide whether the fabric needs
+re-synthesising (~18 min) or can be reused (~3 min), regenerates the firmware against the
+current hardware definition either way, produces `blobs/BOOT.bin`, and then checks what it
+made — timing closed, and the bitstream inside the image identical to the one
+implementation produced. It fails rather than emit an image it cannot vouch for.
+
+```bash
+scripts/build.sh --check      # say what would be rebuilt, change nothing
+scripts/build.sh --force-pl   # re-synthesise the PL even if unchanged
+```
+
+Needs **Vivado + Vitis 2025.1**; set `XILINX_ROOT` if they are not at `/opt/Xilinx/2025.1`.
+The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`.
+
+Copy `blobs/BOOT.bin` to the FAT32 boot partition of the SD card to flash it.
 
 ## 5. First connection
 

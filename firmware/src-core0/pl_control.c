@@ -115,6 +115,11 @@ void pl_set_channel_enable(int channel_enable) {
     Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_2_OFFSET, ctrl_reg_2);
     send_message("PL channel enable set to 0x%02X (port0=0x%X port1=0x%X)\r\n",
                  channel_enable & 0xFF, channel_enable & 0xF, (channel_enable >> 4) & 0xF);
+
+    // The LFP frame size is derived from this mask, so the framing the PS is
+    // mid-way through reading is now stale. Resynchronise rather than let it
+    // misparse every following frame.
+    lfp_stream_resync();
 }
 
 // ============================================================================
@@ -133,7 +138,7 @@ int pl_is_transmission_active(void) {
 }
 
 uint32_t pl_get_packets_sent(void) {
-    return Xil_In32(PL_CTRL_BASE_ADDR + STATUS_REG_2_OFFSET);  // Moved to register 2
+    return Xil_In32(PL_CTRL_BASE_ADDR + STATUS_REG_2_OFFSET);
 }
 
 int pl_is_loop_limit_reached(void) {
@@ -478,9 +483,9 @@ int pl_aux_confirm_bank(int slot, int bank, int timeout_ms) {
     return 0;
 }
 
-// pl_aux_seq_enable / pl_aux_seq_is_enabled retired: the aux engine is always on
-// (aux-default). There is no enable/disable, and hence no OFF-injection ordering
-// to manage -- clearing fast-settle now always reaches the chip.
+// The aux engine is always on, so there is deliberately no enable/disable entry
+// point here. With nothing to gate, there is no OFF-injection ordering to
+// manage: clearing fast-settle always reaches the chip.
 
 // cfg carries the AUX_CTRL fast-settle + DSP fields (bits [13:4])
 void pl_aux_set_fast_settle(uint32_t cfg) {
@@ -629,4 +634,56 @@ void pl_run_full_cable_test(void) {
     send_message("  1. Check received packets for 'INTAN' pattern\r\n");
     send_message("  2. Look for 0x0049 ('I') in word indices 8,9\r\n");
     send_message("  3. Use optimal phase settings found\r\n");
+}
+
+// ============================================================================
+// LFP/DSP engine control (CTRL_REG_LFP_*; see lfp_dsp_block.sv)
+// ============================================================================
+// Total decimation is fixed by the cascade: 30 kHz / 10 = 3 kHz LFP.
+uint8_t  lfp_cfg_enable = 0, lfp_cfg_decim_R = 10, lfp_cfg_num_taps = 0;
+
+// The LFP lane mask MIRRORS the broadband channel-enable mask in the PL (single
+// source of truth -- driven by data_generator_core's channel_enable_reg). The
+// lfp_cfg[15:8] lane_mask field is left at 0 on the wire: the PL ignores it.
+void pl_lfp_set_config(uint8_t enable, uint8_t num_taps) {
+    // decim_R is reported, not commanded: the cascade is wired /2 then /5.
+    uint32_t cfg = ((uint32_t)enable & 0x1)
+                 | ((uint32_t)LFP_DECIM_TOTAL << 16)
+                 | ((uint32_t)num_taps        << 24);
+    Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_LFP_CFG_OFFSET, cfg);
+    lfp_cfg_enable = enable;
+    lfp_cfg_decim_R = LFP_DECIM_TOTAL; lfp_cfg_num_taps = num_taps;
+}
+
+// Coefficient upload through the indirect window (mirrors the aux-bank strobe-
+// write CDC pattern). Load while the engine is disabled. The host streams taps
+// one CMD_LFP_WRITE_COEF at a time, so expose begin/push; pl_lfp_upload_coeffs
+// is the local array convenience.
+static uint32_t lfp_coef_strobe = 0;
+
+void pl_lfp_coef_begin(int stage) {
+    // The stage bit must be held across the whole upload, including the clear,
+    // so both the pointer reset and every subsequent write target one filter.
+    uint32_t sel = (stage == LFP_STAGE_DECIMATOR) ? LFP_STROBE_STAGE_SEL : 0u;
+    Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_LFP_STROBE_OFFSET, LFP_STROBE_PTR_CLR | sel);
+    usleep(2);
+    lfp_coef_strobe = sel;
+    Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_LFP_STROBE_OFFSET, lfp_coef_strobe);  // release
+    usleep(2);
+}
+
+void pl_lfp_coef_push(int32_t coef) {
+    Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_LFP_COEF_OFFSET, (uint32_t)(coef & 0x3FFFF));
+    lfp_coef_strobe ^= LFP_STROBE_COEF_TOGGLE;
+    Xil_Out32(PL_CTRL_BASE_ADDR + CTRL_REG_LFP_STROBE_OFFSET, lfp_coef_strobe);
+    usleep(2);
+}
+
+void pl_lfp_upload_coeffs(int stage, const int32_t *coeffs, int n) {
+    pl_lfp_coef_begin(stage);
+    for (int j = 0; j < n; j++) pl_lfp_coef_push(coeffs[j]);
+}
+
+uint32_t pl_lfp_read_status(void) {
+    return Xil_In32(PL_CTRL_BASE_ADDR + STATUS_REG_13_OFFSET);
 }

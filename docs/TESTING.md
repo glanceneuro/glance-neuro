@@ -1,40 +1,115 @@
 # Testing
 
-The verification that ships with the broadband + aux datapath. RTL sims use Vivado's
-`xsim` (`source /opt/Xilinx/2025.1/Vivado/settings64.sh` first); each `run_*.sh`
-compiles the RTL it needs, runs the sim, and prints `RESULT: PASS` / `RESULT: FAIL`.
+RTL simulations run under Vivado's `xsim` (`source /opt/Xilinx/2025.1/Vivado/settings64.sh`
+first). Host checks run from `remote/`.
 
-Every test here asserts *intended behavior directly* — against a spec-derived
-reference or the AXI protocol, never a diff against older code — so it stays
-meaningful as the design evolves. Run the relevant one after changing the code it
-covers; each testbench's header says what it guards and when it should legitimately
-fail.
+## What earns a test
+
+**A test is a liability as well as an asset.** It has to be read, kept working, and
+believed. One that no longer guards anything still costs all three, and worse, a suite
+full of noise trains you to skim past a real failure.
+
+The bar for keeping a testbench here is narrow:
+
+- **It guards a contract, not an implementation.** Byte-exact output against a
+  reference, a wire format, a handshake — something that would still be true after a
+  rewrite.
+- **It guards code that still changes.** A test over frozen code is documentation with
+  a runtime cost; write documentation instead.
+- **Its failure would otherwise be silent.** The aux command path is the clearest case:
+  a regression there is invisible on the wire and produces plausible-looking data.
+
+What gets retired rather than migrated:
+
+- one-off debug benches written to chase a specific bug, once it is fixed
+- migration tests that only proved an old and a new path agreed, once the old one is gone
+- anything asserting on a value that has no reason to be that value
+
+Delete them outright. Git history keeps them if anyone ever needs to look.
+
+## Reading a failure
+
+**When a testbench fails after a change, re-run it with the change reverted before
+touching either.** Establish whether the change or the bench is at fault — it is a
+30-second control run and it is the difference between fixing a bug and inventing one.
+
+This is not hypothetical: a `lane_mask` latch added to `lfp_dsp_block.sv` broke frame
+publication in a way that looked like a flaky bench. The control run showed the bench
+passing without the change, which turned a vague suspicion into a precise bug (the
+first frame was being framed at zero lanes, so it emitted nothing and was never
+published).
+
+Passing simulation is necessary and not sufficient. It says the RTL does what the bench
+asserts; it says nothing about whether the bench asserts the right thing, and nothing at
+all about the host.
 
 ## RTL simulations (`programmable_logic/sim/`)
 
-| Testbench | Guards | Re-run when you touch |
-|---|---|---|
-| `dualport_dropout_tb` | The **no-data-loss** contract: the full datapath at the 0xFF worst case — no stuck/frozen channels, the 14-word unified header well-formed, every sample byte-exact vs the sine reference, and SEQ / timestamp / index advancing +1 per packet (the SEQ check *is* the loss check). | the acquisition core, the FIFO→BRAM packer, the packet/header format, or channel packing |
-| `data_generator_aux_wire_tb` | The **aux command path on the wire**: decodes the serialized COPI out of the real core and checks the always-on aux commands reach the chip — the channel `CONVERT`s, the slot-0 program loop, the one-shot slot-2 inject, and the override rewrites (fast-settle `WRITE(0)`+D5, DSP-reset bit-H on every `CONVERT`, Reg-3 digout D0). Any of these is silent on the wire if it regresses. | the aux engine, `aux_program`, the override rewrites, or the frame geometry (`acq_frame_pkg`) |
-| `axi_lite_write_tb` | The **AXI-Lite write handshake**: a write must complete for every legal AW/W arrival order, else the PS hangs mid-store — a silent bus wedge that stops the board accepting commands. | `axi_lite_registers.v` — i.e. any time the register map grows |
+Each testbench has a `run_*.sh` that compiles what it needs, runs `xsim`, and prints
+`RESULT: PASS` / `RESULT: FAIL` plus a check count.
 
 ```bash
 cd programmable_logic/sim
 source /opt/Xilinx/2025.1/Vivado/settings64.sh
-bash run_dualport_dropout_tb.sh    # the no-loss proof
-bash run_aux_wire_tb.sh            # the aux command path on the wire
-bash run_axi_write_tb.sh
+
+bash run_dualport_dropout_tb.sh        # broadband integrity -- run this first
+
+for tb in run_*.sh; do                 # the whole suite
+  echo "== $tb"; bash "$tb" 2>&1 | grep -E "Checks:|TB_PASS|TB_FAIL"
+done
 ```
 
-## check-dma guardrail (`scripts/check_dma.sh`, `.claude/skills/check-dma/`)
+A clean suite is **6 testbenches, 0 errors**.
 
-A static check for the one anti-pattern that silently breaks the data path: moving
-PL→PS bulk data by looping the CPU over BRAM/staging instead of AXI-CDMA (slow, and
-CPU bursts corrupt the 0xFF stream). Run it before declaring any PL↔PS data-path
-change done; annotate genuinely-justified single-beat peeks `// DMA-EXEMPT: <reason>`.
+| Testbench | Guards |
+|---|---|
+| `dualport_dropout_tb.sv` | **Broadband data integrity.** Every data word out of the wrapper is byte-exact against the RTL sine reference across both cable ports, and SEQ/timestamp advance +1 per packet with no gaps. The canonical no-loss proof |
+| `data_generator_aux_wire_tb.sv` | **Aux command path on the wire.** Decodes serialised COPI out of the real core: channel CONVERTs, the programmed aux loop, one-shot injection, and the override rewrites (fast-settle, DSP-reset bit on every CONVERT, Reg-3 digout substitution). Every one of these is silent on the wire if it regresses |
+| `axi_lite_write_tb.sv` | AXI-Lite register **write handshake** — catches a silently wedged control bus |
+| `lfp_halfband_dec2_tb.sv` | **LFP stage 1**, the 11-tap halfband /2, against vectors generated by `gen_lfp_hb_vectors.py` from the same quantised coefficients the hardware uses |
+| `lfp_poly_dec5_tb.sv` | **LFP stage 2**, the polyphase /5, across tap counts up to the 120 maximum. Drives enough frames to exercise the *whole* filter — a short drive leaves the tail taps untested and the bench passes for the wrong reason |
+| `lfp_packet_tb.sv` | **LFP packet assembly** in the output BRAM: header contents, sample placement by rank, and publication only once a frame is complete. Runs at `num_taps = 1`, the tightest legal case, because that is where the header and sample writers most nearly collide |
 
-## Host-side validation (`remote/net.py`)
+Vectors (`*_samples.hex`, `*_exp*.hex`) are generated and gitignored — regenerate with
+the `gen_*.py` scripts. **Coefficients (`*_coefs.hex`) are tracked**: they are the filter
+that ships in the bitstream, and `design_lfp_filters.py` regenerates them along with
+`lfp_coef_pkg.sv`.
 
-`python3 remote/net.py` connects (TCP `0x6900`), streams, and validates the UDP data
-(`0x6800`): per-stream SEQ continuity (the loss check), magic/size checks, and
-cable/phase detection. A clean run shows **0 SEQ gaps**.
+## check-dma guardrail (`.claude/skills/check-dma/`)
+
+Scans for the anti-pattern where a PL→PS bulk-data path loops the CPU over BRAM or the
+DMA staging buffer instead of using CDMA. Run before declaring a data-path change done.
+Genuinely justified single-beat reads (a 2-word magic/resync peek, say) must be annotated
+`// DMA-EXEMPT: <reason>`.
+
+## Host-side (`remote/net.py`)
+
+```bash
+python3 net.py           # TCP 0x6900 control, unified UDP 0x6800 data
+```
+
+Connects, starts streaming, and validates the stream: per-stream SEQ continuity (the
+loss check), magic and size checks, cable/phase detection. **A clean run shows 0 SEQ
+gaps** — loss is proven, not assumed.
+
+`sink` prints live per-stream counters: packet counts, per-stream SEQ gaps, and the last
+sender. Run it twice a few seconds apart — what matters is whether a gap count is still
+climbing, not its absolute value.
+
+## Before believing any packet-loss report
+
+```bash
+python3 netperf_loopback.py 30 20 154 0     # broadband only
+python3 netperf_loopback.py 30 20 154 10    # + the LFP mix
+```
+
+Pure `127.0.0.1`, no board, 20 seconds. Healthy is ~30,000 pkt/s drained with 0 SEQ
+gaps. **Run this before touching firmware, PL, or `net.py`.** A degraded host has
+repeatedly presented as a board-side bug, and this separates the two in less time than
+it takes to form a theory.
+
+Note what a loopback shortfall does and does not prove. It shows the problem is on the
+host — not the board, not the PL. It rules out app-layer network filtering, which cannot
+touch loopback. It does **not** rule out a system network extension (a VPN content filter
+or transparent proxy), which sits lower and can degrade loopback along with everything
+else.
