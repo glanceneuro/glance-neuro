@@ -92,6 +92,7 @@ ID   | Command          | Param1              | Param2
 #define CMD_STIM_GET_STATUS   0xAB  // -> stim_status_response_t
 #define CMD_STIM_SET_IDLE     0xAC  // param1 = drive_codes; param2 = codeB<<16|codeA
 #define CMD_STIM_POWERDOWN    0xAD  // disarm + outputs -> 1k to AGND
+#define CMD_SET_CONFIG        0xB4  // param1 = config selector; PCAP-swap the PL fabric
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -488,6 +489,32 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // Lightweight link check - no send_message() to avoid UDP streaming lag
             // Just ACK immediately
             break;
+
+        case CMD_SET_CONFIG: {
+            // PCAP-swap the PL fabric. Only when NOT streaming (nothing in flight
+            // on the PL AXI); pl_config_apply() resets the master timestamp on a
+            // successful acquisition load. docs/deferred-boot.md.
+            if (stream_enabled) {
+                status = ACK_ERROR;
+                send_message("SET_CONFIG refused: stop streaming first\r\n");
+                break;
+            }
+            struct __attribute__((packed)) {
+                int32_t  rc;      // 0 ok; >0 pl_status_t; -1 bad selector
+                uint32_t bytes;   // bitstream bytes programmed
+                uint32_t flags;   // bit0 = is_acq, bit1 = link_up
+            } r;
+            uint32_t bytes = 0; uint8_t is_acq = 0;
+            r.rc    = pl_config_apply(cmd->param1, &bytes, &is_acq);
+            r.bytes = bytes;
+            r.flags = (is_acq ? 1u : 0u) |
+                      (netif_is_link_up(&server_netif) ? 2u : 0u);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
+            send_message("SET_CONFIG sel=%u rc=%d %s link=%s\r\n",
+                         (unsigned)cmd->param1, (int)r.rc,
+                         is_acq ? "acq" : "non-acq", (r.flags & 2) ? "UP" : "DOWN");
+            return;  // response already sent
+        }
 
         case CMD_GET_STATUS: {
             // NOTE: pl_print_status() (a ~16-line console flood) is deliberately

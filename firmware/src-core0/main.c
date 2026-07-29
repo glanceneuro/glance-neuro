@@ -170,9 +170,76 @@ void update_current_packet_size(void) {
 // STREAMING CONTROL
 // ============================================================================
 
+// ============================================================================
+// PL CONFIGURATION SWAP (docs/deferred-boot.md)
+// ============================================================================
+// The shared 2nd-CIPO lane is LVDS (128-ch) or single-ended (I2C IMU / 64-ch)
+// per port; IOSTANDARD is fixed per bitstream, so changing a port's mode means
+// PCAP-loading a different full bitstream. We only swap when NOT streaming (so
+// nothing is in flight on the PL AXI) and reset the master timestamp on each
+// swap so the host sees a fresh epoch.
+
+// 1 while an acquisition fabric is live -- gates every PL-touching service so a
+// scan (non-acq) fabric, or a mid-swap teardown, can't hang the core on AXI to
+// registers that aren't there.
+volatile int pl_is_acq = 0;
+
+// selector -> SD file (no .bin) -> is it an acquisition fabric?
+// Phase 1a: the two fabrics we have. Phase 2 expands to the four expressive acq
+// configs (acq_no_imu / acq_with_port_a_imu / _b / _both).
+typedef struct { const char *name; const char *file; int is_acq; } pl_config_t;
+static const pl_config_t pl_configs[] = {
+  { "acquisition", "acq",    1 },   // current acquisition fabric
+  { "scan",        "detect", 0 },   // single-ended I2C-probe fabric
+};
+#define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
+static int current_config = -1;
+
+// Full acquisition PL init -- re-runnable so a swap can re-establish the datapath
+// after PCAP. Same sequence the firmware runs at boot.
+static void acq_pl_bringup(void) {
+#if BRAM_READ_METHOD == BRAM_READ_DMA
+  pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
+#endif
+  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+  pl_set_transmission(0);
+  pl_set_loop_count(0);
+  update_current_packet_size();
+  pl_set_copi_commands(initialization_cmd_sequence);
+  pl_stim_boot_init();  // DAC to its safe state (docs/stim.md)
+}
+
+// Load the config with the given selector via PCAP. Caller MUST guarantee we are
+// not streaming. Resets the master timestamp on a successful acquisition load.
+// Returns 0 ok, positive pl_status_t on load failure, -1 on a bad selector.
+int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
+  if (sel >= PL_NUM_CONFIGS) return -1;
+  const pl_config_t *c = &pl_configs[sel];
+  if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
+  pl_is_acq = 0;                         // tearing the PL down -> stop touching it
+  uint32_t bytes = 0;
+  pl_status_t st = pl_loader_load(c->file, &bytes);
+  if (out_bytes) *out_bytes = bytes;
+  if (st != PL_OK) { current_config = -1; return (int)st; }
+  current_config = (int)sel;
+  if (c->is_acq) {
+    acq_pl_bringup();
+    pl_reset_timestamp();                // new fabric -> fresh timeline for the host
+    pl_is_acq = 1;
+  }
+  send_message("Config '%s' loaded (%lu bytes)%s\r\n", c->name,
+               (unsigned long)bytes,
+               c->is_acq ? ", acquisition ready" : " (scan fabric)");
+  return 0;
+}
+
 void handle_enable_streaming(void) {
   if (stream_enabled) {
     send_message("Streaming already enabled\r\n");
+    return;
+  }
+  if (!pl_is_acq) {
+    send_message("Cannot start: no acquisition fabric loaded (set_config first)\r\n");
     return;
   }
 
@@ -392,7 +459,7 @@ void network_maintenance_loop(void) {
   // Refresh the shared status snapshot at ~200 Hz (every 5 ms). Cheap and
   // non-blocking; core 1 reads it on demand or for its ~1 Hz monitor.
   uint32_t now_ms = sys_now();
-  if (now_ms - last_psmon_time >= 5) {
+  if (pl_is_acq && now_ms - last_psmon_time >= 5) {   // snapshot reads PL regs
     last_psmon_time = now_ms;
     publish_status_snapshot();
   }
@@ -526,22 +593,17 @@ int main() {
   // negotiates. No network is up yet, so the blocking SD read starves nothing.
   pl_loader_init();
   uint32_t fabric_bytes = 0;
-  pl_status_t fabric_st = pl_loader_load("acq", &fabric_bytes);
-  if (fabric_st == PL_OK) {
+  // config 0 = "acquisition": PCAP-load + full acq bring-up + timestamp reset.
+  int fabric_rc = pl_config_apply(0, &fabric_bytes, NULL);
+  if (fabric_rc == 0) {
     xil_printf("Acquisition fabric loaded from SD via PCAP (%lu bytes)\r\n",
                (unsigned long)fabric_bytes);
-    // These two touch the PL (CDMA self-test, LFP CTRL write) -- their original
-    // pre-network position, valid now the fabric is live.
-#if BRAM_READ_METHOD == BRAM_READ_DMA
-    pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
-#endif
-    pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
   } else {
     // No fabric -> acquisition is impossible and any PL AXI access would hang.
     // Bring the network up read-only (GEM is MIO, needs no PL) so the board is
     // pingable, but never start the command server, and park here.
-    xil_printf("FATAL: acquisition fabric load failed: %s -- acquisition off, "
-               "board pingable for diagnosis\r\n", pl_status_str(fabric_st));
+    xil_printf("FATAL: acquisition fabric load failed (rc=%d) -- acquisition off, "
+               "board pingable for diagnosis\r\n", fabric_rc);
     lwip_init();
     netif_add(&server_netif, &ipaddr, &netmask, &gw, NULL, NULL, NULL);
     netif_set_default(&server_netif);
@@ -599,21 +661,9 @@ int main() {
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
+  // PL is already configured: pl_config_apply() PCAP-loaded the fabric and ran
+  // the full acquisition bring-up (incl. the DAC safe state) before the network.
 
-  // Initialize PL (the fabric was PCAP-loaded before the network, above)
-  pl_set_transmission(0);
-  pl_set_loop_count(0);
-    
-  // Initialize packet size based on current channel_enable setting
-  update_current_packet_size();
-
-  pl_set_copi_commands(initialization_cmd_sequence);
-  service_network();   // keep the RX pool drained across PL init
-
-  // Stimulus DAC to its safe state: soft-reset, then power-down (outputs
-  // parked at 1k-to-AGND until the first playback). See docs/stim.md.
-  pl_stim_boot_init();
-  
   send_message("System ready. Commands: start, stop, reset_timestamp, status\r\n");
   send_message("debug> ");
 
@@ -634,6 +684,12 @@ int main() {
   // Main event loop
   while (1) {
     network_maintenance_loop();
+
+    // The stream services touch the PL, so run them only on an acquisition
+    // fabric. (stream_enabled/lfp are already 0 on a scan fabric and START is
+    // gated on pl_is_acq, but this makes a mid-swap teardown provably safe.)
+    if (!pl_is_acq)
+      continue;
 
     // Broadband first, and unconditionally: it is the 30 kHz path with the
     // 33 us budget, and nothing may come between it and the PL.

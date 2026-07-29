@@ -354,6 +354,37 @@ def load_pl(sock, name="detect"):
         print(f"Load of '{name}.bin' FAILED: {msg} (status={status}, {nbytes} bytes read)")
     return {"status": status, "bytes": nbytes}
 
+# --- Config swap on the acquisition firmware (CMD_SET_CONFIG) -----------------
+# PCAP-swap the whole PL fabric to a named config. Only accepted when NOT
+# streaming (stop first); the board resets the master timestamp on a successful
+# acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
+# the two fabrics we have; Phase 2 adds the four expressive acq configs.
+CMD_SET_CONFIG = 0xB4
+CONFIGS = {"acquisition": 0, "scan": 1}
+
+def set_config(sock, name):
+    if name not in CONFIGS:
+        print(f"[CONFIG] unknown '{name}'; known: {', '.join(CONFIGS)}")
+        return None
+    ok, data = send_binary_command(sock, CMD_SET_CONFIG, param1=CONFIGS[name], timeout=15.0)
+    if not ok:
+        print("[CONFIG] refused/failed -- streaming active? (stop first), or wrong firmware")
+        return None
+    if data is None or len(data) < 12:
+        print("[CONFIG] short/no response")
+        return None
+    rc, nbytes, flags = struct.unpack('<iII', data[:12])
+    is_acq, link_up = bool(flags & 1), bool(flags & 2)
+    if rc == 0:
+        kind = "acquisition ready" if is_acq else "scan fabric (no streaming)"
+        print(f"Config '{name}': {nbytes} bytes loaded, {kind}, "
+              f"link {'UP' if link_up else 'DOWN(!)'}, master timestamp reset.")
+    elif rc < 0:
+        print(f"Config '{name}' FAILED: unknown selector (rc={rc})")
+    else:
+        print(f"Config '{name}' FAILED: {_PL_STATUS.get(rc, f'error {rc}')} (rc={rc})")
+    return {"rc": rc, "bytes": nbytes, "is_acq": is_acq, "link_up": link_up}
+
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
 # drains 5000 promiscuously and fans the LFP frames out to subscribers, so the
@@ -3097,6 +3128,12 @@ def tcp_control():
                 elif cmd == "load_pl" or cmd.startswith("load_pl "):
                     parts = cmd.split()
                     load_pl(sock, parts[1] if len(parts) > 1 else "detect")
+                elif cmd == "set_config" or cmd.startswith("set_config "):
+                    parts = cmd.split()
+                    if len(parts) > 1:
+                        set_config(sock, parts[1])
+                    else:
+                        print(f"usage: set_config <{'|'.join(CONFIGS)}>  (only when not streaming)")
                 elif cmd == "stim_status":
                     print_stim_status(stim_get_status(sock))
                 elif cmd.startswith("stim_gaussian"):

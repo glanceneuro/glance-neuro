@@ -65,16 +65,21 @@ bootgen -image scripts/boot_acq_loader.bif -arch zynq -o BOOT.bin -w >/dev/null 
   || die "bootgen (BOOT.bin) failed"
 mkdir -p blobs && mv -f BOOT.bin blobs/BOOT.bin
 
-echo "== [4/4] acq.bin (PCAP bitstream for SD) =="
+echo "== [4/4] fabrics for SD: acq.bin + detect.bin (scan) =="
 # -process_bitstream bin strips the .bit header and byte-orders the data for
 # XDcfg/PCAP, emitting <name>.bit.bin next to the input.
-printf 'all:\n{\n\t%s\n}\n' "$BIT" > .acq_bit.bif
-bootgen -image .acq_bit.bif -arch zynq -process_bitstream bin -w >/dev/null \
-  || die "bootgen -process_bitstream failed"
-rm -f .acq_bit.bif
-PCAP_BIN="${BIT}.bin"
-[ -f "$PCAP_BIN" ] || die "PCAP .bin not produced (looked for ${BIT}.bin)"
-cp -f "$PCAP_BIN" blobs/acq.bin
+bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
+  local bit="$1" dst="$2"
+  [ -f "$bit" ] || die "bitstream .bit not found ($bit)"
+  printf 'all:\n{\n\t%s\n}\n' "$bit" > .pcap.bif
+  bootgen -image .pcap.bif -arch zynq -process_bitstream bin -w >/dev/null \
+    || die "bootgen -process_bitstream failed for $bit"
+  rm -f .pcap.bif
+  cp -f "${bit}.bin" "$dst"
+}
+bit_to_pcap "$BIT" blobs/acq.bin
+# The scan / single-ended fabric for the "scan" config (config-swap test).
+bit_to_pcap "vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit" blobs/detect.bin
 
 echo ""
 echo "   blobs/ is the SD image -- copy its contents verbatim to the SD FAT root:"
