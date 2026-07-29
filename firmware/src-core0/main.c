@@ -195,19 +195,27 @@ static const pl_config_t pl_configs[] = {
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
 static int current_config = -1;
 
-// Full acquisition PL init -- re-runnable so a swap can re-establish the datapath
-// after PCAP. Same sequence the firmware runs at boot.
-static void acq_pl_bringup(void) {
+// Acquisition PL init, split so boot can keep the known-good 2c-i ordering:
+//  - early: CDMA + LFP config. At boot this runs BEFORE the network (load-first,
+//    for link stability); its few send_messages match what 2c-i buffered.
+//  - late: the send_message-HEAVY register setup. At boot this must run AFTER
+//    core1 is awake and draining the print ring -- running it before core1
+//    flooded the ring and raced core0/core1 on the shared UART, hanging the boot.
+// A runtime swap (core1 long since up) just calls the full acq_pl_bringup().
+static void acq_pl_init_early(void) {
 #if BRAM_READ_METHOD == BRAM_READ_DMA
   pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
 #endif
   pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+}
+static void acq_pl_init_late(void) {
   pl_set_transmission(0);
   pl_set_loop_count(0);
   update_current_packet_size();
   pl_set_copi_commands(initialization_cmd_sequence);
   pl_stim_boot_init();  // DAC to its safe state (docs/stim.md)
 }
+static void acq_pl_bringup(void) { acq_pl_init_early(); acq_pl_init_late(); }
 
 // Load the config with the given selector via PCAP. Caller MUST guarantee we are
 // not streaming. Resets the master timestamp on a successful acquisition load.
@@ -592,18 +600,16 @@ int main() {
   // unreachable), so the fabric must be live and settled before the PHY
   // negotiates. No network is up yet, so the blocking SD read starves nothing.
   pl_loader_init();
-  uint32_t fabric_bytes = 0;
-  // config 0 = "acquisition": PCAP-load + full acq bring-up + timestamp reset.
-  int fabric_rc = pl_config_apply(0, &fabric_bytes, NULL);
-  if (fabric_rc == 0) {
-    xil_printf("Acquisition fabric loaded from SD via PCAP (%lu bytes)\r\n",
-               (unsigned long)fabric_bytes);
+  pl_status_t fabric_st = pl_loader_load("acq", NULL);
+  if (fabric_st == PL_OK) {
+    xil_printf("Acquisition fabric loaded from SD via PCAP\r\n");
+    acq_pl_init_early();  // CDMA + LFP config, before the network (load-first)
   } else {
     // No fabric -> acquisition is impossible and any PL AXI access would hang.
     // Bring the network up read-only (GEM is MIO, needs no PL) so the board is
     // pingable, but never start the command server, and park here.
-    xil_printf("FATAL: acquisition fabric load failed (rc=%d) -- acquisition off, "
-               "board pingable for diagnosis\r\n", fabric_rc);
+    xil_printf("FATAL: acquisition fabric load failed (%s) -- acquisition off, "
+               "board pingable for diagnosis\r\n", pl_status_str(fabric_st));
     lwip_init();
     netif_add(&server_netif, &ipaddr, &netmask, &gw, NULL, NULL, NULL);
     netif_set_default(&server_netif);
@@ -661,8 +667,15 @@ int main() {
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
-  // PL is already configured: pl_config_apply() PCAP-loaded the fabric and ran
-  // the full acquisition bring-up (incl. the DAC safe state) before the network.
+
+  // Acquisition register init runs HERE -- after the network AND after core1 is
+  // awake and draining the print ring. Running these send_message-heavy calls
+  // before core1 flooded the ring and raced core0/core1 on the shared UART,
+  // which hung the boot. The fabric + CDMA/LFP were set up before the network.
+  acq_pl_init_late();
+  pl_reset_timestamp();
+  pl_is_acq = 1;
+  current_config = 0;   // config 0 = "acquisition"
 
   send_message("System ready. Commands: start, stop, reset_timestamp, status\r\n");
   send_message("debug> ");
