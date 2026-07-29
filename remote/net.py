@@ -405,6 +405,7 @@ def print_command_help():
     print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
     print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
     print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
+    print("          (stim_arm = fire playback from a digital-in line: edge=once per trigger edge, gate=play while asserted; pol 0=rising/high, 1=falling/low)")
     print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
     print("  auto_cable_detect - Automated cable detection!")
     print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
@@ -3246,7 +3247,9 @@ def tcp_control():
                         ok, _ = send_binary_command(sock, CMD_STIM_SET_TRIGGER, p1, mp_us)
                         print(f"[STIM] armed line {line} {parts[2]}" if ok else "[STIM] arm failed")
                     except (ValueError, IndexError, KeyError):
-                        print("Usage: stim_arm <line 0-7> <edge|gate> [pol] [minpulse_us] [retrig]")
+                        print("Usage: stim_arm <line 0-7> <edge|gate> [pol=0] [minpulse_us=1] [retrig=0]")
+                        print("  edge = fire once per trigger edge; gate = play while the line is asserted")
+                        print("  pol: 0 = rising / active-high, 1 = falling / active-low; minpulse_us = glitch filter")
                 elif cmd == "stim_disarm":
                     ok, _ = send_binary_command(sock, CMD_STIM_SET_TRIGGER, 0, 1)
                     print("[STIM] disarmed" if ok else "[STIM] disarm failed")
