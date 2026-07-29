@@ -394,6 +394,17 @@ static void send_response(struct tcp_pcb *tpcb, uint32_t ack_id, uint8_t status,
 static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     uint8_t status = ACK_SUCCESS;
 
+    // On a non-acquisition fabric (scan) or a torn-down PL, only fabric-swap and
+    // ping are safe: every other command reads/writes acquisition registers at
+    // 0x40000000 / CDMA / BRAM that are not present, and that AXI access never
+    // gets a response -> the core hangs. Refuse them until an acq fabric is live.
+    if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING) {
+        send_message("cmd 0x%02X refused: no acquisition fabric "
+                     "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
+        send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+        return;
+    }
+
     switch (cmd->cmd_id) {
         case CMD_START:
             command_flags->enable_streaming_flag = 1;
