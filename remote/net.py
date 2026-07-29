@@ -401,7 +401,7 @@ def print_command_help():
     print("  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print("       set_config <acquisition|scan>  (PCAP-swap the whole fabric; only when NOT streaming)")
-    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k], stim_sine [hz] [amp_v] [k]")
+    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
     print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
     print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
     print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
@@ -2750,6 +2750,25 @@ def stim_frames_ldac(codes_a, codes_b, wake=True):
         frames.append(STIM_FRAME_LDAC)
     return frames
 
+def stim_ch_frames(chan, k, make_codes):
+    """Build a stim frame list for a channel selection: chan in {A, B, both}.
+    make_codes(per_channel_rate_hz) -> list of DAC codes. For 'both' the two DAC
+    channels share the frame stream (interleaved), so the per-channel sample rate
+    is HALF the mono rate -- make_codes is called with that halved rate so the
+    waveform's timing (pulse width / frequency) is preserved on each channel.
+    Returns (frames, per_ch_rate_hz, desc, n_samples), or (None, 0, chan, 0) for
+    an unknown channel."""
+    chan = str(chan).upper()
+    if chan in ('A', 'B'):
+        rate = STIM_MASTER_RATE_HZ / k
+        codes = make_codes(rate)
+        return stim_frames_mono(codes, chan), rate, f"ch {chan}", len(codes)
+    if chan == 'BOTH':
+        rate = STIM_MASTER_RATE_HZ / k / 2   # interleaved: 2 frames per A/B sample pair
+        codes = make_codes(rate)
+        return stim_frames_interleaved(codes, codes), rate, "ch A+B", len(codes)
+    return None, 0.0, chan, 0
+
 def gaussian_pulse_codes(amplitude_v, sigma_ms, rate_hz, baseline_v=0.0,
                          full_scale=2.5, span_sigmas=4.0):
     """Sampled Gaussian pulse, span_sigmas either side of the peak."""
@@ -3167,34 +3186,42 @@ def tcp_control():
                         amp = float(parts[1]) if len(parts) > 1 else 1.0
                         sigma = float(parts[2]) if len(parts) > 2 else 5.0
                         k = int(parts[3]) if len(parts) > 3 else 8
-                        rate = STIM_MASTER_RATE_HZ / k
-                        codes = gaussian_pulse_codes(amp, sigma, rate)
-                        frames = stim_frames_mono(codes, 'A')
-                        print(f"[STIM] gaussian: {amp} V, sigma {sigma} ms, "
-                              f"{len(codes)} samples at {rate:.0f} S/s")
-                        if stim_play(sock, frames, rate_k=k, continuous=False):
-                            print("[STIM] single-shot started")
+                        chan = parts[4] if len(parts) > 4 else 'A'
+                        frames, rate, desc, n = stim_ch_frames(
+                            chan, k, lambda r: gaussian_pulse_codes(amp, sigma, r))
+                        if frames is None:
+                            print(f"[STIM] bad channel '{chan}' -- use A, B, or both")
+                        elif len(frames) > STIM_RAM_DEPTH:
+                            print(f"[STIM] {len(frames)} frames won't fit ({STIM_RAM_DEPTH}); raise k or shorten sigma")
+                        else:
+                            print(f"[STIM] gaussian: {amp} V, sigma {sigma} ms, {desc}, "
+                                  f"{n} samples at {rate:.0f} S/s/ch")
+                            if stim_play(sock, frames, rate_k=k, continuous=False):
+                                print("[STIM] single-shot started")
                     except (ValueError, IndexError):
-                        print("Usage: stim_gaussian [amp_v] [sigma_ms] [k]")
+                        print("Usage: stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both]")
                 elif cmd.startswith("stim_sine"):
                     try:
                         parts = cmd.split()
                         freq = float(parts[1]) if len(parts) > 1 else 10.0
                         amp = float(parts[2]) if len(parts) > 2 else 1.0
                         k = int(parts[3]) if len(parts) > 3 else 8
-                        rate = STIM_MASTER_RATE_HZ / k
-                        n = max(2, int(round(rate / freq)))
-                        if n > STIM_RAM_DEPTH - 1:
-                            print(f"[STIM] {n} samples/cycle won't fit; raise k")
+                        chan = parts[4] if len(parts) > 4 else 'A'
+                        def _sine_codes(r):
+                            nn = max(2, int(round(r / freq)))
+                            return [dac_code(amp / 2 * (1 + math.sin(2 * math.pi * i / nn)))
+                                    for i in range(min(nn, STIM_RAM_DEPTH))]
+                        frames, rate, desc, n = stim_ch_frames(chan, k, _sine_codes)
+                        if frames is None:
+                            print(f"[STIM] bad channel '{chan}' -- use A, B, or both")
+                        elif len(frames) > STIM_RAM_DEPTH:
+                            print(f"[STIM] {n} samples/cycle won't fit; raise k or freq")
                         else:
-                            codes = [dac_code(amp / 2 * (1 + math.sin(2 * math.pi * i / n)))
-                                     for i in range(n)]
-                            print(f"[STIM] sine: {rate/n:.2f} Hz actual, {n} samples/cycle, looping")
-                            if stim_play(sock, stim_frames_mono(codes, 'A'),
-                                         rate_k=k, continuous=True):
+                            print(f"[STIM] sine: {rate/n:.2f} Hz actual, {n} samples/cycle, {desc}, looping")
+                            if stim_play(sock, frames, rate_k=k, continuous=True):
                                 print("[STIM] continuous loop started")
                     except (ValueError, IndexError):
-                        print("Usage: stim_sine [hz] [amp_v] [k]")
+                        print("Usage: stim_sine [hz] [amp_v] [k] [A|B|both]")
                 elif cmd.startswith("stim_start"):
                     cont = 1 if "cont" in cmd else 0
                     ok, _ = send_binary_command(sock, CMD_STIM_START, cont)
