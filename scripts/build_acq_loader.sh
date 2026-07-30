@@ -7,7 +7,8 @@
 #   - blobs/BOOT.bin          : FSBL + both core ELFs, NO bitstream (PL blank at boot)
 #   - blobs/acq.bin           : 128-ch LVDS acquisition fabric (no IMU)
 #   - blobs/detect.bin        : single-ended I2C-probe fabric (both AXI IICs)
-#   - blobs/acq_imu_both.bin  : 64-ch/port acquisition + BNO055 on both cables
+#   - blobs/aimuboth.bin      : 64-ch/port acquisition + BNO055 on both cables
+#                               (8.3 short name -- xilffs FF_USE_LFN=0 on the loader)
 #
 # The firmware is built against the acq_imu_both .xsa (the SUPERSET: CDMA + both
 # AXI IICs), so its BSP carries XIic and pl_imu_detect.c links -- core0 then
@@ -101,7 +102,7 @@ bootgen -image scripts/boot_acq_loader.bif -arch zynq -o BOOT.bin -w >/dev/null 
   || die "bootgen (BOOT.bin) failed"
 mkdir -p blobs && mv -f BOOT.bin blobs/BOOT.bin
 
-echo "== [4/5] fabrics for SD: acq.bin + detect.bin + acq_imu_both.bin =="
+echo "== [4/5] fabrics for SD: acq.bin + detect.bin + aimuboth.bin =="
 # -process_bitstream bin strips the .bit header and byte-orders the data for
 # XDcfg/PCAP, emitting <name>.bit.bin next to the input.
 bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
@@ -115,7 +116,9 @@ bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
 }
 bit_to_pcap "$BIT" blobs/acq.bin
 bit_to_pcap "vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit" blobs/detect.bin
-bit_to_pcap "$IMU_BIT" blobs/acq_imu_both.bin
+# 8.3 short name: the loader's xilffs has FF_USE_LFN=0, so the SD filename base
+# must be <=8 chars. "acq_imu_both.bin" (12-char base) fails f_open; use aimuboth.
+bit_to_pcap "$IMU_BIT" blobs/aimuboth.bin
 
 echo "== [5/5] done =="
 echo ""
@@ -123,6 +126,6 @@ echo "   blobs/ is the SD image -- copy its contents verbatim to the SD FAT root
 echo "   boot        : blobs/BOOT.bin         ($(stat -c%s blobs/BOOT.bin) bytes, md5 $(md5sum blobs/BOOT.bin | cut -c1-32))"
 echo "   acq (128ch) : blobs/acq.bin          ($(stat -c%s blobs/acq.bin) bytes, md5 $(md5sum blobs/acq.bin | cut -c1-32))"
 echo "   scan/detect : blobs/detect.bin       ($(stat -c%s blobs/detect.bin) bytes, md5 $(md5sum blobs/detect.bin | cut -c1-32))"
-echo "   acq+IMU     : blobs/acq_imu_both.bin ($(stat -c%s blobs/acq_imu_both.bin) bytes, md5 $(md5sum blobs/acq_imu_both.bin | cut -c1-32))"
+echo "   acq+IMU     : blobs/aimuboth.bin      ($(stat -c%s blobs/aimuboth.bin) bytes, md5 $(md5sum blobs/aimuboth.bin | cut -c1-32))"
 echo "   test        : cp blobs/* -> SD root; boot (PL blank) -> net.py ->"
 echo "                 set_config acq_imu_both -> detect_imu (both cables) / stream"

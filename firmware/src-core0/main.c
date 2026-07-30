@@ -193,11 +193,15 @@ volatile int pl_has_iic = 0;
 // selector -> SD file (no .bin), is it an acquisition fabric, does it carry the
 // AXI IICs? Selectors are append-only so the host mapping (net.py CONFIGS) stays
 // stable. Later variants add acq_imu_port_a / _b (one IIC + one 128-ch LVDS port).
+// The `file` field MUST be an 8.3 short name (<=8-char base): the loader's xilffs
+// is built with FF_USE_LFN=0, so f_open on a longer name fails PL_ERR_OPEN even
+// when the file is present. Hence acq_imu_both's blob is "aimuboth.bin", not
+// "acq_imu_both.bin" (12-char base). The host-facing `name` is unconstrained.
 typedef struct { const char *name; const char *file; int is_acq; int has_iic; } pl_config_t;
 static const pl_config_t pl_configs[] = {
-  { "acquisition",  "acq",          1, 0 },   // 128-ch LVDS acquisition, no IMU
-  { "scan",         "detect",       0, 1 },   // single-ended I2C-probe fabric (both IICs)
-  { "acq_imu_both", "acq_imu_both", 1, 1 },   // 64-ch/port acquisition + BNO055 on both cables
+  { "acquisition",  "acq",      1, 0 },   // 128-ch LVDS acquisition, no IMU
+  { "scan",         "detect",   0, 1 },   // single-ended I2C-probe fabric (both IICs)
+  { "acq_imu_both", "aimuboth", 1, 1 },   // 64-ch/port acquisition + BNO055 on both cables
 };
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
 static int current_config = -1;
