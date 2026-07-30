@@ -606,36 +606,17 @@ int main() {
   // TODO: Figure out how to make this work with hotplug
   // TODO: Ideally, we'd allow for a DHCP option with some sort of discovery protocol
 
-  // ---- Deferred fabric load, BEFORE the network (docs/deferred-boot.md) -------
-  // The FSBL loads the bitstream before the app in the baked image; mirror that
-  // here -- PCAP-load the acquisition fabric from SD now, before bringing up
-  // Ethernet. Loading it AFTER the link is established disturbed the link (the
-  // fabric's power/activation transient dropped the PHY, seen as err -4 +
-  // unreachable), so the fabric must be live and settled before the PHY
-  // negotiates. No network is up yet, so the blocking SD read starves nothing.
-  pl_loader_init();
-  pl_status_t fabric_st = pl_loader_load("acq", NULL);
-  if (fabric_st == PL_OK) {
-    xil_printf("Acquisition fabric loaded from SD via PCAP\r\n");
-    acq_pl_init_early();  // CDMA + LFP config, before the network (load-first)
-  } else {
-    // No fabric -> acquisition is impossible and any PL AXI access would hang.
-    // Bring the network up read-only (GEM is MIO, needs no PL) so the board is
-    // pingable, but never start the command server, and park here.
-    xil_printf("FATAL: acquisition fabric load failed (%s) -- acquisition off, "
-               "board pingable for diagnosis\r\n", pl_status_str(fabric_st));
-    lwip_init();
-    netif_add(&server_netif, &ipaddr, &netmask, &gw, NULL, NULL, NULL);
-    netif_set_default(&server_netif);
-    xemac_add(&server_netif, &ipaddr, &netmask, &gw,
-              mac_ethernet_address, XPAR_XEMACPS_0_BASEADDR);
-    netif_set_up(&server_netif);
-    while (1) {
-      xemacif_input(&server_netif);
-      sys_check_timeouts();
-      eth_link_detect(&server_netif);
-    }
-  }
+  // ---- Network-FIRST boot: come up with the PL BLANK -------------------------
+  // Do NOT auto-load a fabric here. Init the loader only (XDcfg + SD mount -- no
+  // PROG_B, no PL reconfiguration), bring the full network + command server up
+  // below with the PL blank, and let the host PCAP-load a fabric ON COMMAND via
+  // set_config over the live link (the hardware-validated model, docs/
+  // deferred-boot.md 2a). This cleanly splits the failure under diagnosis: if the
+  // network is healthy with a blank PL but dies on a set_config load, the PL
+  // reconfiguration is the culprit, not the network stack. pl_is_acq stays 0, so
+  // every PL-touching service is skipped until a fabric is actually loaded.
+  if (pl_loader_init() != 0)
+    xil_printf("WARNING: pl_loader_init failed -- set_config loads unavailable\r\n");
 
   lwip_init();
   
@@ -682,16 +663,15 @@ int main() {
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
 
-  // Acquisition register init runs HERE -- after the network AND after core1 is
-  // awake and draining the print ring. Running these send_message-heavy calls
-  // before core1 flooded the ring and raced core0/core1 on the shared UART,
-  // which hung the boot. The fabric + CDMA/LFP were set up before the network.
-  acq_pl_init_late();
-  pl_reset_timestamp();
-  pl_is_acq = 1;
-  current_config = 0;   // config 0 = "acquisition"
+  // Blank PL at boot: no fabric loaded, so touch NO PL registers here. The host
+  // loads a fabric with set_config, at which point pl_config_apply runs the full
+  // acq_pl_bringup. Leaving the PL untouched keeps pl_is_acq 0 -> every
+  // PL-touching service in the main loop is skipped until then.
+  pl_is_acq = 0;
+  pl_has_iic = 0;
+  current_config = -1;   // blank -- CMD_PL_STATUS reports "blank"
 
-  send_message("System ready. Commands: start, stop, reset_timestamp, status\r\n");
+  send_message("System ready (PL BLANK). Load a fabric: set_config <acquisition|scan|acq_imu_both>\r\n");
   send_message("debug> ");
 
   // Board is fully up now. Proactively announce our IP->MAC with a gratuitous
