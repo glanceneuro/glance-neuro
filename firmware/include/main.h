@@ -504,7 +504,11 @@ extern uint32_t packets_received_count;
 // master timestamp on a successful acquisition load. Returns 0 ok, >0
 // pl_status_t on load failure, -1 bad selector.
 extern volatile int pl_is_acq;
+// 1 while the loaded fabric exposes the two AXI IICs (acq_imu_* or scan/detect);
+// gate CMD_DETECT_IMU on it so a fabric without them can't hang the core.
+extern volatile int pl_has_iic;
 int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq);
+int pl_current_config(void);   // -1 blank, else pl_configs index (for CMD_PL_STATUS)
 
 // Command flags for main loop processing
 extern volatile int enable_streaming_flag;

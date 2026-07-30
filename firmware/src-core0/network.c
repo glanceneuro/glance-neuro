@@ -4,6 +4,7 @@
 #include "main.h"
 #include "pl_dma.h"     // CDMA read of the LFP output BRAM into non-cacheable staging
 #include "pl_stim.h"    // DAC70502 stimulus peripheral driver
+#include "pl_imu_detect.h"  // per-cable BNO055 probe over the AXI IICs (CMD_DETECT_IMU)
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -92,7 +93,9 @@ ID   | Command          | Param1              | Param2
 #define CMD_STIM_GET_STATUS   0xAB  // -> stim_status_response_t
 #define CMD_STIM_SET_IDLE     0xAC  // param1 = drive_codes; param2 = codeB<<16|codeA
 #define CMD_STIM_POWERDOWN    0xAD  // disarm + outputs -> 1k to AGND
+#define CMD_DETECT_IMU        0xB0  // probe both cables' AXI IIC for a BNO055 (fabric must carry the IICs)
 #define CMD_SET_CONFIG        0xB4  // param1 = config selector; PCAP-swap the PL fabric
+#define CMD_PL_STATUS         0xB5  // query the loaded fabric -- works in ANY fabric state
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -398,7 +401,8 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     // ping are safe: every other command reads/writes acquisition registers at
     // 0x40000000 / CDMA / BRAM that are not present, and that AXI access never
     // gets a response -> the core hangs. Refuse them until an acq fabric is live.
-    if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING) {
+    if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
+        cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU) {
         send_message("cmd 0x%02X refused: no acquisition fabric "
                      "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
         send_ack(tpcb, cmd->ack_id, ACK_ERROR);
@@ -524,6 +528,43 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             send_message("SET_CONFIG sel=%u rc=%d %s link=%s\r\n",
                          (unsigned)cmd->param1, (int)r.rc,
                          is_acq ? "acq" : "non-acq", (r.flags & 2) ? "UP" : "DOWN");
+            return;  // response already sent
+        }
+
+        case CMD_PL_STATUS: {
+            // Which fabric is loaded -- readable in ANY fabric state (blank/scan/
+            // acq). Reads the loader's firmware record (pl_current_config), never a
+            // PL register, so a host reconnecting after a drop can recover even if
+            // the board was left in the detect fabric. docs/deferred-boot.md.
+            struct __attribute__((packed)) {
+                int32_t  config;   // -1 blank, else the CMD_SET_CONFIG selector
+                uint32_t flags;    // bit0 = is_acq, bit1 = link_up
+            } r;
+            r.config = pl_current_config();
+            r.flags  = (pl_is_acq ? 1u : 0u) |
+                       (netif_is_link_up(&server_netif) ? 2u : 0u);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
+            send_message("PL_STATUS config=%d %s link=%s\r\n",
+                         (int)r.config, pl_is_acq ? "acq" : "non-acq",
+                         (r.flags & 2) ? "UP" : "DOWN");
+            return;  // response already sent
+        }
+
+        case CMD_DETECT_IMU: {
+            // Probe both cables' AXI IIC for a BNO055. Allowed on any fabric that
+            // carries the IICs (acq_imu_* OR the scan/detect fabric); refused on a
+            // fabric without them (plain acq), where 0x43D0 is absent and the AXI
+            // read would never return. Gated by pl_has_iic, not pl_is_acq, so it
+            // also works on the non-acq scan fabric (past the guard allow-list).
+            if (!pl_has_iic) {
+                send_message("DETECT_IMU refused: loaded fabric has no I2C "
+                             "(set_config acq_imu_both or scan first)\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_detect_response_t resp;
+            pl_imu_detect_run(&resp);   // per-port results carry the present/ack verdict
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
             return;  // response already sent
         }
 

@@ -184,16 +184,28 @@ void update_current_packet_size(void) {
 // registers that aren't there.
 volatile int pl_is_acq = 0;
 
-// selector -> SD file (no .bin) -> is it an acquisition fabric?
-// Phase 1a: the two fabrics we have. Phase 2 expands to the four expressive acq
-// configs (acq_no_imu / acq_with_port_a_imu / _b / _both).
-typedef struct { const char *name; const char *file; int is_acq; } pl_config_t;
+// 1 while the loaded fabric exposes the two AXI IICs (0x43D0/0x43D1) for the
+// per-cable BNO055. Gates CMD_DETECT_IMU so a fabric without them (plain acq)
+// can't hang the core probing absent I2C. Valid on BOTH acquisition fabrics that
+// carry the IICs (acq_imu_*) AND the non-acq scan/detect fabric.
+volatile int pl_has_iic = 0;
+
+// selector -> SD file (no .bin), is it an acquisition fabric, does it carry the
+// AXI IICs? Selectors are append-only so the host mapping (net.py CONFIGS) stays
+// stable. Later variants add acq_imu_port_a / _b (one IIC + one 128-ch LVDS port).
+typedef struct { const char *name; const char *file; int is_acq; int has_iic; } pl_config_t;
 static const pl_config_t pl_configs[] = {
-  { "acquisition", "acq",    1 },   // current acquisition fabric
-  { "scan",        "detect", 0 },   // single-ended I2C-probe fabric
+  { "acquisition",  "acq",          1, 0 },   // 128-ch LVDS acquisition, no IMU
+  { "scan",         "detect",       0, 1 },   // single-ended I2C-probe fabric (both IICs)
+  { "acq_imu_both", "acq_imu_both", 1, 1 },   // 64-ch/port acquisition + BNO055 on both cables
 };
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
 static int current_config = -1;
+
+// Which fabric the loader last programmed (-1 = none/blank, else a pl_configs
+// index). Read-only accessor for CMD_PL_STATUS: it reads this firmware state, not
+// PL registers, so a reconnecting host can learn the config in ANY fabric state.
+int pl_current_config(void) { return current_config; }
 
 // Acquisition PL init, split so boot can keep the known-good 2c-i ordering:
 //  - early: CDMA + LFP config. At boot this runs BEFORE the network (load-first,
@@ -225,11 +237,13 @@ int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
   const pl_config_t *c = &pl_configs[sel];
   if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
   pl_is_acq = 0;                         // tearing the PL down -> stop touching it
+  pl_has_iic = 0;                        // ...and its IICs are gone until reloaded
   uint32_t bytes = 0;
   pl_status_t st = pl_loader_load(c->file, &bytes);
   if (out_bytes) *out_bytes = bytes;
   if (st != PL_OK) { current_config = -1; return (int)st; }
   current_config = (int)sel;
+  pl_has_iic = c->has_iic;               // IICs present on acq_imu_* and detect fabrics
   if (c->is_acq) {
     acq_pl_bringup();
     pl_reset_timestamp();                // new fabric -> fresh timeline for the host

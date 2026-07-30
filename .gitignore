@@ -69,3 +69,6 @@ vivado_detect/
 vitis_detect/
 vivado_detect_build.log
 vitis_detect_build.log
+
+# acq_imu_both fabric build project (generated, like vivado_project/)
+vivado_acq_imu_both/

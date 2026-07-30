@@ -3,14 +3,21 @@
 
 import vitis
 import glob
+import os
 
 client = vitis.create_client()
 client.set_workspace(path="vitis_workspace")
 
 advanced_options = client.create_advanced_options_dict(dt_overlay="0")
 
+# The platform's hardware handoff. The monolithic acq build (build.sh) uses the
+# plain acq .xsa; the deferred-load build (build_acq_loader.sh) sets KLAB_XSA to
+# the acq_imu_both superset (.xsa with the two AXI IICs) so the BSP carries XIic
+# and pl_imu_detect.c links -- the firmware then probes IMUs on any fabric that
+# has the IICs. The core acq peripherals sit at the same addresses in both, so
+# the firmware still drives the plain acq / detect fabrics unchanged.
 platform = client.create_platform_component(name = "klab-platform",
-        hw_design = "./vivado_project/klab_project.xsa",
+        hw_design = os.environ.get("KLAB_XSA", "./vivado_project/klab_project.xsa"),
         os = "standalone",
         cpu = "ps7_cortexa9_0",
         domain_name = "standalone_ps7_cortexa9_0",

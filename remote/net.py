@@ -358,9 +358,11 @@ def load_pl(sock, name="detect"):
 # PCAP-swap the whole PL fabric to a named config. Only accepted when NOT
 # streaming (stop first); the board resets the master timestamp on a successful
 # acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
-# the two fabrics we have; Phase 2 adds the four expressive acq configs.
+# Append-only selectors (firmware pl_configs order): acquisition=128-ch/no-IMU,
+# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables. Later
+# variants add acq_imu_port_a / _b (one IIC + one 128-ch LVDS port).
 CMD_SET_CONFIG = 0xB4
-CONFIGS = {"acquisition": 0, "scan": 1}
+CONFIGS = {"acquisition": 0, "scan": 1, "acq_imu_both": 2}
 
 def set_config(sock, name):
     if name not in CONFIGS:
@@ -385,6 +387,29 @@ def set_config(sock, name):
         print(f"Config '{name}' FAILED: {_PL_STATUS.get(rc, f'error {rc}')} (rc={rc})")
     return {"rc": rc, "bytes": nbytes, "is_acq": is_acq, "link_up": link_up}
 
+CMD_PL_STATUS = 0xB5
+_CONFIG_NAMES = {v: k for k, v in CONFIGS.items()}   # 0->acquisition, 1->scan, 2->acq_imu_both
+_CONFIG_NAMES[-1] = "blank (no fabric)"
+
+def pl_status(sock, verbose=True):
+    """Query which PL fabric is loaded. Works in ANY fabric state (blank / scan /
+    acquisition) because the firmware answers from its loader record, not from a PL
+    register -- so a host reconnecting after a drop can learn the board's config and
+    recover (e.g. it was left in the detect fabric mid-rescan). Returns a dict or
+    None. docs/deferred-boot.md."""
+    ok, data = send_binary_command(sock, CMD_PL_STATUS, timeout=2.0)
+    if not ok or data is None or len(data) < 8:
+        if verbose:
+            print("[PL] no PL_STATUS response -- firmware without the config-swap loader?")
+        return None
+    config, flags = struct.unpack('<iI', data[:8])
+    is_acq, link_up = bool(flags & 1), bool(flags & 2)
+    name = _CONFIG_NAMES.get(config, f"config {config}")
+    if verbose:
+        print(f"PL fabric: {name} (config={config}), "
+              f"{'acquisition' if is_acq else 'non-acq'}, link {'UP' if link_up else 'DOWN'}")
+    return {"config": config, "name": name, "is_acq": is_acq, "link_up": link_up}
+
 def print_command_help():
     """The single command menu -- printed at connect AND by the `help` command,
     so the two can't drift. (The `help` command used to be a separate stale copy
@@ -398,9 +423,10 @@ def print_command_help():
     print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], lfp_sink  (UDP_PORT, stream_type=2)")
     print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
     print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
-    print("  IMU: detect_imu  (probe both ports for a BNO055 -- detect bitstream only)")
+    print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print("       set_config <acquisition|scan>  (PCAP-swap the whole fabric; only when NOT streaming)")
+    print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
     print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
     print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
     print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
@@ -3150,13 +3176,23 @@ def tcp_control():
             print(f"[TCP] Failed to configure UDP destination")
             print(f"[TCP] Device may still be sending to default: 192.168.18.100:{UDP_PORT}")
         
-        # Get and display initial status
-        print("\n[TCP] Getting initial device status...")
-        status = get_status(sock)
-        if status:
-            print_status(status)
-            validator.set_channel_enable(status['channel_enable'])
-        
+        # Which PL fabric is loaded? Query this FIRST -- it works in any state
+        # (blank / scan / acquisition), so a deferred-boot board, or one left in the
+        # detect fabric after a host drop, is understood before we try the
+        # acquisition-only status (which would time out on a non-acq fabric).
+        print("\n[TCP] Checking loaded PL fabric...")
+        pl = pl_status(sock)
+        if pl is None or pl['is_acq']:
+            # Acquisition fabric (or older firmware without PL_STATUS): show status.
+            print("[TCP] Getting initial device status...")
+            status = get_status(sock)
+            if status:
+                print_status(status)
+                validator.set_channel_enable(status['channel_enable'])
+        else:
+            print(f"[TCP] Board is on the '{pl['name']}' fabric (not acquisition). "
+                  f"Run `set_config acquisition` (or rescan) before streaming.")
+
         print_command_help()
         
         while True:
@@ -3204,6 +3240,8 @@ def tcp_control():
                         set_config(sock, parts[1])
                     else:
                         print(f"usage: set_config <{'|'.join(CONFIGS)}>  (only when not streaming)")
+                elif cmd == "pl_status":
+                    pl_status(sock)
                 elif cmd == "stim_status":
                     print_stim_status(stim_get_status(sock))
                 elif cmd.startswith("stim_gaussian"):
@@ -3515,6 +3553,12 @@ def tcp_control():
                 # Re-enable TCP keepalive on reconnection
                 configure_tcp_keepalive(sock)
                 print(f"[TCP] Reconnected successfully!")
+                # Re-check the loaded fabric: the board may have been left in the
+                # detect fabric (mid-rescan) when the link dropped. Works in any state.
+                pl = pl_status(sock)
+                if pl and not pl['is_acq']:
+                    print(f"[TCP] Board is on the '{pl['name']}' fabric (not acquisition). "
+                          f"Run `set_config acquisition` (or rescan) before streaming.")
                 
     except ConnectionRefusedError:
         print(f"[TCP] Could not connect to {ZYNQ_IP}:{TCP_PORT}")
