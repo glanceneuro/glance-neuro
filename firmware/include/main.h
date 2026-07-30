@@ -344,7 +344,10 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            //      engine is always on, reg22 carries the override
                                            //      semantics, and the accel slot-0 reply rides in-frame at
                                            //      data word 34. A 1.x host does not interoperate.
-#define FIRMWARE_VERSION_PATCH         0
+#define FIRMWARE_VERSION_PATCH         1   // 2.2.0.1: harden the hw retrigger path --
+                                           //      latch the trigger edge (no drop in the
+                                           //      RD pipeline) + start-latch FRAME_COUNT.
+                                           //      RTL bugfix; wire contract unchanged.
 #define FIRMWARE_VERSION_BUILD         0
 #define FIRMWARE_VERSION_WORD          ((FIRMWARE_VERSION_MAJOR << 24) | \
                                        (FIRMWARE_VERSION_MINOR << 16) | \

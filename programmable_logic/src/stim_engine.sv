@@ -142,12 +142,16 @@ reg        run_continuous;
 reg        run_retrig;
 reg [ADDR_W-1:0] run_start_index, run_end_index, run_loop_index;
 reg [31:0] run_frames_left;      // finite mode countdown
+reg [31:0] run_frame_count;      // start-latched reload value; retrigger reloads
+                                 // from this, not live cfg (config-frozen contract)
 reg [40:0] run_period;           // 350 * k, up to 41 bits at k = 2^32-1
 reg [40:0] tick_cnt;
 
 // Stop requests are latched, not sampled: a 1-cycle p_* pulse can land during
 // the S_RD/S_RD2 pipeline states where S_RUN's checks would miss it.
 reg        stop_pending;
+reg        retrig_pending;   // latched hw-retrigger edge (mirrors stop_pending so
+                             // an edge in the RD pipeline is never dropped)
 reg        stop_codes;       // idle flavour chosen by the stopping command
 reg [1:0]  idle_frames_left;
 reg        idle_use_codes;       // latched idle flavour for this sequence
@@ -190,9 +194,11 @@ always @(posedge clk) begin
         run_end_index <= {ADDR_W{1'b0}};
         run_loop_index <= {ADDR_W{1'b0}};
         run_frames_left <= 32'd0;
+        run_frame_count <= 32'd0;
         run_period <= 41'd0;
         tick_cnt <= 41'd0;
         stop_pending <= 1'b0;
+        retrig_pending <= 1'b0;
         stop_codes <= 1'b0;
         idle_frames_left <= 2'd0;
         idle_use_codes <= 1'b0;
@@ -211,6 +217,7 @@ always @(posedge clk) begin
             running <= 1'b0;
             idle_seq_active <= 1'b0;
             stop_pending <= 1'b0;
+            retrig_pending <= 1'b0;
         end else begin
             case (state)
             S_IDLE: begin
@@ -223,10 +230,12 @@ always @(posedge clk) begin
                         run_end_index   <= cfg_end_index;
                         run_loop_index  <= cfg_loop_index;
                         run_frames_left <= cfg_frame_count;
+                        run_frame_count <= cfg_frame_count;
                         run_period      <= period_calc;
                         current_index   <= cfg_start_index;
                         completed_count <= 64'd0;
                         stop_pending    <= 1'b0;
+                        retrig_pending  <= 1'b0;
                         tick_cnt        <= 41'd0;   // first frame issues now
                         running         <= 1'b1;
                         ts_start        <= master_timestamp;
@@ -252,11 +261,14 @@ always @(posedge clk) begin
             end
 
             S_RUN: begin
-                // Retrigger-restart: an edge while running rewinds to the
-                // start of the stimulus at the next frame boundary.
-                if (trig_rise && cfg_hw_arm && cfg_trig_mode == 2'd1 && run_retrig) begin
+                // Retrigger-restart: service a LATCHED edge (retrig_pending, set
+                // below after the case just like stop_pending) so an edge that
+                // lands in the S_RD/S_RD2 read pipeline is never lost. Rewind to
+                // the stimulus start at this frame boundary.
+                if (retrig_pending) begin
+                    retrig_pending  <= 1'b0;
                     current_index   <= run_start_index;
-                    run_frames_left <= cfg_frame_count;
+                    run_frames_left <= run_frame_count;   // start-latched, not live cfg
                     ts_start        <= master_timestamp;
                 end
                 if (stop_pending || gate_stop) begin
@@ -345,6 +357,14 @@ always @(posedge clk) begin
                 (p_stop || p_zero || p_powerdown)) begin
                 stop_pending <= 1'b1;
                 stop_codes   <= p_powerdown ? 1'b0 : cfg_idle_drive_codes;
+            end
+
+            // Same treatment for the hardware retrigger edge: latch it whenever a
+            // run is in flight, so an edge landing in the RD pipeline survives to
+            // be serviced at the next S_RUN (this set beats the same-cycle clear).
+            if ((state == S_RUN || state == S_RD || state == S_RD2) &&
+                trig_rise && cfg_hw_arm && cfg_trig_mode == 2'd1 && run_retrig) begin
+                retrig_pending <= 1'b1;
             end
         end
     end

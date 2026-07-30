@@ -74,8 +74,12 @@ forever; **finite** plays a set frame count once, then returns to idle.
 
 **Trigger mode** — **software**: a TCP command starts playback (or fires a single
 finite shot) immediately. **Hardware**: a PMOD digital-in line arms the engine and
-a physical edge or level starts it, with selectable polarity, a glitch filter, and
-retrigger-restart. Hardware and software starts are mutually exclusive per run.
+a physical edge or level starts it, with selectable polarity and a glitch filter.
+In **retrigger-restart** (edge mode), each hardware edge while running rewinds the
+stimulus to its start — the edge is reliably caught even if it arrives mid-frame,
+and the restart replays with the configuration latched at the original start, so a
+mid-run register write never perturbs a running stimulus. Hardware and software
+starts are mutually exclusive per run.
 
 ## Sampling rate and the divider
 
@@ -232,11 +236,6 @@ window drives 0 V.
 Reviewed and consciously deferred (none block v1; each is an engine-RTL change that
 warrants its own tested commit):
 
-- A hardware retrigger edge landing in the engine's 2-cycle RAM-read pipeline is
-  dropped (~0.6% of async edges at k = 1); and the retrigger reload samples the live
-  FRAME_COUNT rather than the start-latched copy, so rewriting config mid-run while
-  retriggering can tear. Rule until fixed: treat all config as frozen while running
-  (which is the intended usage anyway).
 - Register decode ignores address bits [15:7], so undefined offsets in the low 64 K
   alias onto the register file without SLVERR — drivers must stay inside the map.
 - The master rate (240 kf/s) and the 84 MHz µs→clocks factor are compile-time facts

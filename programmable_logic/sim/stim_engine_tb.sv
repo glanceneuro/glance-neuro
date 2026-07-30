@@ -73,6 +73,7 @@ stim_engine #(.RAM_DEPTH(RAM_DEPTH), .ADDR_W(ADDR_W)) dut (
 );
 
 integer errors = 0;
+reg [63:0] ts0;
 task check(input cond, input [511:0] msg);
     if (!cond) begin
         errors = errors + 1;
@@ -83,6 +84,14 @@ endtask
 // ------------------------------------------------------------ SPI monitor --
 integer cyc = 0;
 always @(posedge clk) cyc = cyc + 1;
+
+// (debug) report the FSM state at each hw retrigger edge -- confirms Test 6c
+// actually lands its edge inside the S_RD/S_RD2 read pipeline (states 2/3),
+// which is the window where the pre-fix engine dropped the edge.
+always @(posedge clk)
+    if (dut.trig_rise && dut.run_retrig && cfg_hw_arm)
+        $display("  [retrig edge] cyc=%0d state=%0d (1=S_RUN 2=S_RD 3=S_RD2)",
+                 cyc, dut.state);
 
 reg [23:0] mon_shift;
 integer    mon_bits = 0;
@@ -284,6 +293,48 @@ initial begin
     `PULSE(p_stop)
     wait_idle;
     check(1'b1, "stop during RD pipeline completed (no hang)");
+
+    // ---- Test 9b: a hw retrigger edge landing in the RD pipeline must NOT be
+    //      lost (the analogue of Test 9 for the hardware retrigger edge). The
+    //      edge is aimed one frame period ahead, minus the 3-cycle sync latency
+    //      (minpulse=0), so trig_rise lands in S_RD/S_RD2 -- watch the [retrig
+    //      edge] debug line for the state it actually hits. Detection: ts_start
+    //      advances only on a (re)start, so a serviced edge changes it. ----
+    cfg_hw_arm = 1; cfg_trig_mode = 1; cfg_trig_line = 3; cfg_trig_pol = 0;
+    cfg_retrig_restart = 1; cfg_trig_minpulse = 0;
+    cfg_continuous = 1; cfg_rate_k = 1;
+    cfg_start_index = 0; cfg_end_index = 5; cfg_loop_index = 0;
+    clear_monitor;
+    digital_in[3] = 1; repeat (10) @(posedge clk); digital_in[3] = 0;  // hw start
+    wait (frame_count >= 2);
+    ts0 = ts_start;
+    @(posedge ram_en);                       // a read tick; next window ~350 clks on
+    repeat (348) @(posedge clk);             // aim trig_rise into the next S_RD/S_RD2
+    digital_in[3] = 1; repeat (10) @(posedge clk); digital_in[3] = 0;
+    repeat (800) @(posedge clk);             // allow the restart to be serviced
+    check(ts_start != ts0, "retrigger edge in RD pipeline serviced (not lost)");
+    `PULSE(p_stop)
+    wait_idle;
+    cfg_retrig_restart = 0; cfg_hw_arm = 0; cfg_trig_mode = 0; cfg_continuous = 0;
+
+    // ---- Test 9c: retrigger reloads the START-LATCHED frame count, not a live
+    //      mid-run rewrite of FRAME_COUNT. (Uses the edge latch above so the
+    //      retrigger is serviced regardless of where the edge lands.) ----
+    cfg_hw_arm = 1; cfg_trig_mode = 1; cfg_trig_line = 3; cfg_trig_pol = 0;
+    cfg_retrig_restart = 1; cfg_trig_minpulse = 0;
+    cfg_continuous = 0; cfg_frame_count = 4; cfg_rate_k = 1;
+    cfg_start_index = 0; cfg_end_index = 3; cfg_loop_index = 0;
+    clear_monitor;
+    digital_in[3] = 1; repeat (10) @(posedge clk); digital_in[3] = 0;  // hw start, 4 frames
+    wait (frame_count >= 2);
+    cfg_frame_count = 30;            // host rewrites FRAME_COUNT mid-run
+    digital_in[3] = 1; repeat (10) @(posedge clk); digital_in[3] = 0;  // retrigger
+    wait_idle;
+    // The restart must replay the 4 frames latched at start, not the live 30, so
+    // the whole run is a handful of frames -- ~30 would mean it tore to live cfg.
+    check(frame_count < 15, "retrigger reloads start-latched FRAME_COUNT, not live cfg");
+    cfg_frame_count = 0;
+    cfg_retrig_restart = 0; cfg_hw_arm = 0; cfg_trig_mode = 0;
 
     if (errors == 0) $display("RESULT: PASS");
     else $display("RESULT: FAIL (%0d errors)", errors);
