@@ -425,7 +425,7 @@ def print_command_help():
     print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
     print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
-    print("       set_config <acquisition|scan>  (PCAP-swap the whole fabric; only when NOT streaming)")
+    print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
     print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
     print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
     print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")

@@ -615,10 +615,15 @@ int main() {
   // PROG_B, no PL reconfiguration), bring the full network + command server up
   // below with the PL blank, and let the host PCAP-load a fabric ON COMMAND via
   // set_config over the live link (the hardware-validated model, docs/
-  // deferred-boot.md 2a). This cleanly splits the failure under diagnosis: if the
-  // network is healthy with a blank PL but dies on a set_config load, the PL
-  // reconfiguration is the culprit, not the network stack. pl_is_acq stays 0, so
-  // every PL-touching service is skipped until a fabric is actually loaded.
+  // deferred-boot.md). This ordering is load-bearing: a PCAP reconfiguration too
+  // close to the GEM/PHY bring-up window wedges Ethernet. Loading a fabric BEFORE
+  // lwip_init left the MAC unable to transmit at all (zero frames on the wire,
+  // board unreachable), and the mirror case -- loading right after link-up --
+  // dropped the PHY (err -4). Holding the PL blank until the network is fully up
+  // and a set_config arrives keeps every load clear of that window; a runtime
+  // load over the settled link is safe (verified: set_config swaps the fabric
+  // with the link intact). pl_is_acq stays 0, so every PL-touching service is
+  // skipped until a fabric is loaded.
   if (pl_loader_init() != 0)
     xil_printf("WARNING: pl_loader_init failed -- set_config loads unavailable\r\n");
 
