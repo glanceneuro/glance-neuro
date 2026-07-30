@@ -56,6 +56,9 @@ Most commands reply with a small ack; `GET_STATUS`, `READ_REGISTER`, etc. reply 
 | `0x75` | SET_FAST_SETTLE | p1 = amp cfg, p2 = dsp cfg | `sw \| gpio_en<<1 \| pin<<4` per field |
 | `0x76` | SET_DIGOUT | p1 = sw \| gpio_en<<1 \| pin<<4; p2 = reg3 static byte | digital-out control |
 | `0xA0`–`0xAD` | STIM_* | see `docs/stim.md` | DAC70502 stimulus playback: window/loop/rate/trigger config, start/stop/trigger, safe-state, upload + CRC verify, status |
+| `0xB0` | DETECT_IMU | — | probe both cables' AXI IIC for a BNO055; 12-byte `{result_a, result_b, version}`. Only on a fabric that carries the IICs (`acq_imu_*` / `scan`), gated on `pl_has_iic`; refused (with an ack error) on a fabric without them so the AXI read can't hang the core |
+| `0xB4` | SET_CONFIG | p1 = config selector | PCAP-swap the whole PL fabric (deferred boot, `docs/deferred-boot.md`): `0`=acquisition, `1`=scan, `2`=acq_imu_both. Only when not streaming; resets the timestamp on an acquisition load |
+| `0xB5` | PL_STATUS | — | which fabric is loaded — works in **any** state (blank/scan/acq), reads firmware state not PL registers. Returns `{int32 config, uint32 flags}` (`config` −1=blank else selector; `flags` bit0=is_acq, bit1=link_up) |
 
 > **Removed in v2:** `0x72 AUX_SEQ_EN`. The aux command engine is **always on** — there is no
 > enable step — so the command was retired. (A v1 host that sends it will not interoperate;

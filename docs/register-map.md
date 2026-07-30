@@ -152,6 +152,24 @@ carries **only the port-A phases**; read port B from the CTRL_REG_2 mirror (reg 
 `[13:8]` slot-0 program index, `[21:16]` slot-1 index (always 0), `[29:24]` slot-2 index
 (always 0).
 
+## AXI peripherals beyond the control bank
+
+The flat bank above is the acquisition core. The PS ↔ PL GP0 interconnect also carries
+full IP blocks at their own base addresses:
+
+| base | peripheral | present on | purpose |
+|------|-----------|------------|---------|
+| `0x44A00000` | AXI CDMA | all fabrics | bulk PL→PS data path (result BRAM → DDR staging); see `.claude/skills/check-dma` |
+| `0x43D00000` | `axi_iic_a` | `acq_imu_*`, `scan`/`detect` | port-A cable I2C — BNO055 IMU (+ headstage EEPROM) |
+| `0x43D10000` | `axi_iic_b` | `acq_imu_*`, `scan`/`detect` | port-B cable I2C — BNO055 IMU (+ headstage EEPROM) |
+
+The two AXI IICs exist **only** on fabrics that route the freed second-CIPO pins to I2C:
+the `acq_imu_*` acquisition fabrics free port A `M19/M20` and port B `J16/K16`, and the
+single-ended `scan`/`detect` fabric. On the plain 128-ch `acquisition` fabric they are
+absent, and an AXI read at `0x43D0xxxx` there never returns — which is why `CMD_DETECT_IMU`
+is gated on `pl_has_iic`. Registers follow the standard Xilinx AXI IIC layout (`xiic_l.h`);
+`firmware/src-core0/pl_imu_detect.c` drives them via the dynamic-controller path.
+
 ## RHD2000 SPI command encodings
 
 ```

@@ -147,3 +147,45 @@ explicitly for bring-up and testing.
   construction; use the network for status there. A fabric can route EMIO UART to
   M14/M15 for a post-load console (acquisition parity), but the early boot log
   needs another channel (e.g. a "boot log over TCP" command) if wanted.
+
+## Hardware-validated boot rules (on the board)
+
+The deferred acquisition firmware (src-core0 orchestrator, network-first blank boot,
+`set_config` PCAP-swap) is validated on hardware: blank boot → `net.py` connects →
+`set_config acq_imu_both` loads the freed-pin dual-IIC fabric over the live link →
+`detect_imu` reads a BNO055 (chip_id `0xA0`) on the cabled port. Two rules were paid for
+in that bring-up:
+
+- **Network-FIRST is mandatory; do NOT PCAP-load a fabric near the GEM/PHY bring-up
+  window.** Loading a fabric *before* `lwip_init` left the MAC unable to transmit at all
+  (zero frames, board unreachable); loading *right after* link-up dropped the PHY
+  (err −4). A load over a fully-settled link (a host `set_config`, seconds later) is safe
+  — the link survives. So boot with the PL **blank**, bring the whole network + command
+  server up, and load fabrics only on command; `main.c` holds `pl_is_acq = 0` until the
+  first load so no PL-touching service runs on a blank PL. (Exact mechanism of the
+  near-window fragility is not yet pinned — likely the reconfig transient, or the
+  `Xil_SetTlbAttributes`-vs-EMACPS-BD-ring ordering; characterize it before any
+  *auto*-load or the rescan orchestrator, both of which depend on runtime swaps.)
+- **Fabric blob filenames must be 8.3 (≤8-char base).** The loader's xilffs is built
+  `FF_USE_LFN=0`, so `f_open("0:/<name>.bin")` fails `PL_ERR_OPEN` on a longer base name
+  even when the file is present. `acq.bin` / `detect.bin` fit; `acq_imu_both.bin` did not
+  and ships as **`aimuboth.bin`**. The host-facing config *name* (net.py `CONFIGS`) is
+  unconstrained; only the SD `file` in `pl_configs` must be 8.3. Future
+  `acq_imu_port_a/_b` blobs need 8.3 names too.
+
+Shipped fabrics today (coexist model, not the earlier `acq_AA/AN/NA` sketch above):
+`acq.bin` (128-ch), `detect.bin` (scan), `aimuboth.bin` (64-ch/port + dual IMU).
+
+## Build host (Vitis 2025.1) environment
+
+`scripts/build_acq_loader.sh` builds the deferred image (BOOT.bin from src-core0 vs the
+`acq_imu_both` superset .xsa, + the fabric `.bin`s). Two host env prerequisites, easy to
+lose across a machine reboot (both surfaced as deterministic platform-gen failures):
+
+- **`libtinfo.so.5`** — Vitis `hsi`/`sdtgen` needs ncurses5; modern distros ship `.so.6`.
+  Symptom: `package require sdtgen FAILED` / `error loading hsi ... libtinfo.so.5`. Fix:
+  `ln -s libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5` (or a user-dir symlink on
+  `LD_LIBRARY_PATH`).
+- **`ESW_REPO`** — must point at the complete embeddedsw repo so the FSBL/sw_apps
+  resolve. Symptom: `[ERROR] Couldnt find the src directory for zynq_fsbl`. Fix:
+  `export ESW_REPO=/opt/Xilinx/2025.1/data/embeddedsw`.
