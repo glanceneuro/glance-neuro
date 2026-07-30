@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
 # The only way to build BOOT.bin.
 #

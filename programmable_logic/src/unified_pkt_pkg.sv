@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 // unified_pkt_pkg.sv
 //
@@ -48,7 +48,8 @@ package unified_pkt_pkg;
     // stream_type (header word 1, [7:0]) -- what the host demuxes the port on.
     localparam logic [7:0] STREAM_TYPE_BROADBAND = 8'd1;   // 30 kHz amplifier stream
     localparam logic [7:0] STREAM_TYPE_LFP       = 8'd2;   // decimated LFP band
-    localparam logic [7:0] STREAM_TYPE_WAVELET   = 8'd3;   // reserved: on-PL scalogram
+    // stream_type 3 is intentionally left undefined here -- reserved for a
+    // possible future on-PL wavelet/scalogram stream, if that engine ever lands.
 
     // Header word 1. `flags` is reserved: no stream sets it today, and the host
     // ignores it, so it is free for a future per-stream marker.

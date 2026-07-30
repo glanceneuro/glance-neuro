@@ -1,9 +1,10 @@
 # Unified single-port packet format (no-loss, no-MTU-framer)
 
-Status: **design contract** for the `claude/unified-ports` (broadband + LFP) and the
-follow-on `claude/unified-wavelet` branches, and the two matching `ephys-socket` branches.
-This is the single source of truth — PL, firmware, `net.py`, and the Open Ephys plugin all
-implement exactly this.
+Status: **design contract** for the `claude/unified-ports` (broadband + LFP) stream and its
+`ephys-socket` consumer. This is the single source of truth — PL, firmware, `net.py`, and the
+Open Ephys plugin all implement exactly this. A wavelet/scalogram stream (type 3) is a
+*possible future* direction, sketched at the end for reference; it is **not** implemented and
+**not** part of the current contract.
 
 ## Principles (from the CLAUDE.md hard rule)
 
@@ -55,7 +56,8 @@ wrong. This is why principle 1 is one port + a `stream_type` tag, not a port per
 | 6 | `AUX1` | stream-specific (below) |
 | 7 | `RSVD` | 0 (reserved; candidate for a future CRC32 of the packet) |
 
-`stream_type`: **1 = BROADBAND, 2 = LFP, 3 = WAVELET.**
+`stream_type`: **1 = BROADBAND, 2 = LFP.** (Type 3 is reserved for a possible future
+wavelet/scalogram stream — sketched at the end; not implemented.)
 
 The host demuxes on `TYPE_VER[7:0]`. **Per-stream `SEQ` continuity = the loss check.** Keep
 each stream's `SEQ` independent so broadband's integrity is unaffected by the others.
@@ -103,7 +105,12 @@ header (no sub-block) then the decimated samples. `num_samples` = `popcount(lane
 (header + samples) in its output BRAM; the PS DMAs it and sends it on UDP 0x6800 with
 stream_type=2. Verified in `programmable_logic/sim/lfp_dsp_block_tb.sv`.
 
-### WAVELET (type 3) — one octave per packet, rate-aligned
+### WAVELET (type 3) — POTENTIAL FUTURE, not implemented
+
+> This is a sketch for a *possible* future on-PL wavelet/scalogram stream, kept for
+> reference. It is **not** implemented and **not** part of the current wire contract
+> (which is broadband + LFP only). If that engine is ever built, this is the intended shape:
+
 - **One packet = one octave.** `AUX0` = `octave[3:0]` · `n_octaves[7:4]` · `n_voices[11:8]`
   · `overrun[24]`. `AUX1` = `n_channels[7:0]` · `lane_start[23:8]`.
 - Payload = `n_channels × n_voices` complex coefficients (re,im as int32 each) for **this
@@ -126,8 +133,6 @@ stream_type=2. Verified in `programmable_logic/sim/lfp_dsp_block_tb.sv`.
 - **One socket, port 0x6800, promiscuous drain:** a tight `recvfrom → ring` loop that never
   blocks on processing; demux + per-stream handling happen downstream. Big `SO_RCVBUF`.
 - Demux by `TYPE_VER[7:0]`; verify per-stream `SEQ` continuity (the loss check).
-- Wavelet: place each packet's `(octave, lane_start..+n_channels)` block into the surface;
-  hold each octave between its rate-aligned updates.
 
 ## Branch plan
 

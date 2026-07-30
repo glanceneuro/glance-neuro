@@ -3,6 +3,7 @@
 
 #include "main.h"
 #include "pl_dma.h"     // CDMA read of the LFP output BRAM into non-cacheable staging
+#include "pl_stim.h"    // DAC70502 stimulus peripheral driver
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -75,6 +76,22 @@ ID   | Command          | Param1              | Param2
 #define CMD_LFP_SET_CHANNELS 0x82  // param1 = 8-bit lane mask
 #define CMD_LFP_WRITE_COEF   0x83  // param1 = [0] clear-ptr-first | [1] stage (0=halfband,1=decimator); param2 = 18-bit signed coef
 #define CMD_PERF_RESET       0x91  // clear recv->transmit sticky maxes + histogram + counts
+
+// DAC70502 stimulus playback (docs/stim.md; PL peripheral driver in pl_stim.c)
+#define CMD_STIM_SET_WINDOW   0xA0  // param1 = start_index; param2 = end_index
+#define CMD_STIM_SET_LOOP     0xA1  // param1 = loop_index; param2 = frame_count
+#define CMD_STIM_SET_RATE     0xA2  // param1 = divider k (240 kf/s / k)
+#define CMD_STIM_SET_TRIGGER  0xA3  // param1 = line|pol<<3|mode<<4|retrig<<6|arm<<7; param2 = min_pulse_us
+#define CMD_STIM_START        0xA4  // param1 = 0 finite / 1 continuous
+#define CMD_STIM_STOP         0xA5
+#define CMD_STIM_TRIGGER      0xA6  // software single-shot
+#define CMD_STIM_ZERO         0xA7  // disarm + configured idle state
+#define CMD_STIM_UPLOAD_BEGIN 0xA8  // param1 = start_index; param2 = word count
+#define CMD_STIM_WRITE        0xA9  // param1/param2 = two frame words (auto-inc)
+#define CMD_STIM_VERIFY       0xAA  // param1 = offset; param2 = count -> CRC32 reply
+#define CMD_STIM_GET_STATUS   0xAB  // -> stim_status_response_t
+#define CMD_STIM_SET_IDLE     0xAC  // param1 = drive_codes; param2 = codeB<<16|codeA
+#define CMD_STIM_POWERDOWN    0xAD  // disarm + outputs -> 1k to AGND
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -603,6 +620,121 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             send_message("Binary Command: PERF_RESET (maxes/histogram/counts cleared)\r\n");
             break;
 
+
+        case CMD_STIM_SET_WINDOW:
+            pl_stim_set_window(cmd->param1, cmd->param2);
+            send_message("Binary Command: STIM_SET_WINDOW %u..%u\r\n",
+                         cmd->param1, cmd->param2);
+            break;
+
+        case CMD_STIM_SET_LOOP:
+            pl_stim_set_loop(cmd->param1, cmd->param2);
+            send_message("Binary Command: STIM_SET_LOOP loop=%u count=%u\r\n",
+                         cmd->param1, cmd->param2);
+            break;
+
+        case CMD_STIM_SET_RATE:
+            if (cmd->param1 == 0) {
+                status = ACK_ERROR;
+            } else {
+                pl_stim_set_rate(cmd->param1);
+                send_message("Binary Command: STIM_SET_RATE k=%u\r\n", cmd->param1);
+            }
+            break;
+
+        case CMD_STIM_SET_TRIGGER:
+            pl_stim_set_trigger(cmd->param1 & 7,          // line
+                                (cmd->param1 >> 3) & 1,   // pol
+                                (cmd->param1 >> 4) & 3,   // mode
+                                (cmd->param1 >> 6) & 1,   // retrig
+                                (cmd->param1 >> 7) & 1,   // arm
+                                cmd->param2);             // min pulse, us
+            send_message("Binary Command: STIM_SET_TRIGGER 0x%02X min=%uus\r\n",
+                         cmd->param1, cmd->param2);
+            break;
+
+        case CMD_STIM_START:
+            if (pl_stim_start(cmd->param1 & 1) == 0) {
+                send_message("Binary Command: STIM_START %s\r\n",
+                             (cmd->param1 & 1) ? "continuous" : "finite");
+            } else {
+                status = ACK_ERROR;
+                send_message("Binary Command: STIM_START refused (bad config)\r\n");
+            }
+            break;
+
+        case CMD_STIM_STOP:
+            pl_stim_stop();
+            send_message("Binary Command: STIM_STOP\r\n");
+            break;
+
+        case CMD_STIM_TRIGGER:
+            if (pl_stim_trigger_once() == 0) {
+                send_message("Binary Command: STIM_TRIGGER\r\n");
+            } else {
+                status = ACK_ERROR;
+                send_message("Binary Command: STIM_TRIGGER refused\r\n");
+            }
+            break;
+
+        case CMD_STIM_ZERO:
+            pl_stim_zero();
+            send_message("Binary Command: STIM_ZERO\r\n");
+            break;
+
+        case CMD_STIM_POWERDOWN:
+            pl_stim_powerdown();
+            send_message("Binary Command: STIM_POWERDOWN\r\n");
+            break;
+
+        case CMD_STIM_SET_IDLE:
+            pl_stim_set_idle(cmd->param1 & 1, cmd->param2);
+            send_message("Binary Command: STIM_SET_IDLE mode=%u codes=0x%08X\r\n",
+                         cmd->param1 & 1, cmd->param2);
+            break;
+
+        // Uploads and verifies are v1-gated to acquisition-idle: every
+        // register access competes with the 33 us sample budget, and a
+        // 16K-word upload or CRC readback is milliseconds of bus traffic.
+        case CMD_STIM_UPLOAD_BEGIN:
+            if (pl_is_transmission_active() ||
+                pl_stim_upload_begin(cmd->param1, cmd->param2) != 0) {
+                status = ACK_ERROR;
+                send_message("Binary Command: STIM_UPLOAD_BEGIN refused "
+                             "(streaming, running, or bad range)\r\n");
+            } else {
+                send_message("Binary Command: STIM_UPLOAD_BEGIN %u+%u\r\n",
+                             cmd->param1, cmd->param2);
+            }
+            break;
+
+        case CMD_STIM_WRITE:
+            if (pl_is_transmission_active() ||
+                pl_stim_upload_write2(cmd->param1, cmd->param2) != 0)
+                status = ACK_ERROR;
+            break;
+
+        case CMD_STIM_VERIFY: {
+            uint32_t crc = 0;
+            if (pl_is_transmission_active() ||
+                pl_stim_crc32(cmd->param1, cmd->param2, &crc) != 0) {
+                status = ACK_ERROR;
+                send_message("Binary Command: STIM_VERIFY refused\r\n");
+                break;
+            }
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &crc, sizeof(crc));
+            send_message("Binary Command: STIM_VERIFY %u+%u -> 0x%08X\r\n",
+                         cmd->param1, cmd->param2, crc);
+            return;  // response already sent
+        }
+
+        case CMD_STIM_GET_STATUS: {
+            stim_status_response_t resp;
+            pl_stim_collect_status(&resp);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
+            return;  // response already sent
+        }
+
         default:
             status = ACK_ERROR;
             send_message("Binary Command: UNKNOWN (0x%08X)\r\n", cmd->cmd_id);
@@ -623,6 +755,7 @@ static void tcp_err_cb(void *arg, err_t err) {
     // Connection error or abort - clear client tracking
     tcp_client_pcb = NULL;
     recv_buffer_pos = 0;
+    pl_stim_upload_abort();   // a half-open upload session must not survive the client
     send_message("TCP connection error/closed\r\n");
 }
 
@@ -635,6 +768,7 @@ err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
         tcp_close(tpcb);
         tcp_client_pcb = NULL;
         recv_buffer_pos = 0;
+        pl_stim_upload_abort();
         send_message("TCP connection closed by client\r\n");
         return ERR_OK;
     }

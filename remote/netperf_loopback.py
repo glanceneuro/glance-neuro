@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 #!/usr/bin/env python3
 """Local UDP loopback throughput harness for net.py's UnifiedSink recv path.
