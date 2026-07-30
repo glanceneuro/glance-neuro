@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 """Design the two-stage LFP decimation chain and emit its fixed-point coefficients.
 
     30 kHz --[stage 1: 11-tap halfband, /2]--> 15 kHz --[stage 2: 120-tap, /5]--> 3 kHz
@@ -247,7 +247,7 @@ def write_sv_defaults(path, hb_q, lin_q):
 
     with open(path, 'w') as fh:
         fh.write(f"""// SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 // lfp_coef_pkg.sv
 //

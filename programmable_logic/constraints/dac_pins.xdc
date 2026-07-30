@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
 # DAC70502 SPI pins (stimulus output), bank 34 / VCCIO34 = 3.3 V.
 # Pin and electrical settings are the ones bench-verified on this carrier by

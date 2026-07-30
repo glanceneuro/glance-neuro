@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
 // Stimulus peripheral top: AXI-Lite registers + frame RAM + playback engine
 // + DAC70502 SPI pins. Instantiated in the block design as a module

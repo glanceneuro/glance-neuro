@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
 // PS-side driver for the PL stimulus peripheral (stim_top): DAC70502
 // waveform playback out of the 16384-frame PL RAM. Register map mirrors

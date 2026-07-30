@@ -304,7 +304,6 @@ comparison that shows the minimum-phase trade directly.
 | `programmable_logic/src/lfp_coef_pkg.sv` | generated power-on coefficients |
 | `programmable_logic/src/unified_pkt_pkg.sv` | the common packet header contract |
 | `programmable_logic/sim/design_lfp_filters.py` | filter design + measured numbers |
-| `programmable_logic/sim/lfp_halfband_dec2_tb.sv`, `lfp_poly_dec5_tb.sv` | per-stage bit-exact testbenches |
 | `firmware/src-core0/pl_control.c` | `pl_lfp_set_config`, coefficient upload |
 | `firmware/src-core0/stream.c` | drains the LFP BRAM to UDP |
 | `remote/net.py` | `configure_lfp`, `lfp_enable`, `receive_lfp` |

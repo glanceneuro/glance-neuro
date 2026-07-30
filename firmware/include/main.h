@@ -90,7 +90,7 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define UNIFIED_HEADER_WORDS    8
 #define STREAM_TYPE_BROADBAND   1
 #define STREAM_TYPE_LFP         2
-#define STREAM_TYPE_WAVELET     3   // reserved for the follow-on branch
+// stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
 
 // Packet size calculation based on channel_enable bits.
 // channel_enable is now 8 bits: [3:0] = port 0 streams, [7:4] = port 1 (dual
@@ -323,7 +323,13 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define PROTOCOL_VERSION               1
 #define FIRMWARE_VERSION_MAJOR         2
 // MAJOR bumps when the wire contract breaks; MINOR when it only grows.
-#define FIRMWARE_VERSION_MINOR         1   // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
+#define FIRMWARE_VERSION_MINOR         2   // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
+                                           //      + firmware driver + host API, TCP cmds 0xA0..0xAD).
+                                           //      ADDITIVE over 2.1.0.0 -- the broadband/aux/LFP wire
+                                           //      contract is UNCHANGED (stim is control-only + a PL
+                                           //      peripheral; no new UDP stream), so a 2.1.x host still
+                                           //      interoperates. See docs/stim.md.
+                                           // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
                                            //      (a stream_type=2 producer). ADDITIVE over 2.0.0.0 --
                                            //      the broadband + aux wire contract is UNCHANGED, so a
                                            //      2.0.x host still interoperates. LFP is a second stream
@@ -338,7 +344,10 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            //      engine is always on, reg22 carries the override
                                            //      semantics, and the accel slot-0 reply rides in-frame at
                                            //      data word 34. A 1.x host does not interoperate.
-#define FIRMWARE_VERSION_PATCH         0
+#define FIRMWARE_VERSION_PATCH         1   // 2.2.0.1: harden the hw retrigger path --
+                                           //      latch the trigger edge (no drop in the
+                                           //      RD pipeline) + start-latch FRAME_COUNT.
+                                           //      RTL bugfix; wire contract unchanged.
 #define FIRMWARE_VERSION_BUILD         0
 #define FIRMWARE_VERSION_WORD          ((FIRMWARE_VERSION_MAJOR << 24) | \
                                        (FIRMWARE_VERSION_MINOR << 16) | \

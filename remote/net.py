@@ -208,7 +208,7 @@ UNIFIED_VERSION = 1
 UNIFIED_HEADER_WORDS = 8
 STREAM_TYPE_BROADBAND = 1
 STREAM_TYPE_LFP = 2
-STREAM_TYPE_WAVELET = 3   # reserved for the follow-on branch
+# stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
 
 # Binary command protocol constants
 CMD_MAGIC = 0xDEADBEEF
@@ -256,7 +256,7 @@ LFP_STAGE_HALFBAND = 0      # stage 1: 11-tap halfband, 30 -> 15 kHz
 LFP_STAGE_DECIMATOR = 1     # stage 2: <=120-tap decimator, 15 -> 3 kHz
 CMD_PERF_RESET = 0x91       # clear recv->transmit sticky maxes + histogram + counts
 
-# DAC70502 stimulus playback (docs/dac-stim-requirements.md; PL stim_top)
+# DAC70502 stimulus playback (docs/stim.md; PL stim_top)
 CMD_STIM_SET_WINDOW   = 0xA0  # param1 = start_index; param2 = end_index
 CMD_STIM_SET_LOOP     = 0xA1  # param1 = loop_index;  param2 = frame_count (finite total; 0 with continuous)
 CMD_STIM_SET_RATE     = 0xA2  # param1 = divider k (frame rate = 240 kf/s / k)
@@ -2691,7 +2691,7 @@ def manual_cable_test(sock):
 # Frames are 24-bit DAC70502 SPI words stored one per 32-bit RAM entry:
 # register byte in [23:16], 16-bit MSB-aligned data in [15:0]. The PL plays
 # them at 240 kf/s / k. Channel modes are upload conventions, not engine
-# features -- see docs/dac-stim-requirements.md section 3.8.
+# features -- see docs/stim.md.
 
 STIM_REG_DAC_A   = 0x08
 STIM_REG_DAC_B   = 0x09
@@ -2994,6 +2994,32 @@ def run_detection(sock, verbose=True):
         # must not be scored as a gap against a stale last_seq.
         validator.last_seq = None
 
+
+def print_command_help():
+    """The single command menu -- printed at connect AND by the `help` command,
+    so the two can't drift. (The `help` command used to be a separate stale copy
+    that had fallen behind -- e.g. missing the stim section.)"""
+    print("\n[TCP] Available commands:")
+    print("  Basic: start, stop, reset_timestamp, loop <count>")
+    print("  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
+    print("  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
+    print("  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
+    print("  Debug: dump_bram [start] [count], stats, hex")
+    print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
+    print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
+    print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
+    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
+    print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
+    print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
+    print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
+    print("          (stim_arm = fire playback from a digital-in line: edge=once per trigger edge, gate=play while asserted; pol 0=rising/high, 1=falling/low)")
+    print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
+    print("  auto_cable_detect - Automated cable detection!")
+    print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
+    print("       read_reg <r>, write_reg <r> <v>, aux_selftest")
+    print("       fast_settle <0|1> [dsp] | gpio <pin> | off")
+    print("       digout <0|1> | gpio <pin> | hiz")
+    print("  Utility: help, quit")
 
 def configure_tcp_keepalive(sock):
     """Enable TCP keepalive to detect dead connections faster.

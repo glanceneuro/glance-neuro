@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
 // PS-side driver for the PL stimulus peripheral. Everything here is cold
 // path: uploads are firmware-gated to acquisition-idle periods (R4), and the
