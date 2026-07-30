@@ -246,9 +246,9 @@ warrants its own tested commit):
 
 ### Bench bring-up checklist (board + scope required)
 
-The RTL is verified in simulation (playback order, divider spacing, `t_DACWAIT`
-floor, trigger modes, interlocks); these checks need a board and a scope and have
-not run yet:
+The RTL was verified in simulation during development (playback order, divider
+spacing, `t_DACWAIT` floor, trigger modes, interlocks); the hardware checks below
+need a board and a scope and have not run yet:
 
 1. **First light:** `stim_sine 10 1.0 8` → 10 Hz, 1 Vpp on the DAC1 SMA. Confirms
    pins, SPI timing, wake-from-power-down.

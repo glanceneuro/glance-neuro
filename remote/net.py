@@ -256,7 +256,7 @@ LFP_STAGE_HALFBAND = 0      # stage 1: 11-tap halfband, 30 -> 15 kHz
 LFP_STAGE_DECIMATOR = 1     # stage 2: <=120-tap decimator, 15 -> 3 kHz
 CMD_PERF_RESET = 0x91       # clear recv->transmit sticky maxes + histogram + counts
 
-# DAC70502 stimulus playback (docs/dac-stim-requirements.md; PL stim_top)
+# DAC70502 stimulus playback (docs/stim.md; PL stim_top)
 CMD_STIM_SET_WINDOW   = 0xA0  # param1 = start_index; param2 = end_index
 CMD_STIM_SET_LOOP     = 0xA1  # param1 = loop_index;  param2 = frame_count (finite total; 0 with continuous)
 CMD_STIM_SET_RATE     = 0xA2  # param1 = divider k (frame rate = 240 kf/s / k)
@@ -2552,7 +2552,7 @@ def manual_cable_test(sock):
 # Frames are 24-bit DAC70502 SPI words stored one per 32-bit RAM entry:
 # register byte in [23:16], 16-bit MSB-aligned data in [15:0]. The PL plays
 # them at 240 kf/s / k. Channel modes are upload conventions, not engine
-# features -- see docs/dac-stim-requirements.md section 3.8.
+# features -- see docs/stim.md.
 
 STIM_REG_DAC_A   = 0x08
 STIM_REG_DAC_B   = 0x09
