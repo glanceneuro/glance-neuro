@@ -173,6 +173,38 @@ in that bring-up:
   unconstrained; only the SD `file` in `pl_configs` must be 8.3. Future
   `acq_imu_port_a/_b` blobs need 8.3 names too.
 
+- **The serial console is DARK until an acquisition fabric is loaded.** This is a direct,
+  unavoidable consequence of blank boot, and it surprises everyone once. The debug UART is
+  **UART1 on EMIO**, not MIO: `design_1_bd.tcl` sets `PCW_UART1_UART1_IO {EMIO}` and brings
+  `UART1_TX_0` / `UART1_RX_0` out as top-level PL ports, which `constraints/uart.xdc` pins
+  to **M14/M15** (JX2 → the FT230 USB-serial bridge). With no fabric configured those pins
+  have no routing at all, so every character — FSBL included — goes nowhere.
+
+  | PL state | console | why |
+  |---|---|---|
+  | blank (from power-on) | **no** | EMIO UART signals have no PL routing |
+  | `scan` / `detect` | **no** | that BD creates *no* top-level ports, so its EMIO UART is never brought out (which is also why it passes DRC with only `detect_pins.xdc`) |
+  | `acquisition`, `acq_imu_*` | yes | full constraint set includes `uart.xdc` |
+
+  So a `rescan` goes: dark (blank) → dark (scan census) → console returns when the
+  acquisition variant loads. Writing to the UART while dark is **safe** — UART1 is a PS
+  peripheral at `0xE0001000`, always present, so the writes complete and only the bits on
+  the wire are lost. Nothing hangs.
+
+  Consequence worth weighing: if the network fails to come up, there is now **no diagnostic
+  channel at all** — the console needs a fabric, and loading a fabric needs the network.
+  Under the older baked-bitstream image the FSBL configured the PL before anything printed,
+  so boot failures were visible on serial. Options, none applied yet: auto-load a default
+  fabric immediately *after* `lwip_init` (keeps the proven network-first ordering and
+  restores the console seconds into boot); or bring the EMIO UART out in the scan fabric's
+  BD and add `uart.xdc` to its build (needs a `detect.bin` re-synthesis, and only covers
+  the scan phase).
+
+- **The MicroZed's PL status LED tracks this too.** `DONE` is asserted only when the PL is
+  configured, so on a blank boot it stays in its unconfigured colour and changes on the
+  first successful `set_config` / `rescan` — a free, instant indication that PCAP
+  programming actually worked.
+
 Shipped fabrics today (coexist model, not the earlier `acq_AA/AN/NA` sketch above):
 `acq.bin` (128-ch), `detect.bin` (scan), `aimuboth.bin` (64-ch/port + dual IMU).
 
