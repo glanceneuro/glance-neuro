@@ -18,6 +18,8 @@
 // logic -- tick cadence, FIFO handling, NACK/timeout recovery, packet
 // assembly -- is regression-tested without a board.
 
+#include <string.h>
+
 #ifdef IMU_HOST_TEST
 #include "imu_host_mock.h"
 #else
@@ -51,6 +53,11 @@ static const imu_burst_t imu_data_bursts[3] = {
 #define IMU_HK_BURST_LEN   2
 #define IMU_HK_TICKS       100
 #define IMU_N_DATA_BURSTS  3
+// The three data bursts must exactly fill the packet payload -- if a burst is
+// resized or added, this is what refuses to build rather than shipping a
+// packet with a hole in it.
+_Static_assert(8 + 6 + 6 == IMU_PKT_PAYLOAD_WORDS * 4,
+               "data bursts must exactly cover the IMU packet payload");
 
 // Give a burst 20 ms of wall clock before declaring the bus wedged: worst case
 // on the wire is ~1 ms (8 data bytes + addressing at 100 kHz) plus BNO055
@@ -189,9 +196,12 @@ static void imu_publish(imu_port_t *p, int port)
     w[6] = (uint32_t)p->calib_stat | ((uint32_t)p->opr_mode << 8)
          | ((uint32_t)(uint8_t)p->temp_c << 16);
     w[7] = 0;
-    // Payload image is already wire-layout; copy as 5 words.
-    const uint32_t *s = (const uint32_t *)(const void *)p->sample;
-    for (int i = 0; i < IMU_PKT_PAYLOAD_WORDS; i++) w[8 + i] = s[i];
+    // The sample image is already in wire layout, so it goes out verbatim.
+    // memcpy rather than a uint32_t* cast: the image is a byte array inside
+    // the port struct, and its 4-byte alignment would silently depend on the
+    // preceding fields staying an even multiple of four. The compiler emits
+    // word moves anyway when it can prove alignment.
+    memcpy(&w[8], p->sample, sizeof(p->sample));
 
     // LFP send policy, minus the retry: a stale IMU sample is worth less than
     // the fresh one 10 ms out, so a failed send is a counted drop (and a SEQ
