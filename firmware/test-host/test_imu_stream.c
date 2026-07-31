@@ -28,6 +28,19 @@ static void run_ms(int ms)
     }
 }
 
+// The real core-0 loop revisits this service far faster than 50 us -- it is
+// servicing lwIP and a 33 us sample budget, so passes are microseconds apart.
+// That speed is what exposes bus-state races (a burst's STOP is still
+// releasing when the next burst is queued), so ordering is checked at this
+// cadence rather than the coarse one.
+static void run_ms_fast(int ms)
+{
+    for (int i = 0; i < ms * 500; i++) {
+        pl_imu_stream_service();
+        mock_advance_us(2);
+    }
+}
+
 static uint32_t pkt_word(int n, int w)
 {
     uint32_t v;
@@ -236,6 +249,17 @@ static void test_bus_ordering(void)
     CHECK(mock_bad_sequence == 0,
           "command FIFO deviated from the proven ordering: %d", mock_bad_sequence);
     CHECK(mock_n_pkts > 15, "no traffic to judge ordering by (%d pkts)", mock_n_pkts);
+
+    // Again at main-loop speed. Here the previous burst's STOP is often still
+    // releasing the bus when the next burst is queued, so a naive "is the bus
+    // busy?" test would see the OLD transaction's busy and hand over the byte
+    // count before this burst's addresses ever reached the wire.
+    mock_reset();
+    pl_imu_stream_set(3, 10);
+    run_ms_fast(60);
+    CHECK(mock_bad_sequence == 0,
+          "count written against a stale BUS_BUSY: %d violations", mock_bad_sequence);
+    CHECK(mock_n_pkts > 8, "no traffic at loop speed (%d pkts)", mock_n_pkts);
 
     // An absent device NACKs its address and the core never takes the bus.
     // The machine must notice the error rather than sit out its 20 ms deadline,

@@ -65,6 +65,7 @@ typedef struct {
     uint8_t  running;
     uint8_t  in_flight;      // a burst is loaded in the core's FIFO
     uint8_t  await_count;    // addresses queued; waiting for BUS_BUSY to add the count
+    uint8_t  await_idle;     // waiting for the previous burst's STOP to release the bus
     uint8_t  pend_len;       // byte count for the burst in flight
     uint8_t  burst_idx;      // 0..2 data, 3 = housekeeping
     uint8_t  got;            // bytes drained so far for this burst
@@ -158,6 +159,7 @@ static void imu_error(imu_port_t *p, int port)
     if (p->iic_errors != 0xFF) p->iic_errors++;
     p->in_flight = 0;
     p->await_count = 0;
+    p->await_idle = 0;
     p->burst_idx = 0;
     XTime now; XTime_GetTime(&now);
     p->next_tick = now + imu_ms_to_ticks(imu_period_ms);
@@ -231,6 +233,24 @@ static void imu_service_port(imu_port_t *p, int port)
     if (!p->in_flight) {
         XTime now; XTime_GetTime(&now);
         if (p->burst_idx == 0 && now < p->next_tick) return;
+
+        // The previous burst's STOP takes wire time to release the bus, and
+        // this loop comes back around in microseconds. Kick while that is
+        // still draining and the next BUS_BUSY we observe could be the OLD
+        // transaction's -- which would hand the byte count over before this
+        // burst's addresses ever reached the wire. So require a genuinely idle
+        // bus first, bounded by the same transfer deadline.
+        if (XIic_ReadReg(p->base, XIIC_SR_REG_OFFSET) & XIIC_SR_BUS_BUSY_MASK) {
+            if (!p->await_idle) {
+                p->await_idle = 1;
+                p->deadline = now + imu_ms_to_ticks(IMU_XFER_TIMEOUT_MS);
+            } else if (now > p->deadline) {
+                imu_error(p, port);
+            }
+            return;
+        }
+        p->await_idle = 0;
+
         if (p->burst_idx < IMU_N_DATA_BURSTS) {
             const imu_burst_t *b = &imu_data_bursts[p->burst_idx];
             imu_kick(p, b->reg, b->len);

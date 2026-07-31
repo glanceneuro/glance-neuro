@@ -42,6 +42,7 @@ typedef struct {
     int      st;            // combined-command parse: 0 idle .. 3 await STOP
     int      addr_phase_busy; // addresses queued; core will take the bus
     uint64_t busy_at;       // when BUS_BUSY actually asserts (START takes wire time)
+    uint64_t release_at;    // STOP takes wire time too: busy lingers until here
     uint8_t  cur_reg;
     int      pending;       // 0 none, 1 data due, 2 NACK due
     uint64_t due_at;
@@ -57,10 +58,23 @@ static int port_of(UINTPTR base) { return base == IMUDET_A_BASE ? 0 : 1; }
 // at 100 kHz). Modelling that delay is what makes "write the count only once
 // the bus is busy" a testable property instead of a no-op.
 #define MOCK_START_LATENCY_US 60
+#define MOCK_STOP_RELEASE_US  40
 
+// Busy as the STATUS REGISTER reports it: a transfer running, this
+// transaction's addresses on the wire, or the tail of the PREVIOUS
+// transaction's STOP still releasing the bus.
 static int sim_bus_busy(const sim_iic_t *s)
 {
     if (s->pending) return 1;
+    if (s->addr_phase_busy && mock_now >= s->busy_at) return 1;
+    return mock_now < s->release_at;
+}
+
+// Busy BECAUSE OF THIS TRANSACTION -- the condition the byte count is really
+// supposed to wait for. Distinguishing the two is what catches a count written
+// against the residual busy of the burst before it.
+static int sim_own_busy(const sim_iic_t *s)
+{
     return s->addr_phase_busy && mock_now >= s->busy_at;
 }
 
@@ -93,6 +107,10 @@ static void sim_update(int port)
         mock_bno[port].regs_read++;
     }
     s->pending = 0;
+    // The STOP condition takes wire time: the bus reads busy for a while after
+    // the data has landed. A reader that kicks the next burst immediately can
+    // therefore observe a busy that belongs to the burst just finished.
+    s->release_at = mock_now + MOCK_STOP_RELEASE_US;
 }
 
 uint32_t mock_iic_read(UINTPTR base, uint32_t offset)
@@ -176,7 +194,7 @@ void mock_iic_write(UINTPTR base, uint32_t offset, uint32_t value)
             // Enforce the vendor's proven ordering: the count must be written
             // while the bus is ACTUALLY busy, never speculatively before the
             // addresses have reached the wire.
-            if (!sim_bus_busy(s)) mock_bad_sequence++;
+            if (!sim_own_busy(s)) mock_bad_sequence++;
             s->addr_phase_busy = 0;
             s->st = 0;
             s->pend_reg = s->cur_reg;
