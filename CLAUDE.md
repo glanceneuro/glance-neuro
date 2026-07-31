@@ -40,15 +40,23 @@ fabric `*.bin` files loaded at runtime. One config's image lives in `blobs/` per
 | config (branch) | `blobs/` contents = the SD card | built by |
 |---|---|---|
 | acquisition | `BOOT.bin` ← `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
-| detect (baked) | `BOOT.bin` ← `firmware/src-detect`, detect BD + `detect_pins.xdc` | `scripts/build_detect.sh` |
-| deferred boot | `BOOT.bin` ← `firmware/src-detect` app (no bitstream); `detect.bin`/`acq_*.bin` ← the respective PL | `scripts/build_loader.sh` |
-| deferred acq (current) | `BOOT.bin` ← `firmware/src-core0` + `firmware/include` + **the default acq bitstream** (FSBL configures the PL at boot); `acq.bin`/`aimu*.bin` ← the respective PL | `scripts/build_acq_loader.sh` |
+| deferred acq (**current — this branch's product**) | `BOOT.bin` ← `firmware/src-core0` + `firmware/src-core1` + `firmware/include` + `programmable_logic/{src,constraints,block_design,ip}` (the baked acq bitstream); `acq.bin`/`aimu*.bin` ← the respective PL | `scripts/build_acq_loader.sh` |
+**`BOOT.bin` is a PL artefact as well as a firmware one** — it carries a bitstream, so a
+`programmable_logic/` change must rebuild it, not just the fabric `.bin`. The build script
+enforces this with a source fingerprint (ported from `build.sh`): `--app-only` **refuses**
+rather than baking a stale fabric. Note the inputs the older rows omitted and this one
+does not: `constraints/` (the acq project globs `*.xdc`, and `uart.xdc` is what pins the
+console), `src-core1` (its ELF is inside `BOOT.bin`), and the fact that the Vitis platform —
+hence the FSBL and BSP — is generated from the **acq_imu_both** `.xsa`, so an
+`acq_imu_both_*` edit changes `BOOT.bin` too.
 
-The last row is the one that bites: its `BOOT.bin` carries a bitstream, so it is a **PL
-artefact as well as a firmware one** — a `programmable_logic/` change must rebuild it, not
-just the fabric `.bin`. (`--app-only` reuses the existing bitstream and is valid only for
-firmware edits.) The bitstream is baked because the debug UART leaves the chip through PL
-balls: a blank PL means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
+The bitstream is baked because the debug UART leaves the chip through PL balls: a blank PL
+means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
+
+**Do not run `scripts/build.sh`, `scripts/build_detect.sh` or `scripts/build_loader.sh` on
+this branch.** Each writes `blobs/BOOT.bin` from a *different* bif — `build_detect.sh`
+overwrites it in place, and `build_loader.sh` reinstates the blank-PL boot that costs the
+console and the DONE LED. They belong to the older configs above, kept for reference.
 
 A commit that changes a source subtree rebuilds every artefact that lists it. The
 corollary bit me once: the `src-detect` app grew the loader but the baked `BOOT.bin`

@@ -1,12 +1,30 @@
 # Deferred-load / multi-bitstream boot (step 2)
 
+> **How to read this file.** It is the DESIGN NOTE the feature was planned from, and parts
+> of it describe a model that was tried and then superseded. What SHIPS today is: the FSBL
+> configures the PL from a bitstream baked into `BOOT.bin`, and fabrics are swapped at
+> runtime on host command. The blank-PL boot this note originally proposed was implemented,
+> shipped, and reverted — it cost the serial console and the DONE LED, because the debug
+> UART leaves the chip through PL balls.
+>
+> **Authoritative here:** "New boot flow", "Bitstream inventory", "Hardware-validated boot
+> rules". **Historical, kept for the reasoning:** "Why it works", "Orchestration",
+> "Increments", "Build & commit discipline" (superseded by CLAUDE.md rule 1's current
+> table). Sections in the second group are marked where they contradict the shipped code.
+
 Design note for the "network-first, then load a fabric" boot model. Step 1 (the
 IMU detector, `docs/imu-detect.md`) proved I2C detection on a single baked-in
 bitstream. Step 2 changes *how the PL gets loaded* so one SD image can bring up
 whichever fabric the plugged-in headstages need — decided at runtime, after the
 network is already up.
 
-## Why it works
+## Why it works *(historical — the PL-independence argument)*
+
+> The reasoning below is sound and still explains why runtime swaps are possible at all.
+> But the conclusion it was used for — boot with the PL blank — did not survive contact
+> with the board: the console UART is **not** a PS-only resource on this carrier. It is
+> EMIO to PL balls, so "DDR, clocks, UART | PS hard blocks | no" is wrong for *this*
+> hardware, and that error is what made a blank boot look acceptable on paper.
 
 Every peripheral bring-up needs is a **PS/MIO** block, none of them PL:
 
@@ -28,12 +46,19 @@ headstage (nothing is driven), just unusable until a fabric is loaded.
 ## New boot flow
 
 ```
-BootROM → FSBL: PS up (DDR, clocks, MIO Ethernet/SD/QSPI), load app ELF.   PL blank, pins Hi-Z (safe)
-   app: lwIP up over MIO GEM  →  net.py makes contact                      still no PL
-   app: read <name>.bin from SD (xilffs) → program PL via PCAP (XDcfg)
-        → enable PS↔PL level shifters + release FPGA resets → re-init drivers
-   app: probe / acquire through the just-loaded fabric
+BootROM → FSBL: PS up (DDR, clocks, MIO Ethernet/SD/QSPI), CONFIGURE THE PL from the
+                bitstream baked into BOOT.bin, load both core ELFs
+   app: acq_pl_init_early() (CDMA + TLB) -- BEFORE the network, for link stability
+   app: lwIP up over MIO GEM → link → core 1 wakes → command server + beacon
+   app: acq_pl_init_late() (the print-heavy register setup), pl_is_acq = 1
+   app: host connects; set_config / rescan PCAP-swaps a fabric over the SETTLED link
+        → level shifters + FPGA resets → re-init drivers → probe / acquire
 ```
+
+**No PCAP runs at boot.** That is the point: the FSBL configures the PL, which is `main`'s
+long-proven path, and the runtime-PCAP hazard below applies only to swaps made from the
+live app. The console exists from the FSBL's first line because the debug UART leaves the
+chip through PL balls — a blank PL is silent (see the console note under the boot rules).
 
 The app is the **persistent orchestrator**: it lives in DDR/OCM and keeps
 running — network up — across PL reconfigurations, so the host stays connected
@@ -67,22 +92,29 @@ while the board swaps fabrics under it.
 
 ## Bitstream inventory (files on the SD FAT partition)
 
-`blobs/` **is** the SD card image — its contents are copied verbatim to the FAT
-root. `BOOT.bin` shrinks to **FSBL + orchestrator app ELF — no bitstream**, and
-the fabrics live beside it as plain files:
+`blobs/` **is** the SD card image — its contents are copied verbatim to the FAT root.
+`BOOT.bin` carries **FSBL + the default acquisition bitstream + both core ELFs**, and the
+swappable fabrics live beside it as plain files. (An earlier revision of this design made
+`BOOT.bin` bitstream-free; that is what cost the serial console and the DONE LED, and it
+was reverted — see the resolved item under the boot rules.) The shipped set is:
 
 | file | fabric | when |
 |---|---|---|
-| `detect.bin` | two I2C masters (step 1) | first load; also *is* the acquisition fabric whenever neither port is 128-ch |
-| `acq_AA.bin` | both ports 128-ch (LVDS) | both ports high-channel |
-| `acq_AN.bin` / `acq_NA.bin` | one port 128-ch, other 64-ch/IMU | mixed |
+| `acq.bin` | both ports 128-ch LVDS, no I2C | no IMU on either cable; also the fabric baked into `BOOT.bin` |
+| `aimuboth.bin` | both ports 64-ch + a BNO055 each | IMUs on both cables — and the fabric the IMU census runs on, being the only one with I2C on both ports |
+| `aimu_a.bin` / `aimu_b.bin` | one port 64-ch + IMU, the other 128-ch LVDS | mixed |
 
-A collapse worth noting: the **detect image is the "both single-ended" image**,
-which is also the running acquisition fabric for the common IMU/64-ch cases. So
-the first load doubles as detector *and* as the streaming fabric; a PCAP swap to
-an LVDS-bearing image is only needed when a port is actually 128-ch.
+That collapse did happen, though not as sketched: `aimuboth` — an *acquisition* fabric —
+is both the census fabric and the streaming fabric whenever both cables carry an IMU, so
+that case needs no second load at all. The separate detect/scan fabric it was originally
+built around is retired.
 
-## Build & commit discipline (the load-bearing change)
+## Build & commit discipline *(historical — see CLAUDE.md rule 1 for what shipped)*
+
+> The manifest below was never implemented. What replaced it: rule 1's table names every
+> artefact and its inputs, and `build_acq_loader.sh` carries a source fingerprint that
+> refuses `--app-only` when the PL has changed.
+
 
 Today `build.sh` emits one `blobs/BOOT.bin` and CLAUDE.md rule 1 is "any commit
 touching `programmable_logic/`/`firmware/` carries a `BOOT.bin` built from that
@@ -106,17 +138,25 @@ This is the main real cost of step 2 and the reason for a design note before
 code: it touches the sacred invariant, so the manifest approach needs your read
 before it's baked into `build.sh`.
 
-## Orchestration (later increment)
+## Orchestration *(historical — built, but host-side)*
 
-Once loads are trusted, the app runs the state machine on its own: on boot (PL
-blank) → `load detect.bin` → probe both ports (I2C CHIP_ID + high-Z level sense)
-→ classify each port (128-ch / 64-ch+IMU / empty) → pick the matching
-`acq_XX.bin` → load it → start acquisition. The host can also drive each step
-explicitly for bring-up and testing.
+> Shipped differently: the state machine lives in the HOST (`net.py rescan`, and the
+> plugin's `rescanDevice`), not in the app. It censuses on `aimuboth`, picks the matching
+> `acq_imu_*` variant, loads it, then runs the phase sweep. Keeping it host-side means the
+> board never auto-loads anything, which is what keeps every PCAP swap clear of the
+> GEM/PHY bring-up window.
 
-## Increments
+The original sketch: on boot (PL blank) → `load detect.bin` → probe both ports (I2C
+CHIP_ID + high-Z level sense) → classify each port (128-ch / 64-ch+IMU / empty) → pick the
+matching `acq_XX.bin` → load it → start acquisition.
 
-- **2a — deferred-load proof** *(done, validated on hardware)*: orchestrator app
+## Increments *(historical — the plan as executed)*
+
+> 2a and 2c landed; the blank-PL half of 2a was later reverted (see the banner). 2b's
+> manifest was never built — CLAUDE.md rule 1 plus the build script's PL fingerprint cover
+> the same ground.
+
+- **2a — deferred-load proof** *(done, then partly superseded)*: orchestrator app
   boots with a blank PL, network comes up, `load_pl detect` loads `detect.bin`
   from SD via PCAP + the level-shifter/reset sequence, and `detect_imu` then reads
   chip_id 0xA0 *through the just-loaded fabric*. Proves network-first +
@@ -227,8 +267,9 @@ in that bring-up:
   boot (bitstream omitted from the bif) leaves it unlit — a free, instant read on whether
   the PL was configured at all.
 
-Shipped fabrics today (coexist model, not the earlier `acq_AA/AN/NA` sketch above):
-`acq.bin` (128-ch), `detect.bin` (scan), `aimuboth.bin` (64-ch/port + dual IMU).
+Shipped fabrics today: `acq.bin` (128-ch), `aimuboth.bin` (64-ch/port + dual IMU),
+`aimu_a.bin` / `aimu_b.bin` (one cable each way). The scan/detect fabric is retired —
+`aimuboth` supersedes it, with the same I2C on both ports plus a routed UART.
 
 ## Build host (Vitis 2025.1) environment
 
