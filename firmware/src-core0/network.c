@@ -404,14 +404,20 @@ static void send_response(struct tcp_pcb *tpcb, uint32_t ack_id, uint8_t status,
 static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     uint8_t status = ACK_SUCCESS;
 
-    // On a non-acquisition fabric (scan) or a torn-down PL, only fabric-swap and
-    // ping are safe: every other command reads/writes acquisition registers at
-    // 0x40000000 / CDMA / BRAM that are not present, and that AXI access never
-    // gets a response -> the core hangs. Refuse them until an acq fabric is live.
+    // On a non-acquisition fabric (scan) or a torn-down PL, refuse anything
+    // that reads/writes acquisition registers at 0x40000000 / CDMA / BRAM:
+    // those are not present, and such an AXI access never gets a response, so
+    // the core hangs. The allow-list is therefore "touches no PL", not "looks
+    // harmless" -- SET_UDP_DEST qualifies because it only reconfigures lwIP's
+    // destination on the PS side, and a host must be able to say where packets
+    // go BEFORE a fabric exists (the board boots blank, so a client that
+    // configures its UDP destination at connect would otherwise be refused and
+    // conclude the board is broken). GET_STATUS deliberately stays out: it
+    // reads PL status registers.
     if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
         cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU &&
         cmd->cmd_id != CMD_IMU_READ && cmd->cmd_id != CMD_I2C_SCAN &&
-        cmd->cmd_id != CMD_EEPROM_READ) {
+        cmd->cmd_id != CMD_EEPROM_READ && cmd->cmd_id != CMD_SET_UDP_DEST) {
         send_message("cmd 0x%02X refused: no acquisition fabric "
                      "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
         send_ack(tpcb, cmd->ack_id, ACK_ERROR);

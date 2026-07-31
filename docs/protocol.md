@@ -47,7 +47,7 @@ Most commands reply with a small ack; `GET_STATUS`, `READ_REGISTER`, etc. reply 
 | `0x30` | FULL_CABLE_TEST | — | run the full phase sweep |
 | `0x40` | GET_STATUS | — | returns the `status_response_t` struct (see below) |
 | `0x41` | DUMP_BRAM | p1 = word, p2 = count | debug: dump BRAM words to the serial console |
-| `0x50` | SET_UDP_DEST | p1 = ip, p2 = port | set the UDP stream destination |
+| `0x50` | SET_UDP_DEST | p1 = ip, p2 = port | set the UDP stream destination. Accepted on **any** fabric state including a blank PL — it only reconfigures lwIP on the PS side, and a client must be able to say where packets go before a fabric exists |
 | `0x60` | PING | — | liveness check |
 | `0x70` | AUX_WRITE_WORD | p1 = target \| bank<<8 \| is_len<<16; p2 = addr<<16 \| data | program a slot-0 command word (or its loop length) |
 | `0x71` | AUX_BANK_SELECT | p1 = slot; p2 = bank | select the active program bank for slot 0 |
