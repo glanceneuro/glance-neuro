@@ -624,22 +624,37 @@ int main() {
   // TODO: Figure out how to make this work with hotplug
   // TODO: Ideally, we'd allow for a DHCP option with some sort of discovery protocol
 
-  // ---- Network-FIRST boot: come up with the PL BLANK -------------------------
-  // Do NOT auto-load a fabric here. Init the loader only (XDcfg + SD mount -- no
-  // PROG_B, no PL reconfiguration), bring the full network + command server up
-  // below with the PL blank, and let the host PCAP-load a fabric ON COMMAND via
-  // set_config over the live link (the hardware-validated model, docs/
-  // deferred-boot.md). This ordering is load-bearing: a PCAP reconfiguration too
-  // close to the GEM/PHY bring-up window wedges Ethernet. Loading a fabric BEFORE
-  // lwip_init left the MAC unable to transmit at all (zero frames on the wire,
-  // board unreachable), and the mirror case -- loading right after link-up --
-  // dropped the PHY (err -4). Holding the PL blank until the network is fully up
-  // and a set_config arrives keeps every load clear of that window; a runtime
-  // load over the settled link is safe (verified: set_config swaps the fabric
-  // with the link intact). pl_is_acq stays 0, so every PL-touching service is
-  // skipped until a fabric is loaded.
+  // ---- PL is already configured here; do NOT PCAP-load one ------------------
+  // BOOT.bin bakes the default acquisition bitstream, so the FSBL configured the
+  // PL before this code ran (docs/deferred-boot.md). That costs nothing and buys
+  // the serial console and the DONE LED, because the debug UART leaves the chip
+  // through PL balls -- a blank PL is silent.
+  //
+  // pl_loader_init() below is XDcfg + SD mount ONLY: no PROG_B, no
+  // reconfiguration. The load-bearing rule is about RUNTIME PCAP, which is a
+  // different event from an FSBL-configured PL -- do not conflate them. A PCAP
+  // reconfiguration too close to the GEM/PHY bring-up window wedges Ethernet:
+  // PCAP-loading a fabric BEFORE lwip_init left the MAC unable to transmit at
+  // all (zero frames on the wire, board unreachable), and the mirror case --
+  // loading right after link-up -- dropped the PHY (err -4). A load over a
+  // settled link is safe and is how every set_config swap works (verified: the
+  // fabric changes with the link intact). So: never PCAP here, only on command.
   if (pl_loader_init() != 0)
     xil_printf("WARNING: pl_loader_init failed -- set_config loads unavailable\r\n");
+
+  // BOOT.bin bakes the default acquisition bitstream, so the FSBL has already
+  // configured the PL. Do the EARLY half of the acquisition bring-up here --
+  // before the network, which is the ordering this file has always required.
+  // pl_dma_init() marks its staging region non-cacheable via
+  // Xil_SetTlbAttributes, and that is 1 MB granular: doing it after lwIP has
+  // built its EMACPS BD ring and pbuf pools is precisely the "link stability"
+  // hazard called out above. The send_message-HEAVY half runs later, once
+  // core 1 is draining the print ring. Splitting them is why acq_pl_init_early
+  // and acq_pl_init_late exist -- calling the combined acq_pl_bringup() here
+  // would break one ordering or the other.
+  int pl_live_at_boot = pl_loader_pl_configured();
+  if (pl_live_at_boot)
+    acq_pl_init_early();
 
   lwip_init();
   
@@ -650,13 +665,8 @@ int main() {
   netif_set_up(&server_netif);
   service_network();   // RX is live now -- start draining it through the rest of init
 
-  // Start second core
-  xil_printf("ARM0: sending the SEV to wake up ARM1\n\r");
-  sev(); // Send event to wake up ARM1
-  usleep(5000);
-
   send_message("Debug server up and running.\r\n");
-    
+
   // Interrogate PHY to detect initial link state right after xemac_add completes
   // We'll only start TCP and UDP if we're connected
   eth_link_detect(&server_netif);
@@ -676,6 +686,22 @@ int main() {
       send_message("Network link UP\r\n");
     }
   }
+
+  // Start second core -- AFTER the PHY/link work above, deliberately.
+  //
+  // There is exactly one UART and two potential writers. Core 1 owns it once it
+  // starts (it drains the print ring with xil_printf). Core 0 does not print
+  // directly on purpose... but lwIP's xemacpsif/PHY code does: "Start PHY
+  // autonegotiation", "link speed for phy address 0: 1000" and friends are
+  // xil_printf straight from the driver, on core 0, and eth_link_detect() calls
+  // into it. Waking core 1 before that finished put both cores on the UART at
+  // once and shredded the output into interleaved characters. It also has to
+  // stay after lwip_init (see the note above about lwIP breaking if core 1
+  // starts first), so this window -- after link-up, before the servers -- is the
+  // one spot that satisfies both.
+  xil_printf("ARM0: sending the SEV to wake up ARM1\n\r");
+  sev(); // Send event to wake up ARM1
+  usleep(5000);
 
   start_tcp_server();
   service_network();   // answer anything already waiting on the listener
@@ -700,9 +726,9 @@ int main() {
   // No PCAP runs here either way -- the FSBL did the configuring -- so none of
   // this goes near the GEM/PHY bring-up window that runtime loads must avoid.
   pl_has_iic = pl_has_iic_a = pl_has_iic_b = 0;   // the baked fabric is 128-ch, no I2C
-  if (pl_loader_pl_configured()) {
+  if (pl_live_at_boot) {
     current_config = PL_CONFIG_BAKED;
-    acq_pl_bringup();
+    acq_pl_init_late();     // early half already ran, before the network
     pl_reset_timestamp();
     pl_is_acq = 1;
     send_message("System ready: PL configured at boot (%s). "
