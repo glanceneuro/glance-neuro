@@ -295,8 +295,9 @@ def detect_imu(sock):
     detect bitstream's two AXI IIC controllers) and print a per-port verdict."""
     ok, data = send_binary_command(sock, CMD_DETECT_IMU, timeout=2.0)
     if not ok or data is None or len(data) < 12:
-        print("[DETECT] no fabric to probe -- baked detect image not loaded, or the "
-              "deferred-boot image has a blank PL (run load_pl detect first).")
+        print("[DETECT] refused -- the loaded fabric has no IMU I2C. Load one that does "
+              "with set_config: acq_imu_both / acq_imu_port_a / acq_imu_port_b / scan. "
+              "(Plain 'acquisition' and a blank PL carry no I2C; check with pl_status.)")
         return None
     ra, rb, ver = struct.unpack('<III', data[:12])
     if ver != IMUDET_VERSION:
