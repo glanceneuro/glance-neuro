@@ -231,6 +231,111 @@ def test_i2c_scan_decode():
         restore()
 
 
+def test_imu_command_decode():
+    print("imu commands: stream/read replies and failure statuses decode")
+
+    class ImuBoard(MockBoard):
+        """Board that streams only port A -- the acq_imu_port_a case, and the
+        one that must tell the user why they got less than they asked for."""
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.last_mask = None
+            self.last_period = None
+
+        def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
+            self.commands.append((cmd_id, param1, param2))
+            if cmd_id == net.CMD_IMU_STREAM:
+                self.last_mask, self.last_period = param1, param2
+                active = param1 & 1                     # port B has no IIC here
+                period = param2 if param2 else 10
+                period = max(10, min(1000, period))
+                return True, struct.pack('<III', active, period,
+                                         net.IMUSTREAM_VERSION)
+            if cmd_id == net.CMD_IMU_READ:
+                status = 0x1 | (0x0C << 8) | (0xC0 << 24)
+                return True, struct.pack('<I10hBbHI', status,
+                                         8192, 0, 0, 0,      # quat: w=0.5
+                                         -981, 0, 0,          # accel: -9.81 m/s^2
+                                         160, -160, 0,        # gyro: +10/-10 dps
+                                         0xC3, 25, 0, net.IMUREAD_VERSION)
+            return super().send(cmd_id, param1, param2, timeout)
+
+    board = ImuBoard()
+    restore = install_mock(board)
+    try:
+        r = net.imu_stream(None, 'both', 0)
+        check(board.last_mask == 3, f"mask sent {board.last_mask}")
+        check(r is not None and r['active'] == 1, "did not report A-only")
+        check(r['period_ms'] == 10, f"period {r['period_ms']}")
+        net.imu_stream(None, 'a', 50)
+        check(board.last_period == 50, f"period sent {board.last_period}")
+        net.imu_stream(None, 'off')
+        check(board.last_mask == 0, "off did not send mask 0")
+        check(net.imu_stream(None, 'bogus') is None, "accepted a bad port spec")
+
+        s = net.imu_read(None, 'a')
+        check(s is not None, "imu_read returned None")
+        if s:
+            check(abs(s['quat'][0] - 0.5) < 1e-9, f"quat {s['quat'][0]}")
+            check(abs(s['accel'][0] + 9.81) < 1e-9, f"accel {s['accel'][0]}")
+            check(abs(s['gyro'][0] - 10.0) < 1e-9, f"gyro {s['gyro'][0]}")
+            check(abs(s['gyro'][1] + 10.0) < 1e-9, "negative gyro sign lost")
+            check(s['calib'] == {'sys': 3, 'gyr': 0, 'acc': 0, 'mag': 3},
+                  f"calib {s['calib']}")
+            check(s['temp_c'] == 25, f"temp {s['temp_c']}")
+    finally:
+        restore()
+
+    # A chip that answers but won't enter NDOF must not look like a sample.
+    class BadImu(MockBoard):
+        def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
+            if cmd_id == net.CMD_IMU_READ:
+                status = 0x8 | (0x00 << 8)          # MODEFAIL, mode reads 0
+                return True, struct.pack('<I10hBbHI', status, *([0] * 10),
+                                         0, 0, 0, net.IMUREAD_VERSION)
+            return super().send(cmd_id, param1, param2, timeout)
+    board = BadImu()
+    restore = install_mock(board)
+    try:
+        check(net.imu_read(None, 'a') is None, "reported a sample despite MODEFAIL")
+    finally:
+        restore()
+
+
+def test_eeprom_failure_statuses():
+    print("eeprom_read: no-ACK and short-read statuses are reported honestly")
+
+    class NoAck(MockBoard):
+        def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
+            if cmd_id == net.CMD_EEPROM_READ:
+                return True, struct.pack('<II', 1, 0) + bytes(32) + \
+                    struct.pack('<I', net.EEPROMRD_VERSION)
+            return super().send(cmd_id, param1, param2, timeout)
+    board = NoAck()
+    restore = install_mock(board)
+    try:
+        check(net.eeprom_read(None, 'a', 0x50, 0, 32, 1) is None,
+              "no-ACK reported as data")
+    finally:
+        restore()
+
+    class Short(MockBoard):
+        def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
+            if cmd_id == net.CMD_EEPROM_READ:
+                # status 3 = short read, 4 of 32 bytes arrived
+                st = 3 | (4 << 8) | (32 << 16)
+                return True, struct.pack('<II', st, 4) + bytes([1, 2, 3, 4]) + \
+                    bytes(28) + struct.pack('<I', net.EEPROMRD_VERSION)
+            return super().send(cmd_id, param1, param2, timeout)
+    board = Short()
+    restore = install_mock(board)
+    try:
+        d = net.eeprom_read(None, 'a', 0x50, 0, 32, 1)
+        check(d == bytes([1, 2, 3, 4]), f"short read returned {d!r}")
+    finally:
+        restore()
+
+
 def test_abort_paths():
     print("abort_paths: rescan gives up cleanly when the board can't comply")
 
@@ -268,6 +373,8 @@ def main():
     test_freed_lane_correction()
     test_rescan_noapply()
     test_i2c_scan_decode()
+    test_imu_command_decode()
+    test_eeprom_failure_statuses()
     test_abort_paths()
     if failures:
         print(f"TB_FAIL  Errors: {failures}")
