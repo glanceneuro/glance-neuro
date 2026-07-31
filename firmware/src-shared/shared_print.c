@@ -229,6 +229,31 @@ void send_message(const char *format, ...) {
     print_buffer->write_idx = (write_idx + 1) % MAX_PRINT_ENTRIES;
 }
 
+// 0 until core 0 wakes core 1; see the header for why this exists.
+volatile int core1_print_active = 0;
+
+void boot_print(const char *format, ...) {
+    char buffer[PRINT_MSG_SIZE];
+    va_list args;
+
+    va_start(args, format);
+    int len = vsnprintf(buffer, PRINT_MSG_SIZE - 1, format, args);
+    va_end(args);
+    if (len <= 0) return;
+    buffer[PRINT_MSG_SIZE - 1] = '\0';
+
+    if (core1_print_active) {
+        // Core 1 owns the UART -- queue like everything else, so core 0 never
+        // blocks on it and the two never interleave characters.
+        send_message("%s", buffer);
+    } else {
+        // Core 1 is parked. The ring would never be drained, so write the UART
+        // directly: core 0 is the only writer here, and nothing this early is
+        // time-critical enough to care that xil_printf blocks.
+        xil_printf("%s", buffer);
+    }
+}
+
 // ============================================================================
 // CORE-1 STATUS PRINTER (reads the shared snapshot, not the PL or core 0)
 // ============================================================================

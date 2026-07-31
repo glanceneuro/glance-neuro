@@ -28,6 +28,24 @@ void init_print_buffer(void);
 void send_message(const char *format, ...);
 void print_handler_loop(void);
 
+// Set by core 0 immediately after it SEVs core 1. Before that point core 1 is
+// parked, so NOTHING drains the print ring: a send_message() would sit unseen
+// and, once 64 entries pile up, be dropped outright.
+extern volatile int core1_print_active;
+
+// For code that can run on BOTH sides of that moment. pl_dma_init() is the
+// case that forced this to exist: it runs from acq_pl_init_early(), which is
+// called once at boot BEFORE core 1 is awake and again on every runtime
+// set_config swap, long after. Neither xil_printf nor send_message is correct
+// in both places -- direct printing collides with core 1 for the UART, queued
+// printing vanishes when core 1 is parked -- so this picks per call.
+//
+// Ordinary code should keep calling send_message(). This is deliberately NOT
+// folded into send_message() itself: the one queued line in the boot path
+// ("Debug server up and running.") is a self-test of the ring, and it only
+// tests anything if send_message() always means "go through the ring".
+void boot_print(const char *format, ...);
+
 
 typedef struct {
     print_entry_t entries[MAX_PRINT_ENTRIES];

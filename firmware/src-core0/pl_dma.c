@@ -45,18 +45,18 @@ int pl_dma_init(void) {
 
     XAxiCdma_Config *cfg = XAxiCdma_LookupConfig(CDMA_BASEADDR);
     if (cfg == NULL) {
-        send_message("CDMA: LookupConfig(0x%08lX) failed\r\n",
+        boot_print("CDMA: LookupConfig(0x%08lX) failed\r\n",
                      (unsigned long)CDMA_BASEADDR);
         return -1;
     }
     if (XAxiCdma_CfgInitialize(&cdma, cfg, cfg->BaseAddress) != XST_SUCCESS) {
-        send_message("CDMA: CfgInitialize failed\r\n");
+        boot_print("CDMA: CfgInitialize failed\r\n");
         return -2;
     }
     // Polled mode (avoids the dual-core GIC distributor init gotcha).
     XAxiCdma_IntrDisable(&cdma, XAXICDMA_XR_IRQ_ALL_MASK);
     cdma_ready = 1;
-    send_message("CDMA: ready (ctrl 0x%08lX, staging 0x%08lX)\r\n",
+    boot_print("CDMA: ready (ctrl 0x%08lX, staging 0x%08lX)\r\n",
                  (unsigned long)CDMA_BASEADDR, (unsigned long)DMA_BUF_ADDR);
 
     // Smoke test: one CDMA transfer BRAM[0]->staging exercises the control path
@@ -66,8 +66,8 @@ int pl_dma_init(void) {
     // it (the BRAM contents at boot are don't-care).
     {
         int rc = pl_dma_read_bram((uint32_t *)DMA_BUF_ADDR, 0, 8);
-        if (rc == 0) send_message("CDMA: self-test OK\r\n");
-        else         send_message("CDMA: self-test FAILED (rc=%d)\r\n", rc);
+        if (rc == 0) boot_print("CDMA: self-test OK\r\n");
+        else         boot_print("CDMA: self-test FAILED (rc=%d)\r\n", rc);
     }
     return 0;
 }

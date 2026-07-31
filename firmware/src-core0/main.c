@@ -680,8 +680,29 @@ int main() {
   if (pl_live_at_boot)
     acq_pl_init_early();
 
+  // ---- Why there are two ways to print, and which one applies here ----------
+  // xil_printf drives the UART directly and BLOCKS until every character has
+  // been shifted out. A line of text is milliseconds at any console baud, and
+  // core 0 runs the 30 kHz sample pump whose entire budget is 33 us per sample.
+  // Core 0 therefore cannot afford to touch the UART once acquisition is live.
+  //
+  // That is what the debug server on core 1 is for. send_message() formats into
+  // a 64-entry shared-memory ring in constant time and returns; core 1 does the
+  // blocking UART work. Core 0 queues, core 1 prints. That is the steady-state
+  // rule for the whole rest of this firmware.
+  //
+  // None of it works yet. Core 1 stays parked until the SEV further down, so
+  // nothing drains the ring: a send_message() in this window would sit unseen
+  // for as long as the link wait takes, and once 64 entries pile up the ring
+  // DROPS rather than blocks, silently losing boot diagnostics. So from here to
+  // the SEV, core 0 prints with xil_printf. It is safe -- nothing here is
+  // time-critical and core 0 is the only writer -- and it is also the only way
+  // to keep the log in causal order, because lwip_init() and the xemacpsif/PHY
+  // code below xil_printf from core 0 themselves ("Start PHY autonegotiation",
+  // "link speed for phy address 0: 1000"). Queued lines would surface after
+  // driver output that actually happened later.
   lwip_init();
-  
+
   netif_add(&server_netif, &ipaddr, &netmask, &gw, NULL, NULL, NULL);
   netif_set_default(&server_netif);
   xemac_add(&server_netif, &ipaddr, &netmask, &gw,
@@ -689,22 +710,6 @@ int main() {
   netif_set_up(&server_netif);
   service_network();   // RX is live now -- start draining it through the rest of init
 
-  // Deliberately the ONE queued message in the boot path: everything else here
-  // prints directly. Core 1 is still parked, so this sits in the ring until the
-  // SEV below wakes it -- which is the point. Seeing it appear right after
-  // "Core 1 awake!!" is the end-to-end proof that the shared-memory print ring
-  // works. If it never appears, the ring is broken, not the network.
-  send_message("Debug server up and running.\r\n");
-
-  // Everything from here to the SEV prints with xil_printf, NOT send_message.
-  // Core 1 is parked, so the ring is not being drained and a queued line would
-  // not reach the console until after the SEV -- up to LINK_WAIT_TIMEOUT_S
-  // later. Worse, it would land OUT OF ORDER: lwIP's xemacpsif/PHY code
-  // xil_printfs from core 0 in this same window ("Start PHY autonegotiation",
-  // "link speed for phy address 0: 1000"), so queued status lines would print
-  // after driver output that actually happened later. Core 0 is the only writer
-  // until the SEV, so printing directly here is safe and keeps the boot log in
-  // causal order.
   eth_link_detect(&server_netif);
   if (netif_is_link_up(&server_netif)) {
     link_is_up = 1;
@@ -723,9 +728,23 @@ int main() {
   {
     XTime wait_start; XTime_GetTime(&wait_start);
     const XTime wait_limit = (XTime)COUNTS_PER_SECOND * LINK_WAIT_TIMEOUT_S;
+    uint32_t last_probe = sys_now();   // the detect just above counts as probe 0
     while (!link_is_up) {
       service_network();   // keep draining RX while waiting for PHY link-up
-      eth_link_detect(&server_netif);
+
+      // Probe the PHY on the SAME 500 ms cadence the maintenance loop uses.
+      // eth_link_detect() drives MDIO and re-enters the driver's link/autoneg
+      // path, which prints as it goes. Calling it as fast as this loop spins
+      // floods the console and keeps restarting negotiation on a link that only
+      // needed a moment to settle -- so an unpaced wait can be the reason the
+      // link never comes up. service_network() still runs every pass; it is the
+      // PHY poll that has to be rate-limited, not the RX drain.
+      uint32_t now_ms_probe = sys_now();
+      if ((uint32_t)(now_ms_probe - last_probe) >= 500) {
+        last_probe = now_ms_probe;
+        eth_link_detect(&server_netif);
+      }
+
       if (netif_is_link_up(&server_netif)) {
         link_is_up = 1;
         xil_printf("Network link UP\r\n");
@@ -745,7 +764,7 @@ int main() {
   //
   // There is exactly one UART and two potential writers. Core 1 owns it once it
   // starts (it drains the print ring with xil_printf). Core 0 does not print
-  // directly on purpose... but lwIP's xemacpsif/PHY code does: "Start PHY
+  // directly after this point... but lwIP's xemacpsif/PHY code does: "Start PHY
   // autonegotiation", "link speed for phy address 0: 1000" and friends are
   // xil_printf straight from the driver, on core 0, and eth_link_detect() calls
   // into it. Waking core 1 before that finished put both cores on the UART at
@@ -753,8 +772,23 @@ int main() {
   // stay after lwip_init (see the note above about lwIP breaking if core 1
   // starts first), so this window -- after link-up, before the servers -- is the
   // one spot that satisfies both.
+
+  // Queued deliberately, and deliberately LAST: this is the only send_message()
+  // in the boot path, and core 1 is still parked, so it can only reach the
+  // console by way of the ring being drained after the SEV on the next line.
+  // That makes it a self-test of the debug server rather than a status line --
+  // "Debug server up and running." landing right behind core 1's own "Core 1
+  // awake!!" is end-to-end proof that the ring works. If it never appears, the
+  // ring is broken, not the network. Keep it immediately above the SEV: move it
+  // earlier and it stops proving anything, because the wait it survives is what
+  // gives it meaning.
+  send_message("Debug server up and running.\r\n");
+
   xil_printf("ARM0: sending the SEV to wake up ARM1\n\r");
   sev(); // Send event to wake up ARM1
+  // From here on the ring has a reader, so boot_print() switches to queueing
+  // and core 0 must stop touching the UART directly.
+  core1_print_active = 1;
   usleep(5000);
 
   start_tcp_server();
