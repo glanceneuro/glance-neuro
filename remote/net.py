@@ -416,6 +416,125 @@ def pl_status(sock, verbose=True):
               f"{'acquisition' if is_acq else 'non-acq'}, link {'UP' if link_up else 'DOWN'}")
     return {"config": config, "name": name, "is_acq": is_acq, "link_up": link_up}
 
+# --- rescan: one-shot inventory + fabric selection ----------------------------
+# DRAFT (overnight 2026-07-30) -- composes existing pieces; no new firmware.
+#
+# Why it is shaped this way -- survey of the detection machinery it builds on:
+#   * auto_cable_detect (CableDetection.detect) is the ONLY per-cable "is an RHD
+#     headstage present?" probe: ce=0xFF packs all four CIPO lanes (A0/A1/B0/B1)
+#     into every packet and a 16-phase sweep scores each lane independently.
+#   * CMD_READ_REGISTER 0x73 / aux_selftest ('INTAN' ROM regs 40-44) CANNOT
+#     serve: the slot-2 inject result register is PORT A ONLY (register-map.md,
+#     status reg 12) and the inject path requires active streaming.
+#   * detect_imu (CMD_DETECT_IMU) probes a port's BNO055 only on a fabric whose
+#     port has an AXI IIC; the 'scan' fabric has both.
+# No single fabric can run both probes on one port (the IMU I2C occupies the
+# freed CIPO1 balls), so rescan is a two-fabric dance:
+#     scan -> IMU census -> pick fabric -> load it -> phase-sweep chip detect.
+#
+# ASSUMPTIONS (review in the morning):
+#   1. IMU presence alone selects the fabric (both->acq_imu_both, A->_port_a,
+#      B->_port_b, neither->acquisition). Chip detection runs AFTER, only to set
+#      phases + channel mask on the chosen fabric -- it cannot influence the
+#      choice because it needs an acquisition fabric to run at all.
+#   2. Probing I2C on a cable that carries a plain 128-ch headstage (the scan
+#      fabric drives SCL/SDA into what that headstage drives as LVDS CIPO1) is
+#      assumed electrically harmless for the ~ms probe and reads as "no IMU".
+#   3. On acq_imu_* fabrics the freed CIPO1 lane(s) are assumed to score below
+#      DETECTION_THRESHOLD in the sweep (tied-off input, no test sine), so the
+#      auto-applied mask gains no phantom lane. rescan warns if one scores
+#      anyway; if hardware shows that, mask the freed lanes before apply.
+#   4. The ce=0xFF detection packet keeps its 154-word four-lane layout on the
+#      64-ch variants (the packetizer RTL is unchanged; only the LVDS buffer
+#      drops a lane), so the validator/scorer need no resize.
+#   5. set_config resets the master timestamp -- a rescan starts a fresh epoch,
+#      so never run it mid-recording.
+#
+# OPEN QUESTIONS (for Caleb):
+#   * Is (2) actually safe on your cables, or should rescan refuse to I2C-probe
+#     a port that streamed chips on its last known fabric?
+#   * Empty cable (no IMU, no chip) currently contributes "plain LVDS" to the
+#     fabric choice -- i.e. two empty ports load 'acquisition'. Prefer that, or
+#     leave the board on 'scan' until something is found?
+#   * Should "IMU present but no chip on that cable's CIPO0" be flagged as a
+#     seating fault rather than silently accepted?
+#   * rescan leaves streaming STOPPED (detection's apply stops to latch the
+#      mask). Auto-start instead?
+
+# (imu_a_present, imu_b_present) -> fabric name in CONFIGS
+_RESCAN_FABRIC = {
+    (True, True): "acq_imu_both",
+    (True, False): "acq_imu_port_a",
+    (False, True): "acq_imu_port_b",
+    (False, False): "acquisition",
+}
+# Freed-CIPO1 detection lanes per IMU fabric (indexes into the A0/A1/B0/B1 lane
+# order) -- used only to warn if a lane that has no LVDS pair "detects" a chip.
+_RESCAN_FREED_LANES = {
+    "acq_imu_both": (1, 3), "acq_imu_port_a": (1,), "acq_imu_port_b": (3,),
+    "acquisition": (),
+}
+
+def rescan(sock, with_chip_detect=True):
+    """Work out what is plugged into each headstage port and load the matching
+    fabric: scan-fabric IMU census -> set_config the right acq variant -> full
+    phase-sweep chip detection (phases + channel mask) on the result. Returns
+    {'imu_a','imu_b','fabric','detection'} or None on abort; the board is left
+    on whatever fabric was loaded last (check pl_status)."""
+    pl = pl_status(sock, verbose=False)
+    if pl is None:
+        print("[RESCAN] aborted -- no PL_STATUS reply (firmware without the "
+              "config-swap loader?)")
+        return None
+    print(f"[RESCAN] starting from fabric '{pl['name']}'")
+
+    # set_config refuses while streaming; stop unconditionally (harmless when
+    # already stopped) rather than guessing at stream state.
+    send_binary_command(sock, CMD_STOP)
+    time.sleep(0.05)
+
+    print("[RESCAN] 1/3 IMU census on the scan fabric ...")
+    r = set_config(sock, "scan")
+    if not r or r["rc"] != 0:
+        print("[RESCAN] aborted -- could not load the scan fabric")
+        return None
+    imu = detect_imu(sock)
+    if imu is None:
+        print("[RESCAN] aborted -- detect_imu refused on the scan fabric (bug?)")
+        return None
+    imu_a, imu_b = imu['A']['present'], imu['B']['present']
+
+    target = _RESCAN_FABRIC[(imu_a, imu_b)]
+    print(f"[RESCAN] 2/3 IMU: A={'yes' if imu_a else 'no'} "
+          f"B={'yes' if imu_b else 'no'} -> loading '{target}' ...")
+    r = set_config(sock, target)
+    if not r or r["rc"] != 0:
+        print(f"[RESCAN] aborted -- could not load '{target}'; the board is "
+              f"still on 'scan' (pl_status to confirm)")
+        return None
+
+    detection = None
+    if with_chip_detect:
+        print("[RESCAN] 3/3 chip detection (phase sweep) ...")
+        detection = run_detection(sock, verbose=False)
+        for lane_idx in _RESCAN_FREED_LANES[target]:
+            lane = ("A.CIPO0", "A.CIPO1", "B.CIPO0", "B.CIPO1")[lane_idx]
+            flagged = (detection.cipo1_detected if lane_idx == 1
+                       else detection.portb_cipo1_detected)
+            if flagged:
+                print(f"[RESCAN] WARNING: {lane} 'detected' a chip but that "
+                      f"lane has no LVDS pair on '{target}' (it is the IMU "
+                      f"I2C) -- the applied channel mask includes a phantom "
+                      f"lane; re-check assumption 3.")
+    else:
+        print("[RESCAN] 3/3 chip detection skipped (with_chip_detect=False)")
+
+    print(f"[RESCAN] done: fabric '{target}', IMU A={'Y' if imu_a else 'n'} "
+          f"B={'Y' if imu_b else 'n'}"
+          + (f", {detection.get_channel_summary()}" if detection else ""))
+    return {"imu_a": imu_a, "imu_b": imu_b, "fabric": target,
+            "detection": detection}
+
 def print_command_help():
     """The single command menu -- printed at connect AND by the `help` command,
     so the two can't drift. (The `help` command used to be a separate stale copy
@@ -430,6 +549,7 @@ def print_command_help():
     print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
     print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
     print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
+    print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
     print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
@@ -3027,32 +3147,6 @@ def run_detection(sock, verbose=True):
         validator.last_seq = None
 
 
-def print_command_help():
-    """The single command menu -- printed at connect AND by the `help` command,
-    so the two can't drift. (The `help` command used to be a separate stale copy
-    that had fallen behind -- e.g. missing the stim section.)"""
-    print("\n[TCP] Available commands:")
-    print("  Basic: start, stop, reset_timestamp, loop <count>")
-    print("  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
-    print("  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
-    print("  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
-    print("  Debug: dump_bram [start] [count], stats, hex")
-    print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
-    print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
-    print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
-    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
-    print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
-    print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
-    print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
-    print("          (stim_arm = fire playback from a digital-in line: edge=once per trigger edge, gate=play while asserted; pol 0=rising/high, 1=falling/low)")
-    print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
-    print("  auto_cable_detect - Automated cable detection!")
-    print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
-    print("       read_reg <r>, write_reg <r> <v>, aux_selftest")
-    print("       fast_settle <0|1> [dsp] | gpio <pin> | off")
-    print("       digout <0|1> | gpio <pin> | hiz")
-    print("  Utility: help, quit")
-
 def configure_tcp_keepalive(sock):
     """Enable TCP keepalive to detect dead connections faster.
 
@@ -3237,6 +3331,10 @@ def tcp_control():
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
                 elif cmd == "detect_imu":
                     detect_imu(sock)
+                elif cmd == "rescan" or cmd.startswith("rescan "):
+                    # "rescan noapply" = fabric selection only, skip the phase
+                    # sweep (leaves phases/mask untouched).
+                    rescan(sock, with_chip_detect=("noapply" not in cmd.split()[1:]))
                 elif cmd == "load_pl" or cmd.startswith("load_pl "):
                     parts = cmd.split()
                     load_pl(sock, parts[1] if len(parts) > 1 else "detect")
