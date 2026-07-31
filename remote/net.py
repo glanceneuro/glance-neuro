@@ -323,6 +323,47 @@ def detect_imu(sock):
             print(f"Port {port}: no IMU (nothing answered at 0x28) {diag}")
     return res
 
+# One-shot BNO055 fused sample (CMD_IMU_READ). Reply is 32 bytes -- keep in sync
+# with firmware imu_sample_response_t. DRAFT (overnight 2026-07-30), untested on
+# hardware; the continuous-ingestion design is docs/imu-ingestion.md.
+CMD_IMU_READ = 0xB6
+IMUREAD_VERSION = 0x494D5552  # "IMUR"
+
+def imu_read(sock, port='a'):
+    """Read one NDOF sample (quaternion/accel/gyro + calibration status) from
+    the BNO055 on port 'a' or 'b'. Needs a fabric with that port's I2C and
+    streaming stopped; the first read after power-up takes ~50 ms extra while
+    the chip enters NDOF."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    ok, data = send_binary_command(sock, CMD_IMU_READ, param1=p, timeout=2.0)
+    if not ok or data is None or len(data) < 32:
+        print(f"[IMU] read refused/failed on port {'B' if p else 'A'} -- "
+              f"fabric without that port's I2C, or streaming active?")
+        return None
+    (status, qw, qx, qy, qz, ax, ay, az, gx, gy, gz,
+     calib, temp, _pad, ver) = struct.unpack('<I10hBbHI', data[:32])
+    if ver != IMUREAD_VERSION:
+        print(f"[IMU] unexpected version 0x{ver:08X} (expected 0x{IMUREAD_VERSION:08X})")
+    if not (status & 0x1):
+        why = ("chip present but would not enter NDOF" if status & 0x8
+               else "nothing answered at 0x28")
+        print(f"[IMU] port {'B' if p else 'A'}: no sample -- {why} "
+              f"[mode=0x{(status >> 8) & 0xFF:02X}, iic_sr=0x{(status >> 24) & 0xFF:02X}]")
+        return None
+    quat = tuple(v / 16384.0 for v in (qw, qx, qy, qz))
+    accel = tuple(v / 100.0 for v in (ax, ay, az))     # m/s^2
+    gyro = tuple(v / 16.0 for v in (gx, gy, gz))       # deg/s
+    cal = {'sys': (calib >> 6) & 3, 'gyr': (calib >> 4) & 3,
+           'acc': (calib >> 2) & 3, 'mag': calib & 3}
+    print(f"[IMU] port {'B' if p else 'A'}: "
+          f"quat w={quat[0]:+.4f} x={quat[1]:+.4f} y={quat[2]:+.4f} z={quat[3]:+.4f}")
+    print(f"      accel ({accel[0]:+7.2f},{accel[1]:+7.2f},{accel[2]:+7.2f}) m/s^2  "
+          f"gyro ({gyro[0]:+8.2f},{gyro[1]:+8.2f},{gyro[2]:+8.2f}) deg/s")
+    print(f"      calib sys={cal['sys']}/3 gyr={cal['gyr']}/3 acc={cal['acc']}/3 "
+          f"mag={cal['mag']}/3, die {temp} C")
+    return {'quat': quat, 'accel': accel, 'gyro': gyro, 'calib': cal,
+            'temp_c': temp, 'status': status}
+
 # Deferred PL load (step 2, docs/deferred-boot.md): the loader image boots with a
 # blank PL and programs a fabric from the SD card via PCAP on command.
 CMD_LOAD_PL = 0xB2
@@ -549,6 +590,7 @@ def print_command_help():
     print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
     print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
     print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
+    print("       imu_read [a|b]  (one NDOF sample: quat/accel/gyro/calib -- not while streaming)")
     print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
@@ -3331,6 +3373,9 @@ def tcp_control():
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
                 elif cmd == "detect_imu":
                     detect_imu(sock)
+                elif cmd == "imu_read" or cmd.startswith("imu_read "):
+                    parts = cmd.split()
+                    imu_read(sock, parts[1] if len(parts) > 1 else 'a')
                 elif cmd == "rescan" or cmd.startswith("rescan "):
                     # "rescan noapply" = fabric selection only, skip the phase
                     # sweep (leaves phases/mask untouched).

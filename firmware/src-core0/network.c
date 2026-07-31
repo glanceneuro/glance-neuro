@@ -5,6 +5,7 @@
 #include "pl_dma.h"     // CDMA read of the LFP output BRAM into non-cacheable staging
 #include "pl_stim.h"    // DAC70502 stimulus peripheral driver
 #include "pl_imu_detect.h"  // per-cable BNO055 probe over the AXI IICs (CMD_DETECT_IMU)
+#include "pl_imu_read.h"    // one-shot BNO055 NDOF sample (CMD_IMU_READ)
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -96,6 +97,7 @@ ID   | Command          | Param1              | Param2
 #define CMD_DETECT_IMU        0xB0  // probe both cables' AXI IIC for a BNO055 (fabric must carry the IICs)
 #define CMD_SET_CONFIG        0xB4  // param1 = config selector; PCAP-swap the PL fabric
 #define CMD_PL_STATUS         0xB5  // query the loaded fabric -- works in ANY fabric state
+#define CMD_IMU_READ          0xB6  // param1 = port (0=A,1=B); one-shot BNO055 NDOF sample
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -402,7 +404,8 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     // 0x40000000 / CDMA / BRAM that are not present, and that AXI access never
     // gets a response -> the core hangs. Refuse them until an acq fabric is live.
     if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
-        cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU) {
+        cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU &&
+        cmd->cmd_id != CMD_IMU_READ) {
         send_message("cmd 0x%02X refused: no acquisition fabric "
                      "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
         send_ack(tpcb, cmd->ack_id, ACK_ERROR);
@@ -568,6 +571,32 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // probing the absent port's AXI slave hangs the core.
             pl_imu_detect_run(&resp, pl_has_iic_a, pl_has_iic_b);
             send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
+            return;  // response already sent
+        }
+
+        case CMD_IMU_READ: {
+            // One-shot BNO055 fused sample (quat/accel/gyro) from one port.
+            // Blocking polled I2C, milliseconds long (plus ~50 ms on first use
+            // to enter NDOF) -- refuse while streaming: the pump would miss
+            // hundreds of 33 us sample slots and overrun the PL FIFO. Checking
+            // transmission state reads an acquisition register, so only do it
+            // when an acq fabric is live (on scan, streaming can't be active).
+            int port = cmd->param1 & 1;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            if (!has_iic) {
+                send_message("IMU_READ refused: port %c has no I2C on this "
+                             "fabric\r\n", port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if (pl_is_acq && pl_is_transmission_active()) {
+                send_message("IMU_READ refused: stop streaming first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_sample_response_t sample;
+            pl_imu_read_sample(port, &sample);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &sample, sizeof(sample));
             return;  // response already sent
         }
 

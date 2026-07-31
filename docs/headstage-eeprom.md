@@ -47,7 +47,8 @@ assembled.
 Extend the detect path with a generic per-port **bus scan** rather than an
 EEPROM-specific read:
 
-1. `CMD_I2C_SCAN` (new, e.g. 0xB6): for each 7-bit address in 0x08–0x77, one
+1. `CMD_I2C_SCAN` (new, e.g. 0xB7 — 0xB6 is now CMD_IMU_READ): for each 7-bit
+   address in 0x08–0x77, one
    `XIic_DynSend(base, addr, &zero, 1, stop)` and record ACK/no-ACK. Reply = a
    16-byte bitmap per port. This finds the BNO055 (sanity check), the EEPROM,
    and anything else on the bus in one shot, and needs no assumption about the
