@@ -327,7 +327,21 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define PROTOCOL_VERSION               1
 #define FIRMWARE_VERSION_MAJOR         2
 // MAJOR bumps when the wire contract breaks; MINOR when it only grows.
-#define FIRMWARE_VERSION_MINOR         2   // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
+#define FIRMWARE_VERSION_MINOR         3   // 2.3.0.0: headstage IMU -- a BNO055 on each cable's freed
+                                           //      CIPO pair, as a stream_type=4 UDP side channel at
+                                           //      100 Hz, plus the I2C bus-scan/EEPROM probes and the
+                                           //      rescan orchestrator that picks a fabric from what is
+                                           //      plugged in. ADDITIVE over 2.2.0.0 -- broadband, LFP,
+                                           //      aux and stim are byte-for-byte UNCHANGED, and
+                                           //      status_response_t is still 288 B, so a 2.2.x host
+                                           //      still interoperates (it simply ignores stream_type 4
+                                           //      and the 0xB0-0xB9 commands). New: CMD_DETECT_IMU
+                                           //      0xB0, SET_CONFIG 0xB4, PL_STATUS 0xB5, IMU_READ 0xB6,
+                                           //      I2C_SCAN 0xB7, IMU_STREAM 0xB8, EEPROM_READ 0xB9.
+                                           //      BOOT.bin now bakes the default acquisition bitstream
+                                           //      (the FSBL configures the PL), and blobs/ carries four
+                                           //      runtime-swappable fabrics. See docs/imu-ingestion.md.
+                                           // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
                                            //      + firmware driver + host API, TCP cmds 0xA0..0xAD).
                                            //      ADDITIVE over 2.1.0.0 -- the broadband/aux/LFP wire
                                            //      contract is UNCHANGED (stim is control-only + a PL
@@ -348,10 +362,10 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            //      engine is always on, reg22 carries the override
                                            //      semantics, and the accel slot-0 reply rides in-frame at
                                            //      data word 34. A 1.x host does not interoperate.
-#define FIRMWARE_VERSION_PATCH         1   // 2.2.0.1: harden the hw retrigger path --
-                                           //      latch the trigger edge (no drop in the
-                                           //      RD pipeline) + start-latch FRAME_COUNT.
-                                           //      RTL bugfix; wire contract unchanged.
+#define FIRMWARE_VERSION_PATCH         0   // reset by the 2.3.0.0 MINOR bump. (2.2.0.1 was
+                                           //      the hw-retrigger hardening: latch the trigger
+                                           //      edge + start-latch FRAME_COUNT; that RTL fix
+                                           //      is included here.)
 #define FIRMWARE_VERSION_BUILD         0
 #define FIRMWARE_VERSION_WORD          ((FIRMWARE_VERSION_MAJOR << 24) | \
                                        (FIRMWARE_VERSION_MINOR << 16) | \
