@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 // CIPO0-only LVDS buffer -- a variant of intan_spi_lvds_buffer for the
 // IMU-acquisition fabrics (acq_imu_*). It drives sclk/csn/copi and receives

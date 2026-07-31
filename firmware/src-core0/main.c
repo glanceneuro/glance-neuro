@@ -184,11 +184,15 @@ void update_current_packet_size(void) {
 // registers that aren't there.
 volatile int pl_is_acq = 0;
 
-// 1 while the loaded fabric exposes the two AXI IICs (0x43D0/0x43D1) for the
-// per-cable BNO055. Gates CMD_DETECT_IMU so a fabric without them (plain acq)
-// can't hang the core probing absent I2C. Valid on BOTH acquisition fabrics that
-// carry the IICs (acq_imu_*) AND the non-acq scan/detect fabric.
-volatile int pl_has_iic = 0;
+// Per-port: 1 while the loaded fabric exposes that cable's AXI IIC (port A at
+// 0x43D0, port B at 0x43D1) for a BNO055. CMD_DETECT_IMU probes a port ONLY if
+// its flag is set: a mixed fabric (acq_imu_port_a/_b) carries one IIC and leaves
+// the other port 128-ch LVDS with NO I2C, and touching that absent AXI slave
+// hangs the core forever. pl_has_iic is the OR (any IIC present) that gates the
+// command itself so plain acq -- which has neither -- refuses it outright.
+volatile int pl_has_iic_a = 0;
+volatile int pl_has_iic_b = 0;
+volatile int pl_has_iic   = 0;
 
 // selector -> SD file (no .bin), is it an acquisition fabric, does it carry the
 // AXI IICs? Selectors are append-only so the host mapping (net.py CONFIGS) stays
@@ -197,13 +201,13 @@ volatile int pl_has_iic = 0;
 // is built with FF_USE_LFN=0, so f_open on a longer name fails PL_ERR_OPEN even
 // when the file is present. Hence acq_imu_both's blob is "aimuboth.bin", not
 // "acq_imu_both.bin" (12-char base). The host-facing `name` is unconstrained.
-typedef struct { const char *name; const char *file; int is_acq; int has_iic; } pl_config_t;
+typedef struct { const char *name; const char *file; int is_acq; int iic_a; int iic_b; } pl_config_t;
 static const pl_config_t pl_configs[] = {
-  { "acquisition",    "acq",      1, 0 },   // 128-ch LVDS acquisition, no IMU
-  { "scan",           "detect",   0, 1 },   // single-ended I2C-probe fabric (both IICs)
-  { "acq_imu_both",   "aimuboth", 1, 1 },   // both cables 64-ch + a BNO055 each
-  { "acq_imu_port_a", "aimu_a",   1, 1 },   // port A 64-ch + IMU, port B 128-ch LVDS
-  { "acq_imu_port_b", "aimu_b",   1, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU
+  { "acquisition",    "acq",      1, 0, 0 },   // 128-ch LVDS acquisition, no IMU
+  { "scan",           "detect",   0, 1, 1 },   // single-ended I2C-probe fabric (both IICs)
+  { "acq_imu_both",   "aimuboth", 1, 1, 1 },   // both cables 64-ch + a BNO055 each
+  { "acq_imu_port_a", "aimu_a",   1, 1, 0 },   // port A 64-ch + IMU (iic_a), port B 128-ch LVDS
+  { "acq_imu_port_b", "aimu_b",   1, 0, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU (iic_b)
 };
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
 static int current_config = -1;
@@ -243,13 +247,15 @@ int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
   const pl_config_t *c = &pl_configs[sel];
   if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
   pl_is_acq = 0;                         // tearing the PL down -> stop touching it
-  pl_has_iic = 0;                        // ...and its IICs are gone until reloaded
+  pl_has_iic_a = pl_has_iic_b = pl_has_iic = 0;  // its IICs are gone until reloaded
   uint32_t bytes = 0;
   pl_status_t st = pl_loader_load(c->file, &bytes);
   if (out_bytes) *out_bytes = bytes;
   if (st != PL_OK) { current_config = -1; return (int)st; }
   current_config = (int)sel;
-  pl_has_iic = c->has_iic;               // IICs present on acq_imu_* and detect fabrics
+  pl_has_iic_a = c->iic_a;               // per-port IIC presence (0x43D0 / 0x43D1)
+  pl_has_iic_b = c->iic_b;
+  pl_has_iic   = c->iic_a || c->iic_b;   // any IIC -> CMD_DETECT_IMU is allowed
   if (c->is_acq) {
     acq_pl_bringup();
     pl_reset_timestamp();                // new fabric -> fresh timeline for the host

@@ -285,6 +285,7 @@ def _decode_imu_result(word):
     return {
         'present': bool(word & 0x1),   # ACKed AND chip_id == 0xA0
         'ack':     bool(word & 0x2),   # a device ACKed its address at 0x28
+        'absent':  bool(word & 0x4),   # this port has no AXI IIC on the loaded fabric (not probed)
         'chip_id': (word >> 8) & 0xFF,
         'iic_sr':  (word >> 24) & 0xFF,  # AXI IIC status reg post-init (diag)
     }
@@ -304,6 +305,9 @@ def detect_imu(sock):
     res = {'A': _decode_imu_result(ra), 'B': _decode_imu_result(rb)}
     for port in ('A', 'B'):
         r = res[port]
+        if r['absent']:
+            print(f"Port {port}: no I2C on this fabric (this cable is 128-ch LVDS) -- not probed")
+            continue
         # AXI IIC status register post-init: a live core reads ~0xC0 (both FIFOs
         # empty). 0x00/0xFF means the controller isn't answering at its base.
         sr = r['iic_sr']

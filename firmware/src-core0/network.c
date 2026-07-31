@@ -563,7 +563,10 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
                 return;
             }
             imu_detect_response_t resp;
-            pl_imu_detect_run(&resp);   // per-port results carry the present/ack verdict
+            // Probe ONLY the ports whose IIC the loaded fabric carries -- a mixed
+            // acq_imu_port_a/_b fabric has one IIC and one 128-ch LVDS port, and
+            // probing the absent port's AXI slave hangs the core.
+            pl_imu_detect_run(&resp, pl_has_iic_a, pl_has_iic_b);
             send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
             return;  // response already sent
         }

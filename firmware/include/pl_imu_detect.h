@@ -22,12 +22,15 @@
 // Per-port result word (packed into the CMD_DETECT_IMU reply):
 //   [0] present (device ACKed AND chip_id == 0xA0)
 //   [1] ack     (device ACKed its address at 0x28)
+//   [2] absent  (this port carries no AXI IIC on the loaded fabric -- it was NOT
+//               probed, so the core is never left waiting on an absent AXI slave)
 //   [15:8]  chip_id byte read back
 //   [31:24] AXI IIC Status Register (post-init) — diagnostic. A live core reads
 //           its reset value (~0xC0, both FIFOs empty); 0x00/0xFF means the base
 //           address is wrong or the controller isn't there.
 #define IMUDET_R_PRESENT (1u << 0)
 #define IMUDET_R_ACK     (1u << 1)
+#define IMUDET_R_ABSENT  (1u << 2)
 #define IMUDET_R_ID_SHIFT 8
 #define IMUDET_R_SR_SHIFT 24
 
@@ -40,8 +43,11 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(imu_detect_response_t) == 12,
                "imu detect response must stay 12 bytes (net.py decode)");
 
-// Probe both ports and fill `out`. Returns 0 always (per-port results carry the
-// verdict). Cold path: called only from the detect command handler.
-int pl_imu_detect_run(imu_detect_response_t *out);
+// Probe the ports whose AXI IIC the loaded fabric actually carries, and fill
+// `out`. probe_a / probe_b MUST be false for a port whose IIC is absent (e.g. a
+// 128-ch LVDS port on acq_imu_port_a/_b) -- reading a non-existent AXI slave
+// never returns and hangs the core. A non-probed port reports IMUDET_R_ABSENT.
+// Returns 0 always. Cold path: called only from the detect command handler.
+int pl_imu_detect_run(imu_detect_response_t *out, int probe_a, int probe_b);
 
 #endif // PL_IMU_DETECT_H

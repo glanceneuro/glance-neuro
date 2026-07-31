@@ -504,8 +504,12 @@ extern uint32_t packets_received_count;
 // master timestamp on a successful acquisition load. Returns 0 ok, >0
 // pl_status_t on load failure, -1 bad selector.
 extern volatile int pl_is_acq;
-// 1 while the loaded fabric exposes the two AXI IICs (acq_imu_* or scan/detect);
-// gate CMD_DETECT_IMU on it so a fabric without them can't hang the core.
+// Per-port IIC presence (port A 0x43D0, port B 0x43D1). CMD_DETECT_IMU probes a
+// port ONLY if its flag is set -- a mixed acq_imu_port_a/_b fabric has one IIC and
+// leaves the other port as 128-ch LVDS, whose absent AXI slave hangs the core.
+// pl_has_iic is the OR that gates the command (plain acq, with neither, refuses).
+extern volatile int pl_has_iic_a;
+extern volatile int pl_has_iic_b;
 extern volatile int pl_has_iic;
 int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq);
 int pl_current_config(void);   // -1 blank, else pl_configs index (for CMD_PL_STATUS)

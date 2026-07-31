@@ -38,10 +38,13 @@ static uint32_t probe_port(UINTPTR base)
     return result;
 }
 
-int pl_imu_detect_run(imu_detect_response_t *out)
+int pl_imu_detect_run(imu_detect_response_t *out, int probe_a, int probe_b)
 {
-    out->result_a = probe_port(IMUDET_A_BASE);
-    out->result_b = probe_port(IMUDET_B_BASE);
+    // Probe a port ONLY if the loaded fabric carries its AXI IIC. On a mixed
+    // fabric (acq_imu_port_a/_b) one port is 128-ch LVDS with no IIC at all, and
+    // touching its absent 0x43D1_0000 / 0x43D0_0000 slave hangs the core forever.
+    out->result_a = probe_a ? probe_port(IMUDET_A_BASE) : IMUDET_R_ABSENT;
+    out->result_b = probe_b ? probe_port(IMUDET_B_BASE) : IMUDET_R_ABSENT;
     out->version  = IMUDET_VERSION;
     return 0;
 }
