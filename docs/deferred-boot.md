@@ -140,13 +140,17 @@ explicitly for bring-up and testing.
   dead" failure.
 - **Blob provisioning discipline** (above) is the real cost — get the manifest
   right or the "can't ship stale" guarantee quietly erodes across N files.
-- **No boot-time serial console on this board.** The console UART (UART1) is
-  routed through the PL — EMIO to the FT230 on M14/M15 (`constraints/uart.xdc`),
-  not MIO — so it only exists once a fabric that routes it is loaded. The blank-PL
-  phase (FSBL → network → first `load_pl`) is therefore silent on serial by
-  construction; use the network for status there. A fabric can route EMIO UART to
-  M14/M15 for a post-load console (acquisition parity), but the early boot log
-  needs another channel (e.g. a "boot log over TCP" command) if wanted.
+- **No boot-time serial console on this board — the risk that came true, now fixed
+  by baking.** The console UART (UART1) is routed through the PL — EMIO to the
+  FT230 on M14/M15 (`constraints/uart.xdc`), not MIO — so it only exists once a
+  fabric that routes it is loaded. A blank-PL phase is therefore silent on serial
+  *by construction*, and this note called it before the board did: shipping the
+  blank boot produced exactly this symptom, plus an unlit DONE LED, and it read
+  as a dead board. The fix is to bake the default acq bitstream back into
+  `BOOT.bin` so the FSBL configures the PL first (see the resolved item under
+  "Hardware-validated boot rules"). The lesson worth keeping: **on this carrier
+  the console is a PL-dependent resource, so any future boot mode that leaves the
+  PL blank silently gives up both serial diagnostics and the DONE LED.**
 
 ## Hardware-validated boot rules (on the board)
 
@@ -173,8 +177,28 @@ in that bring-up:
   unconstrained; only the SD `file` in `pl_configs` must be 8.3. Future
   `acq_imu_port_a/_b` blobs need 8.3 names too.
 
-- **The serial console is DARK until an acquisition fabric is loaded.** This is a direct,
-  unavoidable consequence of blank boot, and it surprises everyone once. The debug UART is
+- **RESOLVED — the default fabric is baked into `BOOT.bin` again.** `boot_acq_loader.bif`
+  stages the acq bitstream between the FSBL and the app ELFs, so the FSBL configures the PL
+  before the GEM or lwIP exist — the path `main` has always shipped and which networks
+  reliably on this board. Console and DONE LED are therefore live from power-on, and a boot
+  where the network fails is still visible on serial. Firmware adopts reality rather than
+  assuming: `pl_loader_pl_configured()` (a PS register read, so it cannot hang) decides
+  between "PL live at boot" and the blank path, which still works if the bitstream is ever
+  omitted. Runtime `set_config` swaps are unchanged and still happen over a settled link.
+
+  This does **not** contradict the network-first rule below. That rule is about *runtime
+  PCAP reconfiguration* — PROG_B clearing the whole PL plus level-shifter and
+  `FPGA_RST_CTRL` toggles, issued from a live app — landing next to GEM/PHY bring-up. An
+  FSBL-configured PL performs no PCAP at boot at all, which is why baking was always safe
+  and blank-booting was the thing that cost the console. The two were conflated once;
+  don't conflate them again.
+
+  Consequence for build discipline: `BOOT.bin` is now a **PL artefact as well as a firmware
+  one**, so a `programmable_logic/` change must rebuild it (CLAUDE.md rule 1).
+  `--app-only` reuses the existing bitstream and is valid only for firmware edits.
+
+- **Why blank boot cost the console** (kept, because it explains the symptom and the
+  constraint that made baking the right answer). The debug UART is
   **UART1 on EMIO**, not MIO: `design_1_bd.tcl` sets `PCW_UART1_UART1_IO {EMIO}` and brings
   `UART1_TX_0` / `UART1_RX_0` out as top-level PL ports, which `constraints/uart.xdc` pins
   to **M14/M15** (JX2 → the FT230 USB-serial bridge). With no fabric configured those pins
@@ -186,24 +210,22 @@ in that bring-up:
   | `scan` / `detect` | **no** | that BD creates *no* top-level ports, so its EMIO UART is never brought out (which is also why it passes DRC with only `detect_pins.xdc`) |
   | `acquisition`, `acq_imu_*` | yes | full constraint set includes `uart.xdc` |
 
-  So a `rescan` goes: dark (blank) → dark (scan census) → console returns when the
-  acquisition variant loads. Writing to the UART while dark is **safe** — UART1 is a PS
-  peripheral at `0xE0001000`, always present, so the writes complete and only the bits on
-  the wire are lost. Nothing hangs.
+  With the bitstream baked the console is live from power-on, but the dark window still
+  exists *mid-session*: a `rescan` passes through the `scan` fabric, whose BD brings out no
+  top-level ports, so serial goes quiet for that second and returns when the acquisition
+  variant loads. Writing to the UART while dark is **safe** — UART1 is a PS peripheral at
+  `0xE0001000`, always present, so the writes complete and only the bits on the wire are
+  lost. Nothing hangs.
 
-  Consequence worth weighing: if the network fails to come up, there is now **no diagnostic
-  channel at all** — the console needs a fabric, and loading a fabric needs the network.
-  Under the older baked-bitstream image the FSBL configured the PL before anything printed,
-  so boot failures were visible on serial. Options, none applied yet: auto-load a default
-  fabric immediately *after* `lwip_init` (keeps the proven network-first ordering and
-  restores the console seconds into boot); or bring the EMIO UART out in the scan fabric's
-  BD and add `uart.xdc` to its build (needs a `detect.bin` re-synthesis, and only covers
-  the scan phase).
+  This is what made a blank boot untenable: with no fabric AND no network there was no
+  diagnostic channel at all, and a boot failure was invisible on both. Baking restores the
+  property the older image had. A carrier respin could route the FT230 to MIO instead and
+  make the console genuinely PL-independent; until then, baking is the fix.
 
 - **The MicroZed's PL status LED tracks this too.** `DONE` is asserted only when the PL is
-  configured, so on a blank boot it stays in its unconfigured colour and changes on the
-  first successful `set_config` / `rescan` — a free, instant indication that PCAP
-  programming actually worked.
+  configured, so it now lights at boot. It stays lit across a runtime swap, and a blank
+  boot (bitstream omitted from the bif) leaves it unlit — a free, instant read on whether
+  the PL was configured at all.
 
 Shipped fabrics today (coexist model, not the earlier `acq_AA/AN/NA` sketch above):
 `acq.bin` (128-ch), `detect.bin` (scan), `aimuboth.bin` (64-ch/port + dual IMU).

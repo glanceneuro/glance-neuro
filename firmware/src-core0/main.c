@@ -211,6 +211,10 @@ static const pl_config_t pl_configs[] = {
   { "acq_imu_port_b", "aimu_b",   1, 0, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU (iic_b)
 };
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
+// Which fabric BOOT.bin bakes in (scripts/boot_acq_loader.bif stages the matching
+// .bit). Keep the two in step: this only names what the FSBL already loaded, so a
+// mismatch would have the firmware describe the PL wrongly, not misconfigure it.
+#define PL_CONFIG_BAKED 0   /* "acquisition" -- 128-ch, works with any headstage */
 static int current_config = -1;
 
 // Which fabric the loader last programmed (-1 = none/blank, else a pl_configs
@@ -683,15 +687,37 @@ int main() {
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
 
-  // Blank PL at boot: no fabric loaded, so touch NO PL registers here. The host
-  // loads a fabric with set_config, at which point pl_config_apply runs the full
-  // acq_pl_bringup. Leaving the PL untouched keeps pl_is_acq 0 -> every
-  // PL-touching service in the main loop is skipped until then.
-  pl_is_acq = 0;
-  pl_has_iic = 0;
-  current_config = -1;   // blank -- CMD_PL_STATUS reports "blank"
-
-  send_message("System ready (PL BLANK). Load a fabric: set_config <acquisition|scan|acq_imu_both>\r\n");
+  // Adopt whatever the PL actually is, rather than assuming. BOOT.bin bakes the
+  // default acquisition bitstream, so the FSBL has already configured the PL by
+  // the time we get here -- and that is what makes the serial console exist at
+  // all, since the debug UART leaves the chip through PL balls (M14/M15 via
+  // JX2). PCFG_DONE is a PS register read, so asking is free and cannot hang
+  // the way touching an unconfigured PL slave would.
+  //
+  // Deliberately AFTER the network is up: the PL-init path is send_message
+  // heavy, and core 1 must already be draining the print ring (running it
+  // earlier once flooded the ring and raced the two cores on the shared UART).
+  // No PCAP runs here either way -- the FSBL did the configuring -- so none of
+  // this goes near the GEM/PHY bring-up window that runtime loads must avoid.
+  pl_has_iic = pl_has_iic_a = pl_has_iic_b = 0;   // the baked fabric is 128-ch, no I2C
+  if (pl_loader_pl_configured()) {
+    current_config = PL_CONFIG_BAKED;
+    acq_pl_bringup();
+    pl_reset_timestamp();
+    pl_is_acq = 1;
+    send_message("System ready: PL configured at boot (%s). "
+                 "set_config / rescan to swap fabrics.\r\n",
+                 pl_configs[PL_CONFIG_BAKED].name);
+  } else {
+    // No bitstream in the boot image (or configuration failed). Everything
+    // still works -- the host loads a fabric with set_config -- but the console
+    // this message is printed to does not exist yet, so say it for the log
+    // that replays once a fabric is up.
+    pl_is_acq = 0;
+    current_config = -1;   // blank -- CMD_PL_STATUS reports "blank"
+    send_message("System ready (PL BLANK -- no baked bitstream). "
+                 "Load a fabric: set_config <acquisition|scan|acq_imu_both>\r\n");
+  }
   send_message("debug> ");
 
   // Board is fully up now. Proactively announce our IP->MAC with a gratuitous

@@ -33,8 +33,12 @@ here, don't debug at the bench — the fault is in logic, not silicon.
 ## Flash
 
 `cp blobs/* /path/to/SD/` (6 files: `BOOT.bin`, `acq.bin`, `detect.bin`,
-`aimuboth.bin`, `aimu_a.bin`, `aimu_b.bin`). Boot — the PL comes up blank and
-network-first, as established.
+`aimuboth.bin`, `aimu_a.bin`, `aimu_b.bin`). `BOOT.bin` is now ~4.5 MB because it
+bakes the default `acquisition` bitstream: the FSBL configures the PL before the
+network exists, so **the serial console and the MicroZed DONE LED are live from
+power-on**. (The debug UART leaves the chip through PL balls, which is why a blank
+PL was silent and the LED stayed unlit.) Runtime `set_config` / `rescan` swaps are
+unchanged.
 
 ## Test 1 — rescan picks the right fabric (5 min)
 

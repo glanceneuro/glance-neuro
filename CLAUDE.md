@@ -42,6 +42,13 @@ fabric `*.bin` files loaded at runtime. One config's image lives in `blobs/` per
 | acquisition | `BOOT.bin` ← `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
 | detect (baked) | `BOOT.bin` ← `firmware/src-detect`, detect BD + `detect_pins.xdc` | `scripts/build_detect.sh` |
 | deferred boot | `BOOT.bin` ← `firmware/src-detect` app (no bitstream); `detect.bin`/`acq_*.bin` ← the respective PL | `scripts/build_loader.sh` |
+| deferred acq (current) | `BOOT.bin` ← `firmware/src-core0` + `firmware/include` + **the default acq bitstream** (FSBL configures the PL at boot); `acq.bin`/`detect.bin`/`aimu*.bin` ← the respective PL | `scripts/build_acq_loader.sh` |
+
+The last row is the one that bites: its `BOOT.bin` carries a bitstream, so it is a **PL
+artefact as well as a firmware one** — a `programmable_logic/` change must rebuild it, not
+just the fabric `.bin`. (`--app-only` reuses the existing bitstream and is valid only for
+firmware edits.) The bitstream is baked because the debug UART leaves the chip through PL
+balls: a blank PL means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
 
 A commit that changes a source subtree rebuilds every artefact that lists it. The
 corollary bit me once: the `src-detect` app grew the loader but the baked `BOOT.bin`

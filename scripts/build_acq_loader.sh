@@ -4,7 +4,12 @@
 #
 # Build the DEFERRED-LOAD ACQUISITION image (step 2c, docs/deferred-boot.md).
 # blobs/ is the SD card image -- copy its contents verbatim to the FAT root:
-#   - blobs/BOOT.bin          : FSBL + both core ELFs, NO bitstream (PL blank at boot)
+#   - blobs/BOOT.bin          : FSBL + the DEFAULT acq bitstream + both core ELFs.
+#                               The FSBL configures the PL before the GEM/lwIP exist
+#                               (main's proven path). This is what gives the board a
+#                               serial console and a lit DONE LED at boot: the debug
+#                               UART leaves the chip through PL balls, so a blank PL
+#                               is silent. Other fabrics still swap in at runtime.
 #   - blobs/acq.bin           : 128-ch LVDS acquisition fabric (no IMU)
 #   - blobs/detect.bin        : single-ended I2C-probe fabric (both AXI IICs)
 #   - blobs/aimuboth.bin      : 64-ch/port acquisition + BNO055 on both cables
@@ -18,10 +23,13 @@
 # gated by pl_has_iic. The core acq peripherals sit at the same addresses in the
 # plain acq and acq_imu_both fabrics, so the firmware drives all three unchanged.
 #
-# Boot flow: PL blank -> net.py connects -> set_config <acquisition|scan|
-# acq_imu_both> PCAP-loads the chosen fabric -> stream / detect_imu.
+# Boot flow: FSBL configures the baked acq fabric -> network comes up -> console and
+# DONE LED live -> host connects -> set_config / rescan PCAP-swaps to another fabric
+# over the settled link (the regime that is proven safe) -> stream / detect_imu.
 #
 #   scripts/build_acq_loader.sh            # fabrics (reuse or build) + apps + BOOT.bin + *.bin
+#   NOTE: BOOT.bin now contains a bitstream, so a PL change must rebuild it too --
+#   --app-only reuses the existing bitstream and is only valid for firmware edits.
 #   scripts/build_acq_loader.sh --app-only # reuse existing bitstreams, rebuild apps only
 set -euo pipefail
 XILINX_ROOT="${XILINX_ROOT:-/opt/Xilinx/2025.1}"
@@ -137,10 +145,21 @@ done
 [ -f vitis_workspace/klab-firmware/build/klab-firmware.elf ] || die "core0 ELF not produced"
 [ -f vitis_workspace/klab-firmware-core1/build/klab-firmware-core1.elf ] || die "core1 ELF not produced"
 
-echo "== [3/5] BOOT.bin (FSBL + both ELFs, no bitstream) =="
+echo "== [3/5] BOOT.bin (FSBL + baked acq bitstream + both ELFs) =="
+# The bif stages $BIT directly out of the Vivado run directory. Refuse to package
+# an image whose bitstream is missing rather than emitting a BOOT.bin that boots
+# to a blank PL and a dead console -- the exact symptom this baking removes.
+[ -f "$BIT" ] || die "baked bitstream missing: $BIT (run without --app-only to build the acq fabric)"
 bootgen -image scripts/boot_acq_loader.bif -arch zynq -o BOOT.bin -w >/dev/null \
   || die "bootgen (BOOT.bin) failed"
 mkdir -p blobs && mv -f BOOT.bin blobs/BOOT.bin
+# BOOT.bin now carries a bitstream, so it is a PL artefact as well as a firmware
+# one (CLAUDE.md rule 1). Prove the bitstream actually landed: a bif typo would
+# silently produce a valid-looking FSBL+ELF image that boots blank.
+boot_sz=$(stat -c%s blobs/BOOT.bin)
+bit_sz=$(stat -c%s "$BIT")
+[ "$boot_sz" -gt "$bit_sz" ] \
+  || die "BOOT.bin ($boot_sz B) is smaller than the bitstream it must contain ($bit_sz B) -- bitstream not staged"
 
 echo "== [4/5] fabrics for SD: acq + detect + aimuboth + aimu_a + aimu_b =="
 # -process_bitstream bin strips the .bit header and byte-orders the data for
@@ -171,5 +190,6 @@ echo "   scan/detect : blobs/detect.bin       ($(stat -c%s blobs/detect.bin) byt
 echo "   acq+IMU     : blobs/aimuboth.bin      ($(stat -c%s blobs/aimuboth.bin) bytes, md5 $(md5sum blobs/aimuboth.bin | cut -c1-32))"
 echo "   imu port A  : blobs/aimu_a.bin        ($(stat -c%s blobs/aimu_a.bin) bytes, md5 $(md5sum blobs/aimu_a.bin | cut -c1-32))"
 echo "   imu port B  : blobs/aimu_b.bin        ($(stat -c%s blobs/aimu_b.bin) bytes, md5 $(md5sum blobs/aimu_b.bin | cut -c1-32))"
-echo "   test        : cp blobs/* -> SD root; boot (PL blank) -> net.py ->"
-echo "                 set_config <acq_imu_both|acq_imu_port_a|acq_imu_port_b> -> detect_imu / stream"
+echo "   test        : cp blobs/* -> SD root; boot -- console + DONE LED should come up"
+echo "                 immediately (acq fabric baked in) -> net.py -> rescan (or"
+echo "                 set_config <acq_imu_both|acq_imu_port_a|acq_imu_port_b>) -> detect_imu / stream"

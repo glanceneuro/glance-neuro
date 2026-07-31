@@ -1,10 +1,26 @@
 //arch = zynq; split = false; format = BIN
-// Deferred-load acquisition BOOT: FSBL + both core ELFs, NO bitstream. The PL is
-// blank at boot; core0 brings up the network then loads the acquisition fabric
-// (acq.bin) from SD via PCAP before any PL-touching init. See docs/deferred-boot.md.
+// Acquisition BOOT image: FSBL + the DEFAULT acquisition bitstream + both core
+// ELFs. The FSBL configures the PL before the GEM or lwIP exist, which is the
+// path main has always shipped and is known-good on this board.
+//
+// Baking is what gives the board a console at all: the debug UART is UART1 on
+// EMIO, pinned to PL balls M14/M15 (JX2 -> the FT230 on the carrier), so with a
+// blank PL there is nowhere for a character to go -- FSBL output included. A
+// blank boot is therefore silent on serial AND leaves the MicroZed's PL DONE
+// LED unlit, which reads as a dead board.
+//
+// This is NOT the failure mode that forced network-first ordering. That one was
+// runtime PCAP reconfiguration (PROG_B clear + level-shifter/FPGA_RST toggles
+// from a live app) landing next to GEM/lwIP bring-up. An FSBL-configured PL
+// involves no PCAP at boot at all. Runtime set_config swaps are unchanged and
+// still happen over a settled link. See docs/deferred-boot.md.
+//
+// The other fabrics still ship as separate .bin files on the SD card and are
+// swapped in at runtime; this one is only the default the board wakes up with.
 the_ROM_image:
 {
 	[bootloader]./vitis_workspace/klab-platform/export/klab-platform/sw/boot/fsbl.elf
+	./vivado_project/klab_project.runs/impl_1/design_1_wrapper.bit
 	./vitis_workspace/klab-firmware/build/klab-firmware.elf
 	./vitis_workspace/klab-firmware-core1/build/klab-firmware-core1.elf
 }
