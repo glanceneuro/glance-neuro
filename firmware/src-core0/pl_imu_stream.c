@@ -88,6 +88,7 @@ static imu_port_t imu_port[2] = {
 };
 static uint32_t imu_period_ms = IMU_PERIOD_MS_DEFAULT;
 static struct udp_pcb *imu_pcb;
+static XTime imu_last_service;   // 0 = never called (see pl_imu_stream_service)
 
 // Staging ring for the zero-copy send (PBUF_REF): a slot must outlive its TX
 // descriptor. 8 slots at 100 Hz means a slot is reused after 80 ms -- orders
@@ -385,8 +386,32 @@ uint32_t pl_imu_stream_mask(void)
     return (imu_port[0].running ? 1u : 0u) | (imu_port[1].running ? 2u : 0u);
 }
 
+// Time the loop spent elsewhere before a gap counts as "we weren't looking"
+// rather than ordinary scheduling jitter. Well above a normal loop period,
+// well under the transfer deadline.
+#define IMU_SERVICE_GAP_MS 2
+
 void pl_imu_stream_service(void)
 {
+    // Credit back time this service was not called at all. The transfer
+    // deadline exists to catch a bus that stopped answering, and that is only
+    // judgeable while we are actually polling. Core 0 legitimately disappears
+    // for long stretches -- a full cable test parks in usleep for ~100 ms,
+    // dump_bram is slow -- and charging that absence to a healthy in-flight
+    // transfer would count a phantom I2C error. Sixteen of those in a row
+    // would auto-stop a perfectly good port, so this is a correctness fix,
+    // not a cosmetic one.
+    XTime now; XTime_GetTime(&now);
+    if (imu_last_service) {
+        XTime gap = now - imu_last_service;
+        if (gap > imu_ms_to_ticks(IMU_SERVICE_GAP_MS)) {
+            for (int i = 0; i < 2; i++)
+                if (imu_port[i].running)
+                    imu_port[i].deadline += gap;
+        }
+    }
+    imu_last_service = now;
+
     imu_service_port(&imu_port[0], 0);
     imu_service_port(&imu_port[1], 1);
 }

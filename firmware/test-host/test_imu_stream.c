@@ -275,6 +275,37 @@ static void test_bus_ordering(void)
     pl_imu_stream_set(0, 0);
 }
 
+static void test_service_gap(void)
+{
+    printf("service_gap: a long absence from the loop is not the bus's fault\n");
+    // Core 0 can legitimately stop servicing for a long time -- a full cable
+    // test parks in usleep for ~100 ms, dump_bram is slow, a console flood
+    // stalls. A transfer in flight across that gap is still healthy; charging
+    // the absence to the transfer deadline would count a bogus I2C error, and
+    // enough of them in a row would auto-stop a perfectly good port.
+    mock_reset();
+    pl_imu_stream_set(1, 10);
+    // Deterministically stall WITH A TRANSFER IN FLIGHT: the first service
+    // call after arming kicks burst 0 (next_tick == now), so the stall lands
+    // squarely inside that transfer rather than on an idle machine.
+    int errors_before = mock_dyninit_calls[0];
+    int pkts_before = mock_n_pkts;
+
+    for (int i = 0; i < 8; i++) {
+        pl_imu_stream_service();       // kicks a burst (or resumes one)
+        mock_advance_us(100000);       // the loop is elsewhere -- cable test, etc.
+        pl_imu_stream_service();       // first look after the stall
+        run_ms(15);                    // let the tick finish normally
+    }
+    CHECK(mock_dyninit_calls[0] == errors_before,
+          "%d bogus bus recoveries from service gaps",
+          mock_dyninit_calls[0] - errors_before);
+    CHECK(pl_imu_stream_active(0), "port auto-stopped because the loop was busy");
+    CHECK(mock_n_pkts > pkts_before + 8, "stream did not continue across stalls");
+    CHECK(mock_bad_sequence == 0, "ordering broke across stalls");
+    pl_imu_stream_set(0, 0);
+}
+
 static void test_period_clamp(void)
 {
     printf("period_clamp: out-of-range periods clamp to [10,1000]\n");
@@ -328,6 +359,7 @@ int main(void)
     test_send_drop_accounting();
     test_stop_all_mid_flight();
     test_bus_ordering();
+    test_service_gap();
     test_period_clamp();
     const char *dump = getenv("IMU_TEST_DUMP");
     if (dump) dump_packets(dump);
