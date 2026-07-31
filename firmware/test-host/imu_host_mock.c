@@ -40,6 +40,8 @@ typedef struct {
     int      rx_r, rx_n;
     uint32_t iisr;
     int      st;            // combined-command parse: 0 idle .. 3 await STOP
+    int      addr_phase_busy; // addresses queued; core will take the bus
+    uint64_t busy_at;       // when BUS_BUSY actually asserts (START takes wire time)
     uint8_t  cur_reg;
     int      pending;       // 0 none, 1 data due, 2 NACK due
     uint64_t due_at;
@@ -49,6 +51,18 @@ typedef struct {
 static sim_iic_t sim[2];
 
 static int port_of(UINTPTR base) { return base == IMUDET_A_BASE ? 0 : 1; }
+
+// BUS_BUSY does not assert the instant software writes the FIFO: the core has
+// to drive a START and the address onto the wire first (tens of microseconds
+// at 100 kHz). Modelling that delay is what makes "write the count only once
+// the bus is busy" a testable property instead of a no-op.
+#define MOCK_START_LATENCY_US 60
+
+static int sim_bus_busy(const sim_iic_t *s)
+{
+    if (s->pending) return 1;
+    return s->addr_phase_busy && mock_now >= s->busy_at;
+}
 
 // The BNO055 register image the simulated bursts read from.
 static uint8_t bno_reg_byte(int port, uint8_t addr)
@@ -89,7 +103,11 @@ uint32_t mock_iic_read(UINTPTR base, uint32_t offset)
     case XIIC_SR_REG_OFFSET: {
         uint32_t v = 0xC0 & ~XIIC_SR_RX_FIFO_EMPTY_MASK;   // FIFOs "live"
         if (s->rx_n == 0) v |= XIIC_SR_RX_FIFO_EMPTY_MASK;
-        if (s->pending)   v |= XIIC_SR_BUS_BUSY_MASK;
+        // Busy while the address phase is on the wire awaiting a count, and
+        // while a transfer is actually running. An ABSENT device NACKs its
+        // address, so the core never takes the bus -- modelled by leaving
+        // addr_phase_busy clear for it (below).
+        if (sim_bus_busy(s)) v |= XIIC_SR_BUS_BUSY_MASK;
         return v;
     }
     case XIIC_DRR_REG_OFFSET: {
@@ -120,25 +138,51 @@ void mock_iic_write(UINTPTR base, uint32_t offset, uint32_t value)
     uint32_t addr_w = XIIC_TX_DYN_START_MASK | (BNO055_I2C_ADDR << 1);
     switch (s->st) {
     case 0:
-        if (value == addr_w) s->st = 1;
-        else mock_bad_sequence++;
+        if (value == addr_w) {
+            s->st = 1;
+            if (!mock_bno[port].present) {
+                // Real hardware NACKs the very first address and releases the
+                // bus, so TX_ERROR latches without the core ever going busy --
+                // the firmware must notice that instead of waiting out its
+                // transfer deadline.
+                s->pending = 2;
+                s->due_at  = mock_now + 200;
+            }
+        } else {
+            mock_bad_sequence++;
+        }
         break;
     case 1:
         if (value <= 0xFF) { s->cur_reg = (uint8_t)value; s->st = 2; }
         else mock_bad_sequence++;
         break;
     case 2:
-        if (value == (addr_w | 1)) s->st = 3;
-        else mock_bad_sequence++;
+        if (value == (addr_w | 1)) {
+            s->st = 3;
+            // The core takes the bus on the address phase and clock-stretches
+            // waiting for the byte count -- so BUS_BUSY reads set from here.
+            // A device that never ACKed leaves the bus alone.
+            if (mock_bno[port].present) {
+                s->addr_phase_busy = 1;
+                s->busy_at = mock_now + MOCK_START_LATENCY_US;
+            }
+        } else {
+            mock_bad_sequence++;
+        }
         break;
     case 3:
         if (value & XIIC_TX_DYN_STOP_MASK) {
             uint8_t len = value & 0xFF;
+            // Enforce the vendor's proven ordering: the count must be written
+            // while the bus is ACTUALLY busy, never speculatively before the
+            // addresses have reached the wire.
+            if (!sim_bus_busy(s)) mock_bad_sequence++;
+            s->addr_phase_busy = 0;
             s->st = 0;
             s->pend_reg = s->cur_reg;
             s->pend_len = len;
             if (!mock_bno[port].present) {
-                s->pending = 2;                    // NACK after the address byte
+                s->pending = 2;                    // NACK (already scheduled)
                 s->due_at  = mock_now + 200;
             } else if (mock_bno[port].wedge) {
                 s->pending = 0;                    // silently swallowed forever

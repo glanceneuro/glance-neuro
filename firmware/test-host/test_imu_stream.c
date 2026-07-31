@@ -223,6 +223,34 @@ static void test_stop_all_mid_flight(void)
     CHECK(mock_n_pkts == pkts, "sent after stop_all");
 }
 
+static void test_bus_ordering(void)
+{
+    printf("bus_ordering: the byte count follows BUS_BUSY, never precedes it\n");
+    // The vendor's blocking XIic_DynRecv writes the dynamic STOP+count only
+    // after the core has taken the bus. The mock counts any count-before-busy
+    // as a bad sequence, so a regression to speculative preloading fails here
+    // rather than at the bench.
+    mock_reset();
+    pl_imu_stream_set(3, 10);
+    run_ms(120);
+    CHECK(mock_bad_sequence == 0,
+          "command FIFO deviated from the proven ordering: %d", mock_bad_sequence);
+    CHECK(mock_n_pkts > 15, "no traffic to judge ordering by (%d pkts)", mock_n_pkts);
+
+    // An absent device NACKs its address and the core never takes the bus.
+    // The machine must notice the error rather than sit out its 20 ms deadline,
+    // so a dead port still costs only one tick.
+    mock_reset();
+    mock_bno[0].present = 0;
+    pl_imu_stream_set(1, 10);
+    int before = mock_dyninit_calls[0];
+    run_ms(30);            // 3 ticks; deadline alone would allow barely one
+    CHECK(mock_dyninit_calls[0] - before >= 2,
+          "NACK not detected promptly (%d recoveries in 30 ms)",
+          mock_dyninit_calls[0] - before);
+    pl_imu_stream_set(0, 0);
+}
+
 static void test_period_clamp(void)
 {
     printf("period_clamp: out-of-range periods clamp to [10,1000]\n");
@@ -275,6 +303,7 @@ int main(void)
     test_ndof_failure();
     test_send_drop_accounting();
     test_stop_all_mid_flight();
+    test_bus_ordering();
     test_period_clamp();
     const char *dump = getenv("IMU_TEST_DUMP");
     if (dump) dump_packets(dump);

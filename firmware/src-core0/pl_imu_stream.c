@@ -64,6 +64,8 @@ static const imu_burst_t imu_data_bursts[3] = {
 typedef struct {
     uint8_t  running;
     uint8_t  in_flight;      // a burst is loaded in the core's FIFO
+    uint8_t  await_count;    // addresses queued; waiting for BUS_BUSY to add the count
+    uint8_t  pend_len;       // byte count for the burst in flight
     uint8_t  burst_idx;      // 0..2 data, 3 = housekeeping
     uint8_t  got;            // bytes drained so far for this burst
     uint8_t  hk_due;         // run the housekeeping burst after this tick's data
@@ -104,9 +106,9 @@ static XTime imu_ms_to_ticks(uint32_t ms)
 // State machine
 // ---------------------------------------------------------------------------
 
-// Preload one complete combined write-then-read into the TX command FIFO.
-// Order matters and is executed by the core exactly as queued:
-//   START+addr(W), register pointer, repeated START+addr(R), STOP+count.
+// Queue the address phase of a combined write-then-read into the TX command
+// FIFO: START+addr(W), register pointer, repeated START+addr(R). The byte
+// count is NOT written here -- see imu_arm_count().
 static void imu_kick(imu_port_t *p, uint8_t reg, uint8_t len)
 {
     XIic_ClearIisr(p->base, XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK);
@@ -115,11 +117,26 @@ static void imu_kick(imu_port_t *p, uint8_t reg, uint8_t len)
     XIic_WriteReg(p->base, XIIC_DTR_REG_OFFSET, reg);
     XIic_WriteReg(p->base, XIIC_DTR_REG_OFFSET,
                   XIIC_TX_DYN_START_MASK | (BNO055_I2C_ADDR << 1) | 1);
-    XIic_WriteReg(p->base, XIIC_DTR_REG_OFFSET, XIIC_TX_DYN_STOP_MASK | len);
     p->in_flight = 1;
+    p->await_count = 1;
+    p->pend_len = len;
     p->got = 0;
     XTime now; XTime_GetTime(&now);
     p->deadline = now + imu_ms_to_ticks(IMU_XFER_TIMEOUT_MS);
+}
+
+// Write the dynamic STOP + byte count, but only once the core has actually
+// taken the bus. This is the ordering the vendor's blocking XIic_DynRecv uses
+// (address, wait for BUS_BUSY, then the count) and the one proven on this
+// board by the detect path -- reproduced here without the blocking wait, which
+// the 30 kHz pump could never afford. The core clock-stretches while it waits
+// for the count, so the bus stays busy until we supply it; a bus that never
+// goes busy is a dead bus and the caller's deadline collects it.
+static void imu_arm_count(imu_port_t *p)
+{
+    XIic_WriteReg(p->base, XIIC_DTR_REG_OFFSET,
+                  XIIC_TX_DYN_STOP_MASK | p->pend_len);
+    p->await_count = 0;
 }
 
 // Abort whatever is on the bus, reset the core, and skip to the next tick.
@@ -130,6 +147,7 @@ static void imu_error(imu_port_t *p, int port)
     XIic_DynInit(p->base);
     if (p->iic_errors != 0xFF) p->iic_errors++;
     p->in_flight = 0;
+    p->await_count = 0;
     p->burst_idx = 0;
     XTime now; XTime_GetTime(&now);
     p->next_tick = now + imu_ms_to_ticks(imu_period_ms);
@@ -218,6 +236,18 @@ static void imu_service_port(imu_port_t *p, int port)
     uint32_t iisr = XIic_ReadIisr(p->base);
     if (iisr & (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK)) {
         imu_error(p, port);
+        return;
+    }
+
+    // Address phase queued but the count not yet supplied: hand it over as
+    // soon as the core has the bus (see imu_arm_count).
+    if (p->await_count) {
+        if (XIic_ReadReg(p->base, XIIC_SR_REG_OFFSET) & XIIC_SR_BUS_BUSY_MASK) {
+            imu_arm_count(p);
+        } else {
+            XTime now; XTime_GetTime(&now);
+            if (now > p->deadline) imu_error(p, port);
+        }
         return;
     }
 
