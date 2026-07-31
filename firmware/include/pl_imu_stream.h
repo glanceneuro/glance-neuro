@@ -34,6 +34,12 @@
 
 #define IMU_STREAM_VERSION     0x494D5553   // "IMUS" (CMD_IMU_STREAM reply)
 
+// param1 bit 31 = REPORT ONLY: reply with the current state and change nothing.
+// The port field is an ABSOLUTE set, so 0 already means "stop everything" and
+// cannot double as a query -- hence a separate flag. Lets a host show IMU state
+// in a status dump without disturbing a running stream.
+#define IMU_STREAM_QUERY       0x80000000u
+
 #define IMU_PERIOD_MS_DEFAULT  10           // BNO055 fusion output rate is 100 Hz
 #define IMU_PERIOD_MS_MIN      10
 #define IMU_PERIOD_MS_MAX      1000

@@ -699,6 +699,16 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // acq_imu_* fabrics anyway. Starting a NEW port does a blocking
             // ~50 ms NDOF entry, so that is refused mid-stream -- start the IMU
             // BEFORE 'start'. Stopping ports never blocks and is always allowed.
+            imu_stream_response_t q;
+            if (cmd->param1 & IMU_STREAM_QUERY) {
+                // Report-only: never touches the state machine, so it is safe
+                // to call while a stream is running or while none is.
+                q.active_mask = pl_imu_stream_mask();
+                q.period_ms   = pl_imu_stream_period_ms();
+                q.version     = IMU_STREAM_VERSION;
+                send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &q, sizeof(q));
+                return;
+            }
             uint32_t want = cmd->param1 & 3;
             uint32_t newly = want & ~pl_imu_stream_mask();
             if (newly && pl_is_transmission_active()) {

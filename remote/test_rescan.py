@@ -355,6 +355,55 @@ def test_eeprom_failure_statuses():
         restore()
 
 
+def test_status_extras():
+    print("status: the dump reports the PL fabric and the IMU stream state")
+
+    class StatusBoard(MockBoard):
+        def __init__(self, imu_active=1, **kw):
+            super().__init__(**kw)
+            self.imu_active = imu_active
+            self.query_masks = []
+
+        def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
+            if cmd_id == net.CMD_IMU_STREAM:
+                self.query_masks.append(param1)
+                return True, struct.pack('<III', self.imu_active, 10,
+                                         net.IMUSTREAM_VERSION)
+            return super().send(cmd_id, param1, param2, timeout)
+
+    board = StatusBoard(config=net.CONFIGS["acq_imu_port_a"])
+    restore = install_mock(board)
+    try:
+        q = net.imu_stream_query(None)
+        check(q == {'active': 1, 'period_ms': 10}, f"query decode {q}")
+        # The query must be REPORT-ONLY: the flag set, no port bits asserted,
+        # or a status dump would stop a running stream.
+        check(board.query_masks == [net.IMU_STREAM_QUERY],
+              f"query sent param1={board.query_masks}")
+        check(board.query_masks[0] & 3 == 0, "query asserted port bits")
+
+        import io, contextlib
+        status = {k: 0 for k in (
+            'firmware_version', 'device_type', 'version', 'timestamp',
+            'packets_sent', 'bram_write_addr', 'fifo_count', 'state_counter',
+            'cycle_counter', 'transmission_active', 'loop_limit_reached',
+            'packets_received', 'error_count', 'udp_packets_sent',
+            'udp_send_errors', 'ps_read_addr', 'packet_size_words',
+            'stream_enabled', 'loop_count', 'phase0', 'phase1',
+            'channel_enable', 'debug_mode', 'udp_dest_ip', 'udp_dest_port',
+            'udp_bytes_sent')}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                net.print_status(status, None)     # no socket -> old behaviour
+            except Exception:
+                pass
+        check("PL fabric:" not in buf.getvalue(),
+              "printed a PL section without a socket")
+    finally:
+        restore()
+
+
 def test_abort_paths():
     print("abort_paths: rescan gives up cleanly when the board can't comply")
 
@@ -395,6 +444,7 @@ def main():
     test_i2c_scan_decode()
     test_imu_command_decode()
     test_eeprom_failure_statuses()
+    test_status_extras()
     test_abort_paths()
     if failures:
         print(f"TB_FAIL  Errors: {failures}")

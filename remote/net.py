@@ -436,6 +436,21 @@ def imu_stream(sock, spec='both', period_ms=0):
           f"(period {period} ms, stream_type=4 on UDP {UDP_PORT})")
     return {'active': active, 'period_ms': period}
 
+IMU_STREAM_QUERY = 0x80000000   # param1 bit 31: report state, change nothing
+
+def imu_stream_query(sock):
+    """Read the board's IMU streaming state without disturbing it. Returns
+    {'active','period_ms'} or None (older firmware, or a fabric that refuses
+    the command)."""
+    ok, data = send_binary_command(sock, CMD_IMU_STREAM,
+                                   param1=IMU_STREAM_QUERY, timeout=2.0)
+    if not ok or data is None or len(data) < 12:
+        return None
+    active, period, ver = struct.unpack('<III', data[:12])
+    if ver != IMUSTREAM_VERSION:
+        return None
+    return {'active': active, 'period_ms': period}
+
 def imu_recv(n=20, timeout=5.0):
     """Print n live IMU samples from the unified sink (imu_stream first)."""
     if UNIFIED_SINK is None:
@@ -3013,8 +3028,12 @@ def get_status(sock):
 
     return status
 
-def print_status(status):
-    """Pretty print status information"""
+def print_status(status, sock=None):
+    """Print the full device status. `sock` is optional: with it, the dump also
+    reports which PL fabric is loaded and the IMU stream state, neither of which
+    lives in the status struct -- the fabric is firmware state (CMD_PL_STATUS)
+    and the IMU state is the stream engine's (CMD_IMU_STREAM query). Without a
+    socket the dump is exactly what it always was."""
     if not status:
         return
     
@@ -3025,6 +3044,16 @@ def print_status(status):
     print(f"Device Type: 0x{status['device_type']:04X}")
     print(f"Firmware: v{fw_str}")
     print(f"Protocol Version: {status['version']}")
+    if sock is not None:
+        # Which fabric is loaded is NOT in the status struct -- it is firmware
+        # state, readable in any PL state, so it needs its own query. Worth
+        # showing here because almost every "why is this not working" answer
+        # starts with which fabric is live.
+        pl = pl_status(sock, verbose=False)
+        if pl:
+            print(f"PL fabric: {pl['name']} (config={pl['config']}, "
+                  f"{'acquisition' if pl['is_acq'] else 'non-acq'}, "
+                  f"link {'UP' if pl['link_up'] else 'DOWN'})")
     
     print("\n--- PL Hardware ---")
     print(f"Timestamp: {status['timestamp']}")
@@ -3128,6 +3157,31 @@ def print_status(status):
           f"(-> {30000.0/R:.0f} sps)  num_taps={status['lfp_num_taps']}")
     print(f"  packets sent: {status['lfp_packets_sent']}   "
           f"overrun: {'YES' if status['lfp_overrun'] else 'no'}")
+
+    if sock is not None:
+        # IMU side channel. Board-side state comes from the stream engine (a
+        # report-only query, so this cannot disturb a running stream); the
+        # received counts come from our own sink, because the board counts what
+        # it SENT and the host counts what ARRIVED -- and the difference is
+        # exactly what a loss investigation needs.
+        print(f"\n--- IMU (BNO055, UDP {UDP_PORT} stream_type=4) ---")
+        q = imu_stream_query(sock)
+        if q is None:
+            print("  state unavailable (firmware without the IMU stream, or a "
+                  "fabric that refuses the command)")
+        elif q['active'] == 0:
+            print("  streaming: OFF   (imu_stream a|b|both to start -- before 'start')")
+        else:
+            names = {1: 'A', 2: 'B', 3: 'A+B'}
+            hz = 1000.0 / max(q['period_ms'], 1)
+            print(f"  streaming: {names.get(q['active'], q['active'])} "
+                  f"@ {hz:.0f} Hz (period {q['period_ms']} ms)")
+        if UNIFIED_SINK is not None:
+            ga, gb = UNIFIED_SINK._imu_gaps
+            print(f"  received here: {UNIFIED_SINK.imu_pkts} pkts   "
+                  f"SEQ gaps A={ga} B={gb}"
+                  + ("   (gaps are lost samples -- board never retries a send)"
+                     if (ga or gb) else ""))
 
     # Analytic chirp NCO config
     f_hi = (status['chirp_fspan'] << CHIRP_FSPAN_SHIFT) / (1 << CHIRP_PHW) * PACKET_RATE_HZ
@@ -3688,7 +3742,7 @@ def tcp_control():
             print("[TCP] Getting initial device status...")
             status = get_status(sock)
             if status:
-                print_status(status)
+                print_status(status, sock)
                 validator.set_channel_enable(status['channel_enable'])
         else:
             print(f"[TCP] Board is on the '{pl['name']}' fabric (not acquisition). "
@@ -3730,7 +3784,7 @@ def tcp_control():
                 elif cmd == "get_status":
                     status = get_status(sock)
                     if status:
-                        print_status(status)
+                        print_status(status, sock)
                 elif cmd == "perf_reset":
                     ok, _ = send_binary_command(sock, CMD_PERF_RESET)
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
