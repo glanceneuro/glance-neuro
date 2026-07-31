@@ -48,8 +48,9 @@ package unified_pkt_pkg;
     // stream_type (header word 1, [7:0]) -- what the host demuxes the port on.
     localparam logic [7:0] STREAM_TYPE_BROADBAND = 8'd1;   // 30 kHz amplifier stream
     localparam logic [7:0] STREAM_TYPE_LFP       = 8'd2;   // decimated LFP band
-    // stream_type 3 is intentionally left undefined here -- reserved for a
-    // possible future on-PL wavelet/scalogram stream, if that engine ever lands.
+    // stream_type 3 is the IMU side channel. No PL builder emits it -- the PS
+    // assembles it from I2C -- so it has no localparam here, but the number is
+    // taken. A future on-PL stream takes 4.
 
     // Header word 1. `flags` is reserved: no stream sets it today, and the host
     // ignores it, so it is free for a future per-stream marker.

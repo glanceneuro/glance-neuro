@@ -10,7 +10,7 @@ scripts/build.sh
 ```
 
 That is the whole procedure. It works out for itself whether the PL needs
-re-synthesising (fingerprinting the RTL, block design, constraints, IP and build
+re-synthesizing (fingerprinting the RTL, block design, constraints, IP and build
 scripts), always regenerates the Vitis workspace against the current `.xsa`,
 stages the bitstream `boot.bif` actually packs, runs `bootgen`, and then verifies
 what it produced. A firmware-only edit takes ~3 minutes; a PL edit ~18.
@@ -19,13 +19,13 @@ It refuses to produce an image it cannot vouch for: it fails on timing not met,
 on a staged bitstream that disagrees with implementation output, or on a Vitis
 build that fails three times. **If it fails, bring the failure to the user — do
 not work around it by hand.** Hand-running the underlying steps is how stale
-artefacts get shipped, which is exactly what this script exists to prevent.
+artifacts get shipped, which is exactly what this script exists to prevent.
 
 Useful variants:
 
 ```bash
 scripts/build.sh --check      # say what would be rebuilt, change nothing
-scripts/build.sh --force-pl   # re-synthesise the PL even if unchanged
+scripts/build.sh --force-pl   # re-synthesize the PL even if unchanged
 ```
 
 Set `XILINX_ROOT` if the tools are not at `/opt/Xilinx/2025.1`.

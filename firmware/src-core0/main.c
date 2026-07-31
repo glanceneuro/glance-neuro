@@ -15,7 +15,14 @@
 //#include "xuartps.h"
 #include "shared_print.h"
 #include "pl_dma.h"
+#include "pl_loader.h"  // deferred fabric load from SD via PCAP (docs/deferred-boot.md)
+#include "pl_imu_stream.h"  // continuous BNO055 readout (stream_type=3)
 #include "xiltimer.h"  // XTime_GetTime / COUNTS_PER_SECOND for perf instrumentation
+
+// How long to wait for PHY link before continuing boot. Bounded so a board with
+// no cable still reaches the point where core 1 wakes and the serial console
+// starts -- see the wait loop for why that matters.
+#define LINK_WAIT_TIMEOUT_S 20
 
 // Forward declare eth_link_detect from xemacpsif adapter
 // This function is provided by the LWIP library's Xilinx EMAC adapter
@@ -169,9 +176,127 @@ void update_current_packet_size(void) {
 // STREAMING CONTROL
 // ============================================================================
 
+// ============================================================================
+// PL CONFIGURATION SWAP (docs/deferred-boot.md)
+// ============================================================================
+// The shared 2nd-CIPO lane is LVDS (128-ch) or single-ended (I2C IMU / 64-ch)
+// per port; IOSTANDARD is fixed per bitstream, so changing a port's mode means
+// PCAP-loading a different full bitstream. We only swap when NOT streaming (so
+// nothing is in flight on the PL AXI) and reset the master timestamp on each
+// swap so the host sees a fresh epoch.
+
+// 1 while an acquisition fabric is live -- gates every PL-touching service so a
+// scan (non-acq) fabric, or a mid-swap teardown, can't hang the core on AXI to
+// registers that aren't there.
+volatile int pl_is_acq = 0;
+
+// Per-port: 1 while the loaded fabric exposes that cable's AXI IIC (port A at
+// 0x43D0, port B at 0x43D1) for a BNO055. CMD_DETECT_IMU probes a port ONLY if
+// its flag is set: a mixed fabric (acq_imu_port_a/_b) carries one IIC and leaves
+// the other port 128-ch LVDS with NO I2C, and touching that absent AXI slave
+// hangs the core forever. pl_has_iic is the OR (any IIC present) that gates the
+// command itself so plain acq -- which has neither -- refuses it outright.
+volatile int pl_has_iic_a = 0;
+volatile int pl_has_iic_b = 0;
+volatile int pl_has_iic   = 0;
+
+// selector -> SD file (no .bin), is it an acquisition fabric, does it carry the
+// AXI IICs? Selectors are append-only so the host mapping (net.py CONFIGS) stays
+// stable. Later variants add acq_imu_port_a / _b (one IIC + one 128-ch LVDS port).
+// The `file` field MUST be an 8.3 short name (<=8-char base): the loader's xilffs
+// is built with FF_USE_LFN=0, so f_open on a longer name fails PL_ERR_OPEN even
+// when the file is present. Hence acq_imu_both's blob is "aimuboth.bin", not
+// "acq_imu_both.bin" (12-char base). The host-facing `name` is unconstrained.
+typedef struct { const char *name; const char *file; int is_acq; int iic_a; int iic_b; } pl_config_t;
+static const pl_config_t pl_configs[] = {
+  { "acquisition",    "acq",      1, 0, 0 },   // 128-ch LVDS acquisition, no IMU
+  { "acq_imu_both",   "aimuboth", 1, 1, 1 },   // both cables 64-ch + a BNO055 each
+  { "acq_imu_port_a", "aimu_a",   1, 1, 0 },   // port A 64-ch + IMU (iic_a), port B 128-ch LVDS
+  { "acq_imu_port_b", "aimu_b",   1, 0, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU (iic_b)
+};
+#define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
+// Which fabric BOOT.bin bakes in (scripts/boot_acq_loader.bif stages the matching
+// .bit). Keep the two in step: this only names what the FSBL already loaded, so a
+// mismatch would have the firmware describe the PL wrongly, not misconfigure it.
+#define PL_CONFIG_BAKED 0   /* "acquisition" -- 128-ch, works with any headstage */
+static int current_config = -1;
+
+// Which fabric the loader last programmed (-1 = none/blank, else a pl_configs
+// index). Read-only accessor for CMD_PL_STATUS: it reads this firmware state, not
+// PL registers, so a reconnecting host can learn the config in ANY fabric state.
+int pl_current_config(void) { return current_config; }
+
+// Acquisition PL init, split so boot can keep the known-good 2c-i ordering:
+//  - early: CDMA + LFP config. At boot this runs BEFORE the network (load-first,
+//    for link stability); its few send_messages match what 2c-i buffered.
+//  - late: the send_message-HEAVY register setup. At boot this must run AFTER
+//    core1 is awake and draining the print ring -- running it before core1
+//    flooded the ring and raced core0/core1 on the shared UART, hanging the boot.
+// A runtime swap (core1 long since up) just calls the full acq_pl_bringup().
+static void acq_pl_init_early(void) {
+#if BRAM_READ_METHOD == BRAM_READ_DMA
+  pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
+#endif
+  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+}
+static void acq_pl_init_late(void) {
+  pl_set_transmission(0);
+  pl_set_loop_count(0);
+  update_current_packet_size();
+  pl_set_copi_commands(initialization_cmd_sequence);
+  pl_stim_boot_init();  // DAC to its safe state (docs/stim.md)
+}
+static void acq_pl_bringup(void) { acq_pl_init_early(); acq_pl_init_late(); }
+
+// Load the config with the given selector via PCAP. Caller MUST guarantee we are
+// not streaming. Resets the master timestamp on a successful acquisition load.
+// Returns 0 ok, positive pl_status_t on load failure, -1 on a bad selector.
+int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
+  if (sel >= PL_NUM_CONFIGS) return -1;
+  const pl_config_t *c = &pl_configs[sel];
+  if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
+  // Shut the serial console's INPUT for the duration. Clearing the PL floats
+  // the EMIO UART RX ball, and core 1 would otherwise parse the resulting noise
+  // as a debug command -- "dump" with a garbage count, or "start" -- either of
+  // which leaves the board unresponsive. Output is unaffected (it is merely
+  // lost on the wire while the pins are gone).
+  command_flags->serial_input_ok = 0;
+  pl_imu_stream_stop_all();              // the IICs it polls are about to vanish
+  pl_is_acq = 0;                         // tearing the PL down -> stop touching it
+  pl_has_iic_a = pl_has_iic_b = pl_has_iic = 0;  // its IICs are gone until reloaded
+  uint32_t bytes = 0;
+  pl_status_t st = pl_loader_load(c->file, &bytes);
+  if (out_bytes) *out_bytes = bytes;
+  if (st != PL_OK) {
+    current_config = -1;
+    command_flags->serial_input_ok = 1;   // failed load: pins are as they were
+    return (int)st;
+  }
+  current_config = (int)sel;
+  pl_has_iic_a = c->iic_a;               // per-port IIC presence (0x43D0 / 0x43D1)
+  pl_has_iic_b = c->iic_b;
+  pl_has_iic   = c->iic_a || c->iic_b;   // any IIC -> CMD_DETECT_IMU is allowed
+  // The fabric is back, so the console pins are real again. Core 1 flushes
+  // whatever noise arrived while the gate was shut before honouring input.
+  command_flags->serial_input_ok = 1;
+  if (c->is_acq) {
+    acq_pl_bringup();
+    pl_reset_timestamp();                // new fabric -> fresh timeline for the host
+    pl_is_acq = 1;
+  }
+  send_message("Config '%s' loaded (%lu bytes)%s\r\n", c->name,
+               (unsigned long)bytes,
+               c->is_acq ? ", acquisition ready" : " (scan fabric)");
+  return 0;
+}
+
 void handle_enable_streaming(void) {
   if (stream_enabled) {
     send_message("Streaming already enabled\r\n");
+    return;
+  }
+  if (!pl_is_acq) {
+    send_message("Cannot start: no acquisition fabric loaded (set_config first)\r\n");
     return;
   }
 
@@ -391,7 +516,7 @@ void network_maintenance_loop(void) {
   // Refresh the shared status snapshot at ~200 Hz (every 5 ms). Cheap and
   // non-blocking; core 1 reads it on demand or for its ~1 Hz monitor.
   uint32_t now_ms = sys_now();
-  if (now_ms - last_psmon_time >= 5) {
+  if (pl_is_acq && now_ms - last_psmon_time >= 5) {   // snapshot reads PL regs
     last_psmon_time = now_ms;
     publish_status_snapshot();
   }
@@ -441,7 +566,7 @@ void network_maintenance_loop(void) {
       start_tcp_server();
 
       // Restart UDP stream
-      udp_stream_init();
+      broadband_stream_init();
 
       // Announce ourselves so a reconnecting host re-learns our MAC immediately
       // (same stale-ARP antidote as at boot, for the hotplug path).
@@ -480,16 +605,9 @@ int main() {
   memset((void *)command_flags, 0, sizeof(command_flags_t));
   psmon_init();   // zero the status snapshot before core 1 reads it
   pl_rhd_shadow_init();   // seed the RHD register mirror from the init defaults
-#if BRAM_READ_METHOD == BRAM_READ_DMA
-  pl_dma_init();  // AXI CDMA + non-cacheable DDR staging buffer for the read path
-#endif
-
-  // Load the LFP cascade's configuration but leave the engine OFF. Its filters
-  // come from the bitstream, so enabling it is a single command and needs no
-  // host setup -- but it costs core-0 time in the same loop as the broadband
-  // pump, and broadband is the stream with a hard 33 us budget. Anything that
-  // competes with it is opt-in. Decimation is structural (/2 then /5 -> 3 kHz).
-  pl_lfp_set_config(/*enable=*/0, /*num_taps=*/LFP_MAX_POLY_TAPS);
+  // pl_dma_init() and pl_lfp_set_config() touch the PL, so they now run right
+  // after the PCAP fabric load (just before lwip_init), not here -- the fabric
+  // is not configured yet at this point in the deferred-boot image.
   // ========================================================================
 
   // ========================================================================
@@ -522,6 +640,46 @@ int main() {
 
   // TODO: Figure out how to make this work with hotplug
   // TODO: Ideally, we'd allow for a DHCP option with some sort of discovery protocol
+
+  // ---- The PL is already configured by the time we get here -----------------
+  // BOOT.bin bakes the default acquisition bitstream, so the FSBL configured the
+  // PL before this code ran (docs/deferred-boot.md). That buys the serial console
+  // and the DONE LED, because the debug UART leaves the chip through PL balls --
+  // a blank PL is silent.
+  //
+  // pl_loader_init() is XDcfg + SD mount ONLY: no PROG_B, no reconfiguration.
+  // The only reconfiguration path is pl_apply_config(), which is reachable just
+  // from a TCP command and therefore always runs over an established link.
+  int loader_ok = (pl_loader_init() == 0);
+  if (!loader_ok)
+    xil_printf("WARNING: pl_loader_init failed -- set_config loads unavailable\r\n");
+
+  // BOOT.bin bakes the default acquisition bitstream, so the FSBL has already
+  // configured the PL. Do the EARLY half of the acquisition bring-up here --
+  // before the network, which is the ordering this file has always required.
+  //
+  // The requirement is EMPIRICAL: moving this after lwip_init cost the link on
+  // hardware. The mechanism is NOT established, and one plausible-sounding
+  // explanation is already ruled out -- that pl_dma_init()'s
+  // Xil_SetTlbAttributes, being 1 MB granular, reaches into lwIP's descriptor
+  // ring. It does not: pl_dma_lfp_staging is at 0x00400000 and pl_dma_staging at
+  // 0x00500000, while emac_bd_space is at 0x00800000, so they are in different
+  // 1 MB sections and no TLB entry is shared. Don't re-derive that story; if you
+  // need the real cause, it is still unfound.
+  //
+  // The send_message-HEAVY half runs later, once core 1 is draining the print
+  // ring. Splitting them is why acq_pl_init_early and acq_pl_init_late exist --
+  // calling the combined acq_pl_bringup() here would break one ordering or the
+  // other.
+  // Gate on the init result: a failed XDcfg_CfgInitialize leaves DcfgInst's
+  // base address at 0, so pl_loader_pl_configured() would read offset 0x0C of
+  // DDR rather than devcfg and could report a configured PL that is not there --
+  // sending acq_pl_init_early() at an unconfigured fabric, which is the
+  // never-returning AXI read this firmware keeps paying for.
+  int pl_live_at_boot = loader_ok && pl_loader_pl_configured();
+  if (pl_live_at_boot)
+    acq_pl_init_early();
+
   lwip_init();
   
   netif_add(&server_netif, &ipaddr, &netmask, &gw, NULL, NULL, NULL);
@@ -531,57 +689,117 @@ int main() {
   netif_set_up(&server_netif);
   service_network();   // RX is live now -- start draining it through the rest of init
 
-  // Start second core
-  xil_printf("ARM0: sending the SEV to wake up ARM1\n\r");
-  sev(); // Send event to wake up ARM1
-  usleep(5000);
-
+  // Deliberately the ONE queued message in the boot path: everything else here
+  // prints directly. Core 1 is still parked, so this sits in the ring until the
+  // SEV below wakes it -- which is the point. Seeing it appear right after
+  // "Core 1 awake!!" is the end-to-end proof that the shared-memory print ring
+  // works. If it never appears, the ring is broken, not the network.
   send_message("Debug server up and running.\r\n");
-    
-  // Interrogate PHY to detect initial link state right after xemac_add completes
-  // We'll only start TCP and UDP if we're connected
+
+  // Everything from here to the SEV prints with xil_printf, NOT send_message.
+  // Core 1 is parked, so the ring is not being drained and a queued line would
+  // not reach the console until after the SEV -- up to LINK_WAIT_TIMEOUT_S
+  // later. Worse, it would land OUT OF ORDER: lwIP's xemacpsif/PHY code
+  // xil_printfs from core 0 in this same window ("Start PHY autonegotiation",
+  // "link speed for phy address 0: 1000"), so queued status lines would print
+  // after driver output that actually happened later. Core 0 is the only writer
+  // until the SEV, so printing directly here is safe and keeps the boot log in
+  // causal order.
   eth_link_detect(&server_netif);
   if (netif_is_link_up(&server_netif)) {
     link_is_up = 1;
-    send_message("Network link UP at boot\r\n");
+    xil_printf("Network link UP at boot\r\n");
   } else {
     link_is_up = 0;
-    send_message("Network link DOWN at boot - waiting for cable connection...\r\n");
+    xil_printf("Network link DOWN at boot - waiting for cable connection...\r\n");
   }
 
-  while (!link_is_up) {
-    service_network();   // keep draining RX while waiting for PHY link-up
-    eth_link_detect(&server_netif);
-    if (netif_is_link_up(&server_netif)) {
-      link_is_up = 1;
-      send_message("Network link UP\r\n");
+  // Bounded, because core 1 is still parked and the console does not exist
+  // until it wakes (below). An unbounded wait here means a board with no
+  // Ethernet -- the exact case the baked bitstream exists to keep diagnosable --
+  // sits mute forever with no serial console and no network. Give the PHY a
+  // generous window, then carry on: link_is_up is re-evaluated by the
+  // maintenance loop, so a cable plugged in later still comes up.
+  {
+    XTime wait_start; XTime_GetTime(&wait_start);
+    const XTime wait_limit = (XTime)COUNTS_PER_SECOND * LINK_WAIT_TIMEOUT_S;
+    while (!link_is_up) {
+      service_network();   // keep draining RX while waiting for PHY link-up
+      eth_link_detect(&server_netif);
+      if (netif_is_link_up(&server_netif)) {
+        link_is_up = 1;
+        xil_printf("Network link UP\r\n");
+        break;
+      }
+      XTime now_wait; XTime_GetTime(&now_wait);
+      if ((now_wait - wait_start) > wait_limit) {
+        xil_printf("Network link DOWN after %ds -- continuing so the serial "
+                   "console comes up; plug the cable in and it will link\r\n",
+                   LINK_WAIT_TIMEOUT_S);
+        break;
+      }
     }
   }
+
+  // Start second core -- AFTER the PHY/link work above, deliberately.
+  //
+  // There is exactly one UART and two potential writers. Core 1 owns it once it
+  // starts (it drains the print ring with xil_printf). Core 0 does not print
+  // directly on purpose... but lwIP's xemacpsif/PHY code does: "Start PHY
+  // autonegotiation", "link speed for phy address 0: 1000" and friends are
+  // xil_printf straight from the driver, on core 0, and eth_link_detect() calls
+  // into it. Waking core 1 before that finished put both cores on the UART at
+  // once and shredded the output into interleaved characters. It also has to
+  // stay after lwip_init (see the note above about lwIP breaking if core 1
+  // starts first), so this window -- after link-up, before the servers -- is the
+  // one spot that satisfies both.
+  xil_printf("ARM0: sending the SEV to wake up ARM1\n\r");
+  sev(); // Send event to wake up ARM1
+  usleep(5000);
 
   start_tcp_server();
   service_network();   // answer anything already waiting on the listener
 
   // Initialize UDP (always enabled)
-  udp_stream_init();
+  broadband_stream_init();
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
+  pl_imu_stream_init();  // IMU side channel, same port, stream_type=3
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
-  
-  // Initialize PL
-  pl_set_transmission(0);
-  pl_set_loop_count(0);
-    
-  // Initialize packet size based on current channel_enable setting
-  update_current_packet_size();
 
-  pl_set_copi_commands(initialization_cmd_sequence);
-  service_network();   // keep the RX pool drained across PL init
-
-  // Stimulus DAC to its safe state: soft-reset, then power-down (outputs
-  // parked at 1k-to-AGND until the first playback). See docs/stim.md.
-  pl_stim_boot_init();
-  
-  send_message("System ready. Commands: start, stop, reset_timestamp, status\r\n");
+  // Adopt whatever the PL actually is, rather than assuming. BOOT.bin bakes the
+  // default acquisition bitstream, so the FSBL has already configured the PL by
+  // the time we get here -- and that is what makes the serial console exist at
+  // all, since the debug UART leaves the chip through PL balls (M14/M15 via
+  // JX2). PCFG_DONE is a PS register read, so asking is free and cannot hang
+  // the way touching an unconfigured PL slave would.
+  //
+  // Deliberately AFTER the network is up: the PL-init path is send_message
+  // heavy, and core 1 must already be draining the print ring (running it
+  // earlier once flooded the ring and raced the two cores on the shared UART).
+  // No PCAP runs here either way -- the FSBL did the configuring -- so none of
+  // this goes near the GEM/PHY bring-up window that runtime loads must avoid.
+  pl_has_iic = pl_has_iic_a = pl_has_iic_b = 0;   // the baked fabric is 128-ch, no I2C
+  if (pl_live_at_boot) {
+    current_config = PL_CONFIG_BAKED;
+    acq_pl_init_late();     // early half already ran, before the network
+    pl_reset_timestamp();
+    pl_is_acq = 1;
+    // The PL is up, so the console's RX ball is real: honour typed commands.
+    command_flags->serial_input_ok = 1;
+    send_message("System ready: PL configured at boot (%s). "
+                 "set_config / rescan to swap fabrics.\r\n",
+                 pl_configs[PL_CONFIG_BAKED].name);
+  } else {
+    // No bitstream in the boot image (or configuration failed). Everything
+    // still works -- the host loads a fabric with set_config -- but the console
+    // this message is printed to does not exist yet, so say it for the log
+    // that replays once a fabric is up.
+    pl_is_acq = 0;
+    current_config = -1;   // blank -- CMD_PL_STATUS reports "blank"
+    send_message("System ready (PL BLANK -- no baked bitstream). "
+                 "Load a fabric: set_config <acquisition|acq_imu_both|acq_imu_port_a|acq_imu_port_b>\r\n");
+  }
   send_message("debug> ");
 
   // Board is fully up now. Proactively announce our IP->MAC with a gratuitous
@@ -602,6 +820,12 @@ int main() {
   while (1) {
     network_maintenance_loop();
 
+    // The stream services touch the PL, so run them only on an acquisition
+    // fabric. (stream_enabled/lfp are already 0 on a scan fabric and START is
+    // gated on pl_is_acq, but this makes a mid-swap teardown provably safe.)
+    if (!pl_is_acq)
+      continue;
+
     // Broadband first, and unconditionally: it is the 30 kHz path with the
     // 33 us budget, and nothing may come between it and the PL.
     broadband_stream_service();
@@ -611,6 +835,18 @@ int main() {
     // Kept on its own line rather than inside the network loop so that ordering
     // is a visible scheduling decision instead of an implementation detail.
     lfp_stream_service();
+
+    // IMU last: 100 Hz, and a pass costs at most a couple of IIC status reads
+    // while a transfer is in flight (the I2C itself runs in the core's FIFOs).
+    //
+    // MEASURED, not assumed: servicing this I2C peripheral from the same loop
+    // as the 30 kHz pump does NOT increase latency. Comparing a streaming run
+    // with the IMU off against one with it on, the recv->transmit histogram
+    // (loop_hist) and over_budget_count are unchanged -- so the cost stays
+    // inside the noise of the 33.3 us budget. Keeping it here therefore needs
+    // no further optimization; if that ever stops being true, perf_reset then
+    // get_status with the stream off vs on is the measurement that shows it.
+    pl_imu_stream_service();
   }
   
   cleanup_platform();

@@ -47,7 +47,7 @@ Most commands reply with a small ack; `GET_STATUS`, `READ_REGISTER`, etc. reply 
 | `0x30` | FULL_CABLE_TEST | — | run the full phase sweep |
 | `0x40` | GET_STATUS | — | returns the `status_response_t` struct (see below) |
 | `0x41` | DUMP_BRAM | p1 = word, p2 = count | debug: dump BRAM words to the serial console |
-| `0x50` | SET_UDP_DEST | p1 = ip, p2 = port | set the UDP stream destination |
+| `0x50` | SET_UDP_DEST | p1 = ip, p2 = port | set the UDP stream destination. Accepted on **any** fabric state including a blank PL — it only reconfigures lwIP on the PS side, and a client must be able to say where packets go before a fabric exists |
 | `0x60` | PING | — | liveness check |
 | `0x70` | AUX_WRITE_WORD | p1 = target \| bank<<8 \| is_len<<16; p2 = addr<<16 \| data | program a slot-0 command word (or its loop length) |
 | `0x71` | AUX_BANK_SELECT | p1 = slot; p2 = bank | select the active program bank for slot 0 |
@@ -55,7 +55,20 @@ Most commands reply with a small ack; `GET_STATUS`, `READ_REGISTER`, etc. reply 
 | `0x74` | WRITE_REGISTER | p1 = reg, p2 = value | inject a one-shot RHD `WRITE(reg,value)` on aux slot 2 → 4-byte echo |
 | `0x75` | SET_FAST_SETTLE | p1 = amp cfg, p2 = dsp cfg | `sw \| gpio_en<<1 \| pin<<4` per field |
 | `0x76` | SET_DIGOUT | p1 = sw \| gpio_en<<1 \| pin<<4; p2 = reg3 static byte | digital-out control |
+| `0x77` | SET_CHIRP | p1 = `mode \| stride<<8`; p2 = `fspan \| rate<<16` | analytic-chirp NCO config (CTRL_REG_3) — a swept-sine debug source, no chip needed |
+| `0x80` | LFP_ENABLE | p1 = 0/1 | enable the on-PL decimation cascade (`stream_type=2` producer) |
+| `0x81` | LFP_SET_PARAMS | p1 ignored, p2 = num_taps | decimation is structural (/2 then /5), so only the stage-2 tap count is settable |
+| `0x82` | LFP_SET_CHANNELS | p1 = 8-bit lane mask | mirrors the broadband channel-enable |
+| `0x83` | LFP_WRITE_COEF | p1 = `[0]` clear-ptr-first \| `[1]` stage; p2 = 18-bit signed coef | one tap per command; hold the stage bit across the whole upload. See `docs/lfp.md` |
+| `0x91` | PERF_RESET | — | clear the sticky recv→transmit maxes, histogram and over-budget count, so a measurement window starts fresh |
 | `0xA0`–`0xAD` | STIM_* | see `docs/stim.md` | DAC70502 stimulus playback: window/loop/rate/trigger config, start/stop/trigger, safe-state, upload + CRC verify, status |
+| `0xB0` | DETECT_IMU | — | probe both cables' AXI IIC for a BNO055; 12-byte `{result_a, result_b, version}`. Only on a fabric that carries the IICs (`acq_imu_*`), gated on `pl_has_iic`; refused (with an ack error) on a fabric without them so the AXI read can't hang the core |
+| `0xB4` | SET_CONFIG | p1 = config selector | PCAP-swap the whole PL fabric (deferred boot, `docs/deferred-boot.md`): `0`=acquisition, `1`=acq_imu_both, `2`=acq_imu_port_a, `3`=acq_imu_port_b — an index into the firmware's `pl_configs[]`, so the two move together. Only when not streaming; resets the timestamp on an acquisition load |
+| `0xB5` | PL_STATUS | — | which fabric is loaded — works in **any** state (blank or acquisition), reads firmware state not PL registers. Returns `{int32 config, uint32 flags}` (`config` −1=blank else selector; `flags` bit0=is_acq, bit1=link_up) |
+| `0xB6` | IMU_READ | p1 = port (0=A, 1=B) | one-shot BNO055 fused sample (enters NDOF on first use, ~50 ms): 32-byte `{status, quat w/x/y/z, acc x/y/z, gyr x/y/z (LE int16), calib_stat, temp_c, rsvd16, version "IMUR"}`. Refused while streaming (blocking ms-scale I2C), while the IMU stream is active on that port, and on a port with no IIC |
+| `0xB7` | I2C_SCAN | p1 = port (0=A, 1=B) | scan the port's I2C bus 0x08–0x77; 24-byte `{status, bitmap[16], version "I2CS"}` (bit n of byte n/8 = address n ACKed). status 0 = ok; 1 = bus wedged at addr `[15:8]`, scan aborted. Deadline-bounded (~25 ms clean). Same gates as IMU_READ |
+| `0xB8` | IMU_STREAM | p1 = port mask (bit0 A, bit1 B; absolute set, 0 = stop all), p2 = period ms (0→10, clamped 10–1000) | continuous per-port BNO055 readout → `stream_type=3` datagrams (`docs/unified-packet-format.md`). 12-byte reply `{active_mask, period_ms, version "IMUS"}`. **p1 bit 31 = report-only**: reply with the current state and change nothing (the port field is an absolute set, so `0` already means "stop all" and cannot double as a query) — this is what `net.py get_status` uses to show IMU state without disturbing a running stream. Ports without an IIC (or with no responding BNO055) are dropped from the mask. **Starting** a port does a blocking NDOF entry → refused while neural streaming is active (imu_stream *before* `start`); stopping is always allowed. Auto-stops on SET_CONFIG |
+| `0xB9` | EEPROM_READ | p1 = `port<<16 \| addr_width<<8 \| i2c_addr`, p2 = `offset<<8 \| len` (len ≤ 32) | bounded combined write-then-read from any device on the port's bus (addr_width 1 = one offset byte / 24xx ≤16 Kbit, 2 = big-endian two / ≥32 Kbit). 44-byte `{status, nbytes, data[32], version "EERD"}`; status 0 ok, 1 no ACK, 2 timeout, 3 short read (`got[15:8]`, `want[23:16]`). Non-destructive. Same gates as IMU_READ, plus the device address must be in `0x08`–`0x77` — `0x00` is the I2C **general call**, which several device families decode as a reset |
 
 > **Removed in v2:** `0x72 AUX_SEQ_EN`. The aux command engine is **always on** — there is no
 > enable step — so the command was retired. (A v1 host that sends it will not interoperate;

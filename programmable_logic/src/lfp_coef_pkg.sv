@@ -15,7 +15,7 @@
 //   stage 2: 120-tap linear phase,     15 kHz -> 3 kHz, passband to 1200 Hz
 //
 // Stage 1 is a halfband, so 4 of its 11 taps are structurally zero and its
-// centre tap is exactly 0.5. The engine still MACs all 11: the zeros cost idle
+// center tap is exactly 0.5. The engine still MACs all 11: the zeros cost idle
 // cycles the budget can spare, and skipping them would silently mis-compute any
 // non-halfband coefficients a user uploads.
 //

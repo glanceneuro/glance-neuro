@@ -5,12 +5,12 @@
 # The only way to build BOOT.bin.
 #
 # Produces blobs/BOOT.bin from the current tree and refuses to produce one it
-# cannot vouch for. It decides for itself whether the PL needs re-synthesising by
+# cannot vouch for. It decides for itself whether the PL needs re-synthesizing by
 # fingerprinting the sources, so a firmware-only edit costs ~3 minutes and a PL
 # edit costs ~18 -- without anyone having to remember which they made.
 #
 #   scripts/build.sh              # build what needs building, then verify
-#   scripts/build.sh --force-pl   # re-synthesise the PL even if unchanged
+#   scripts/build.sh --force-pl   # re-synthesize the PL even if unchanged
 #   scripts/build.sh --check      # report what WOULD be rebuilt, change nothing
 #
 # Set XILINX_ROOT if the tools are not at /opt/Xilinx/2025.1.
@@ -38,7 +38,7 @@ done
 
 die() { echo "" >&2; echo "BUILD FAILED: $*" >&2; exit 1; }
 
-# --- Does the PL need re-synthesising? ---------------------------------------
+# --- Does the PL need re-synthesizing? ---------------------------------------
 # Fingerprint every input the bitstream is built from. Anything that can change
 # the fabric belongs here; the block design and the custom IP are build inputs
 # just as much as the RTL is, and are the easiest to forget.

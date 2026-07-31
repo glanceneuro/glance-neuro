@@ -78,8 +78,8 @@ def design_halfband(ntaps, fp, fs_rate):
     """Equiripple halfband lowpass.
 
     An equiripple design whose bands are symmetric about fs/4 with equal ripple
-    weights is already a halfband (every second tap either side of centre is
-    zero); we snap those to exact zero and pin the centre tap to 0.5 so the RTL
+    weights is already a halfband (every second tap either side of center is
+    zero); we snap those to exact zero and pin the center tap to 0.5 so the RTL
     can implement it as a shift plus a handful of multiplies.
     """
     if (ntaps - 3) % 4 != 0:
@@ -92,10 +92,10 @@ def design_halfband(ntaps, fp, fs_rate):
     for i in range(ntaps):                      # snap the structural zeros
         if i != c and (i - c) % 2 == 0:
             h[i] = 0.0
-    h[c] = 0.5                                  # exact centre -> a shift, not a multiply
+    h[c] = 0.5                                  # exact center -> a shift, not a multiply
     others = [i for i in range(ntaps) if i != c and h[i] != 0.0]
     s = sum(h[i] for i in others)
-    for i in others:                            # renormalise to unity DC gain
+    for i in others:                            # renormalize to unity DC gain
         h[i] *= 0.5 / s
     return h
 
@@ -114,7 +114,7 @@ def design_poly_minphase(ntaps, fp, fst, fs_rate):
     minimum-phase factor -- the factor's magnitude is the square root of the
     prototype's, so the doubled spec comes back to the target.
 
-    Same |H(f)|, but the energy is front-loaded instead of centred, which is
+    Same |H(f)|, but the energy is front-loaded instead of centered, which is
     where the latency saving comes from.
     """
     proto_len = 2 * ntaps - 1
@@ -263,7 +263,7 @@ def write_sv_defaults(path, hb_q, lin_q):
 //   stage 2: {len(lin_q)}-tap linear phase,     15 kHz -> 3 kHz, passband to {F_PASS:.0f} Hz
 //
 // Stage 1 is a halfband, so {sum(1 for v in hb_q if v == 0)} of its {len(hb_q)} taps are structurally zero and its
-// centre tap is exactly 0.5. The engine still MACs all {len(hb_q)}: the zeros cost idle
+// center tap is exactly 0.5. The engine still MACs all {len(hb_q)}: the zeros cost idle
 // cycles the budget can spare, and skipping them would silently mis-compute any
 // non-halfband coefficients a user uploads.
 //
@@ -312,7 +312,7 @@ def main():
     nz = int(np.count_nonzero(hb_q))
     print(f"stage 1  {HB_TAPS}-tap halfband, passband edge {HB_FP/1e3:.1f} kHz, "
           f"stopband from {HB_FST/1e3:.1f} kHz")
-    print(f"         {nz} non-zero taps, centre = {hb[(HB_TAPS-1)//2]:.4f} "
+    print(f"         {nz} non-zero taps, center = {hb[(HB_TAPS-1)//2]:.4f} "
           f"(a shift), {(nz - 1)//2} unique multiplies with symmetry\n")
 
     rows = []
@@ -394,11 +394,11 @@ def main():
         # ---- phase / group delay / impulse response -------------------------
         fp_ = np.linspace(1.0, 1500.0, 3000)      # passband + a little past the edge
         fig2, bx = plt.subplots(3, 1, figsize=(10, 11))
-        colours = {"linear phase": "tab:blue", "minimum phase": "tab:red"}
+        colors = {"linear phase": "tab:blue", "minimum phase": "tab:red"}
 
         for name, h_f in (("linear phase", lin_f), ("minimum phase", mp_f)):
             n = np.arange(len(h_f)) / FS_MID * 1e3
-            bx[0].plot(n, h_f, label=f"stage 2, {name}", color=colours[name], lw=1.2)
+            bx[0].plot(n, h_f, label=f"stage 2, {name}", color=colors[name], lw=1.2)
         bx[0].axhline(0, color='k', lw=.5)
         bx[0].set(title="Stage-2 impulse response — minimum phase front-loads its energy, "
                         "which is where the latency saving comes from",
@@ -407,9 +407,9 @@ def main():
 
         for name, h_f in (("linear phase", lin_f), ("minimum phase", mp_f)):
             ph, gd = cascade_phase_and_delay(hb_f, h_f, fp_)
-            bx[1].plot(fp_ / 1e3, np.degrees(ph), color=colours[name],
+            bx[1].plot(fp_ / 1e3, np.degrees(ph), color=colors[name],
                        label=f"cascade, {name}")
-            bx[2].plot(fp_ / 1e3, gd, color=colours[name],
+            bx[2].plot(fp_ / 1e3, gd, color=colors[name],
                        label=f"cascade, {name}")
         for a in (bx[1], bx[2]):
             a.axvline(F_PASS / 1e3, color='k', ls=':', lw=1)

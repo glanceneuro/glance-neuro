@@ -208,7 +208,8 @@ UNIFIED_VERSION = 1
 UNIFIED_HEADER_WORDS = 8
 STREAM_TYPE_BROADBAND = 1
 STREAM_TYPE_LFP = 2
-# stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
+STREAM_TYPE_IMU = 3           # BNO055 side channel, one 52-byte datagram per fused sample
+# Types are handed out in the order streams ship, with no gaps. The next one is 4.
 
 # Binary command protocol constants
 CMD_MAGIC = 0xDEADBEEF
@@ -274,6 +275,657 @@ CMD_STIM_POWERDOWN    = 0xAD  # outputs -> 1k to AGND (disarms hw trigger)
 
 STIM_RAM_DEPTH = 16384
 STIM_MASTER_RATE_HZ = 240000.0   # 84 MHz / 350, fixed in the PL
+
+# BNO055 IMU presence detection (the separate "detect" bitstream; imu_detect_top).
+# Reply is 12 bytes: result_a(u32), result_b(u32), version(u32) -- keep in sync
+# with firmware imu_detect_response_t and imu_detect_top.sv bitfields.
+CMD_DETECT_IMU = 0xB0
+IMUDET_VERSION = 0x494D5532   # "IMU2" (axi_iic revision)
+
+def _decode_imu_result(word):
+    return {
+        'present': bool(word & 0x1),   # ACKed AND chip_id == 0xA0
+        'ack':     bool(word & 0x2),   # a device ACKed its address at 0x28
+        'absent':  bool(word & 0x4),   # this port has no AXI IIC on the loaded fabric (not probed)
+        'chip_id': (word >> 8) & 0xFF,
+        'iic_sr':  (word >> 24) & 0xFF,  # AXI IIC status reg post-init (diag)
+    }
+
+def detect_imu(sock):
+    """Probe both headstage ports for a BNO055 over the shared-lane I2C (via the
+    detect bitstream's two AXI IIC controllers) and print a per-port verdict."""
+    ok, data = send_binary_command(sock, CMD_DETECT_IMU, timeout=2.0)
+    if not ok or data is None or len(data) < 12:
+        print("[DETECT] refused -- the loaded fabric has no IMU I2C. Load one that does "
+              "with set_config: acq_imu_both / acq_imu_port_a / acq_imu_port_b / scan. "
+              "(Plain 'acquisition' and a blank PL carry no I2C; check with pl_status.)")
+        return None
+    ra, rb, ver = struct.unpack('<III', data[:12])
+    if ver != IMUDET_VERSION:
+        print(f"[DETECT] unexpected peripheral version 0x{ver:08X} "
+              f"(expected 0x{IMUDET_VERSION:08X}); wrong bitstream?")
+    res = {'A': _decode_imu_result(ra), 'B': _decode_imu_result(rb)}
+    for port in ('A', 'B'):
+        r = res[port]
+        if r['absent']:
+            print(f"Port {port}: no I2C on this fabric (this cable is 128-ch LVDS) -- not probed")
+            continue
+        # AXI IIC status register post-init: a live core reads ~0xC0 (both FIFOs
+        # empty). 0x00/0xFF means the controller isn't answering at its base.
+        sr = r['iic_sr']
+        ctrl = "controller alive" if sr not in (0x00, 0xFF) else "CONTROLLER NOT RESPONDING"
+        diag = f"[iic_sr=0x{sr:02X}, {ctrl}]"
+        if r['present']:
+            print(f"Port {port}: IMU present (BNO055, chip_id=0x{r['chip_id']:02X}) {diag}")
+        elif r['ack']:
+            print(f"Port {port}: device answered at 0x28 but chip_id=0x{r['chip_id']:02X} "
+                  f"!= 0xA0 (not a BNO055) {diag}")
+        else:
+            print(f"Port {port}: no IMU (nothing answered at 0x28) {diag}")
+    return res
+
+# One-shot BNO055 fused sample (CMD_IMU_READ). Reply is 32 bytes -- keep in sync
+# with firmware imu_sample_response_t. DRAFT (overnight 2026-07-30), untested on
+# hardware; the continuous-ingestion design is docs/imu-ingestion.md.
+CMD_IMU_READ = 0xB6
+IMUREAD_VERSION = 0x494D5552  # "IMUR"
+
+def imu_read(sock, port='a'):
+    """Read one NDOF sample (quaternion/accel/gyro + calibration status) from
+    the BNO055 on port 'a' or 'b'. Needs a fabric with that port's I2C and
+    streaming stopped; the first read after power-up takes ~50 ms extra while
+    the chip enters NDOF."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    ok, data = send_binary_command(sock, CMD_IMU_READ, param1=p, timeout=2.0)
+    if not ok or data is None or len(data) < 32:
+        print(f"[IMU] read refused/failed on port {'B' if p else 'A'} -- "
+              f"fabric without that port's I2C, or streaming active?")
+        return None
+    (status, qw, qx, qy, qz, ax, ay, az, gx, gy, gz,
+     calib, temp, _pad, ver) = struct.unpack('<I10hBbHI', data[:32])
+    if ver != IMUREAD_VERSION:
+        print(f"[IMU] unexpected version 0x{ver:08X} (expected 0x{IMUREAD_VERSION:08X})")
+    if not (status & 0x1):
+        why = ("chip present but would not enter NDOF" if status & 0x8
+               else "nothing answered at 0x28")
+        print(f"[IMU] port {'B' if p else 'A'}: no sample -- {why} "
+              f"[mode=0x{(status >> 8) & 0xFF:02X}, iic_sr=0x{(status >> 24) & 0xFF:02X}]")
+        return None
+    quat = tuple(v / 16384.0 for v in (qw, qx, qy, qz))
+    accel = tuple(v / 100.0 for v in (ax, ay, az))     # m/s^2
+    gyro = tuple(v / 16.0 for v in (gx, gy, gz))       # deg/s
+    cal = {'sys': (calib >> 6) & 3, 'gyr': (calib >> 4) & 3,
+           'acc': (calib >> 2) & 3, 'mag': calib & 3}
+    print(f"[IMU] port {'B' if p else 'A'}: "
+          f"quat w={quat[0]:+.4f} x={quat[1]:+.4f} y={quat[2]:+.4f} z={quat[3]:+.4f}")
+    print(f"      accel ({accel[0]:+7.2f},{accel[1]:+7.2f},{accel[2]:+7.2f}) m/s^2  "
+          f"gyro ({gyro[0]:+8.2f},{gyro[1]:+8.2f},{gyro[2]:+8.2f}) deg/s")
+    print(f"      calib sys={cal['sys']}/3 gyr={cal['gyr']}/3 acc={cal['acc']}/3 "
+          f"mag={cal['mag']}/3, die {temp} C")
+    return {'quat': quat, 'accel': accel, 'gyro': gyro, 'calib': cal,
+            'temp_c': temp, 'status': status}
+
+# --- Continuous IMU stream (CMD_IMU_STREAM, stream_type=3) --------------------
+# One 52-byte datagram per fused sample on the unified UDP port: the 8-word
+# common header + 10 LE int16s (quat wxyz / acc xyz / gyr xyz). Keep in sync
+# with firmware pl_imu_stream.h.
+#   w1 TYPE_VER: stream_type=3 | version<<8 | port<<16
+#   w5 AUX0:     period_ms[15:0] | iic_errors[23:16] | send_drops[31:24]
+#   w6 AUX1:     calib_stat[7:0] | opr_mode[15:8] | temp_c[23:16]
+CMD_IMU_STREAM = 0xB8
+IMUSTREAM_VERSION = 0x494D5553  # "IMUS"
+IMU_PKT_BYTES = 52
+
+def parse_imu_packet(data):
+    """Decode one stream_type=3 datagram into engineering units, or None."""
+    if len(data) < IMU_PKT_BYTES:
+        return None
+    magic, type_ver, ts_lo, ts_hi, seq, aux0, aux1, _ = \
+        struct.unpack_from('<IIIIIIII', data, 0)
+    if magic != UNIFIED_MAGIC or (type_ver & 0xFF) != STREAM_TYPE_IMU:
+        return None
+    v = struct.unpack_from('<10h', data, 32)
+    temp = (aux1 >> 16) & 0xFF
+    return {
+        'port': 'B' if (type_ver >> 16) & 1 else 'A',
+        'seq': seq,
+        'timestamp': ts_lo | (ts_hi << 32),     # PL master clock: aligns with neural data
+        'period_ms': aux0 & 0xFFFF,
+        'iic_errors': (aux0 >> 16) & 0xFF,
+        'send_drops': (aux0 >> 24) & 0xFF,
+        'calib': aux1 & 0xFF,                   # [7:6]sys [5:4]gyr [3:2]acc [1:0]mag
+        'opr_mode': (aux1 >> 8) & 0xFF,
+        'temp_c': temp - 256 if temp > 127 else temp,
+        'quat': tuple(x / 16384.0 for x in v[0:4]),
+        'accel': tuple(x / 100.0 for x in v[4:7]),      # m/s^2
+        'gyro': tuple(x / 16.0 for x in v[7:10]),       # deg/s
+    }
+
+def imu_stream(sock, spec='both', period_ms=0):
+    """Start/stop continuous IMU streaming. spec: a | b | both | off. The port
+    set is absolute. Start the IMU BEFORE 'start' (arming a port does a ~50 ms
+    blocking NDOF entry, refused mid-stream); stopping is always allowed."""
+    masks = {'a': 1, 'b': 2, 'both': 3, 'off': 0, '0': 0}
+    m = masks.get(str(spec).lower())
+    if m is None:
+        print(f"[IMU] unknown port spec '{spec}' (a | b | both | off)")
+        return None
+    ok, data = send_binary_command(sock, CMD_IMU_STREAM, param1=m,
+                                   param2=int(period_ms), timeout=3.0)
+    if not ok or data is None or len(data) < 12:
+        print("[IMU] imu_stream refused -- needs an acq_imu_* fabric, and "
+              "starting a port is refused while neural streaming is active")
+        return None
+    active, period, ver = struct.unpack('<III', data[:12])
+    if ver != IMUSTREAM_VERSION:
+        print(f"[IMU] unexpected version 0x{ver:08X} (expected 0x{IMUSTREAM_VERSION:08X})")
+    # The firmware sets p->seq = 0 every time a port is ARMED, so a restart is
+    # a backward jump the sink would otherwise score as a gap -- and under hard
+    # rule 3 a nonzero gap count reads as data loss on a clean run. Re-baseline
+    # the ports this command (re)started.
+    if UNIFIED_SINK is not None:
+        for _p in (0, 1):
+            if active & (1 << _p):
+                UNIFIED_SINK._imu_last_seq[_p] = None
+    names = {0: 'none', 1: 'A', 2: 'B', 3: 'A+B'}
+    if m and active != m:
+        print(f"[IMU] note: asked for {names[m]} but got {names[active]} -- "
+              f"ports without an IIC on this fabric (or with no responding "
+              f"BNO055) are dropped; see the board console")
+    print(f"[IMU] streaming: {names[active]} at {1000 // max(period, 1)} Hz "
+          f"(period {period} ms, stream_type=3 on UDP {UDP_PORT})")
+    return {'active': active, 'period_ms': period}
+
+IMU_STREAM_QUERY = 0x80000000   # param1 bit 31: report state, change nothing
+
+def imu_stream_query(sock):
+    """Read the board's IMU streaming state without disturbing it. Returns
+    {'active','period_ms'} or None (older firmware, or a fabric that refuses
+    the command)."""
+    ok, data = send_binary_command(sock, CMD_IMU_STREAM,
+                                   param1=IMU_STREAM_QUERY, timeout=2.0)
+    if not ok or data is None or len(data) < 12:
+        return None
+    active, period, ver = struct.unpack('<III', data[:12])
+    if ver != IMUSTREAM_VERSION:
+        return None
+    return {'active': active, 'period_ms': period}
+
+def imu_recv(n=20, timeout=5.0):
+    """Print n live IMU samples from the unified sink (imu_stream first)."""
+    if UNIFIED_SINK is None:
+        print("[IMU] unified sink not running")
+        return 0
+    q = UNIFIED_SINK.subscribe_imu()
+    got = 0
+    try:
+        while got < n:
+            try:
+                pkt = parse_imu_packet(q.get(timeout=timeout))
+            except queue.Empty:
+                print("[IMU] timeout -- is imu_stream on and an acq fabric loaded?")
+                break
+            if pkt is None:
+                continue
+            got += 1
+            qt, ac, gy = pkt['quat'], pkt['accel'], pkt['gyro']
+            c = pkt['calib']
+            print(f"[IMU {pkt['port']}] seq={pkt['seq']} ts={pkt['timestamp']} "
+                  f"quat=({qt[0]:+.3f},{qt[1]:+.3f},{qt[2]:+.3f},{qt[3]:+.3f}) "
+                  f"acc=({ac[0]:+6.2f},{ac[1]:+6.2f},{ac[2]:+6.2f}) "
+                  f"gyr=({gy[0]:+7.1f},{gy[1]:+7.1f},{gy[2]:+7.1f}) "
+                  f"cal={c >> 6 & 3}{c >> 4 & 3}{c >> 2 & 3}{c & 3}")
+    finally:
+        UNIFIED_SINK.unsubscribe_imu(q)
+    return got
+
+_IMU_CSV = {'thread': None, 'stop': None, 'path': None, 'rows': 0}
+
+def imu_csv_start(path):
+    """Record every IMU sample to a CSV until imu_csv_stop(). Background thread
+    off the sink's subscriber queue -- the recv hot path is untouched."""
+    if _IMU_CSV['thread'] is not None:
+        print(f"[IMU] already recording to {_IMU_CSV['path']} (imu_csv stop first)")
+        return
+    if UNIFIED_SINK is None:
+        print("[IMU] unified sink not running")
+        return
+    # Open here, not in the worker: a bad path must fail in front of the user
+    # rather than killing a background thread that leaves the recorder looking
+    # busy forever.
+    try:
+        # buffering=1 (line buffered). The worker is a DAEMON thread, so the
+        # interpreter exits without unwinding it: anything sitting in a 8 KB
+        # block buffer is simply lost, which silently truncated -- or entirely
+        # emptied -- short recordings.
+        f = open(path, 'w', buffering=1)
+    except OSError as e:
+        print(f"[IMU] cannot record to {path}: {e}")
+        return
+    stop = threading.Event()
+    q = UNIFIED_SINK.subscribe_imu()
+
+    def worker():
+        n = 0
+        try:
+            f.write("host_time,port,seq,timestamp,qw,qx,qy,qz,"
+                    "ax,ay,az,gx,gy,gz,calib,temp_c,iic_errors,send_drops\n")
+            while not stop.is_set():
+                try:
+                    pkt = parse_imu_packet(q.get(timeout=0.5))
+                except queue.Empty:
+                    continue
+                if pkt is None:
+                    continue
+                f.write(f"{time.time():.6f},{pkt['port']},{pkt['seq']},"
+                        f"{pkt['timestamp']},"
+                        + ",".join(f"{x:.6f}" for x in pkt['quat'])
+                        + "," + ",".join(f"{x:.4f}" for x in pkt['accel'])
+                        + "," + ",".join(f"{x:.4f}" for x in pkt['gyro'])
+                        + f",{pkt['calib']},{pkt['temp_c']},"
+                        f"{pkt['iic_errors']},{pkt['send_drops']}\n")
+                n += 1
+                _IMU_CSV['rows'] = n
+        except Exception as e:                      # disk full, etc.
+            print(f"\n[IMU] recording stopped after {n} rows: {e}")
+        finally:
+            # Always drop the subscription and close, or the sink keeps feeding
+            # a queue nobody drains and the file is left open.
+            UNIFIED_SINK.unsubscribe_imu(q)
+            f.close()
+            # Only disown the slot if it is still OURS. A worker that outlived
+            # its stop timeout would otherwise deregister the NEXT recording,
+            # leaving that one unstoppable and its subscriber queue attached to
+            # the recv path for the life of the process.
+            if _IMU_CSV['thread'] is threading.current_thread():
+                _IMU_CSV['thread'] = None
+
+    t = threading.Thread(target=worker, name="imu-csv", daemon=True)
+    _IMU_CSV.update(thread=t, stop=stop, path=path, rows=0)
+    t.start()
+    print(f"[IMU] recording to {path} (imu_csv stop to finish)")
+
+def imu_csv_stop():
+    t = _IMU_CSV['thread']
+    if t is None:
+        print("[IMU] not recording")
+        return
+    _IMU_CSV['stop'].set()
+    t.join(timeout=2.0)
+    print(f"[IMU] recorded {_IMU_CSV['rows']} samples to {_IMU_CSV['path']}")
+    _IMU_CSV.update(thread=None, stop=None, path=None)
+
+# --- I2C bus scan + EEPROM read (CMD_I2C_SCAN / CMD_EEPROM_READ) --------------
+# Generic probes of a headstage port's freed-CIPO I2C bus. Keep the reply
+# layouts in sync with firmware pl_i2c_probe.h.
+I2C_ADDR_FIRST, I2C_ADDR_LAST = 0x08, 0x77   # firmware refuses outside this (network.c)
+CMD_I2C_SCAN = 0xB7
+CMD_EEPROM_READ = 0xB9
+I2CSCAN_VERSION = 0x49324353    # "I2CS"
+EEPROMRD_VERSION = 0x45455244   # "EERD"
+
+def i2c_scan(sock, port='a'):
+    """Scan one port's I2C bus (0x08-0x77) and print an i2cdetect-style map.
+    Needs a fabric with that port's IIC; refused while streaming/imu_stream."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    ok, data = send_binary_command(sock, CMD_I2C_SCAN, param1=p, timeout=3.0)
+    if not ok or data is None or len(data) < 24:
+        print(f"[I2C] scan refused/failed on port {'B' if p else 'A'} -- fabric "
+              f"without that port's I2C, or streaming/imu_stream active?")
+        return None
+    status = struct.unpack_from('<I', data, 0)[0]
+    bitmap = data[4:20]
+    ver = struct.unpack_from('<I', data, 20)[0]
+    if ver != I2CSCAN_VERSION:
+        print(f"[I2C] unexpected version 0x{ver:08X}")
+    if status & 1:
+        print(f"[I2C] port {'B' if p else 'A'}: BUS WEDGED at address "
+              f"0x{(status >> 8) & 0xFF:02X} -- scan aborted (is this cable "
+              f"actually a 128-ch LVDS headstage?)")
+        return None
+    found = [a for a in range(0x08, 0x78) if bitmap[a >> 3] & (1 << (a & 7))]
+    print(f"[I2C] port {'B' if p else 'A'} bus map (0x08-0x77):")
+    print("      " + " ".join(f"{c:2x}" for c in range(16)))
+    for row in range(0, 0x80, 16):
+        cells = []
+        for a in range(row, row + 16):
+            if a < 0x08 or a > 0x77:
+                cells.append("  ")
+            elif bitmap[a >> 3] & (1 << (a & 7)):
+                cells.append(f"{a:02x}")
+            else:
+                cells.append("--")
+        print(f"  {row:02x}: " + " ".join(cells))
+    notes = []
+    if 0x28 in found:
+        notes.append("0x28 = BNO055")
+    eep = [a for a in found if 0x50 <= a <= 0x57]
+    if len(eep) == 8:
+        notes.append("0x50-0x57 all ACK: likely ONE <=16Kbit 24xx EEPROM "
+                     "(block addressing), not 8 devices")
+    elif eep:
+        notes.append(f"24xx EEPROM candidate at {', '.join(hex(a) for a in eep)}")
+    if notes:
+        print("      " + "; ".join(notes))
+    return found
+
+def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
+    """Read bytes from a device on the port's I2C bus (24xx EEPROM, or any
+    register file). width: 1 = one offset byte (<=16Kbit 24xx), 2 = two
+    (>=32Kbit). Non-destructive."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    # Do NOT mask. 0xA0 is the 8-bit write address printed on essentially every
+    # 24xx datasheet, so it is what a user reaches for -- and masking it to 7
+    # bits yields 0x20, a perfectly plausible OTHER device, whose bytes would
+    # then be hex-dumped under the 0xA0 heading. Refuse instead.
+    addr = int(i2c_addr, 0) if isinstance(i2c_addr, str) else int(i2c_addr)
+    if not (I2C_ADDR_FIRST <= addr <= I2C_ADDR_LAST):
+        print(f"[EEPROM] device address 0x{addr:02X} is outside the "
+              f"7-bit range 0x{I2C_ADDR_FIRST:02X}-0x{I2C_ADDR_LAST:02X}. "
+              f"Datasheets often quote the 8-bit form (0xA0); use the 7-bit "
+              f"address (0x50).")
+        return None
+    if int(length) > 32:
+        # One command is one bounded I2C transaction; say so rather than
+        # silently returning a third of what was asked for.
+        print(f"[EEPROM] {length} bytes requested; reading 32 (the per-command "
+              f"maximum). Repeat with offset {offset + 32} for the next chunk.")
+    length = min(int(length), 32)
+    p1 = (p << 16) | ((int(width) & 0xFF) << 8) | (int(i2c_addr) & 0x7F)   # in range, checked above
+    p2 = ((int(offset) & 0xFFFF) << 8) | length
+    ok, data = send_binary_command(sock, CMD_EEPROM_READ, param1=p1, param2=p2,
+                                   timeout=3.0)
+    if not ok or data is None or len(data) < 44:
+        print("[EEPROM] read refused/failed -- fabric without that port's I2C, "
+              "or streaming/imu_stream active?")
+        return None
+    status, nbytes = struct.unpack_from('<II', data, 0)
+    payload = data[8:8 + min(nbytes, 32)]
+    ver = struct.unpack_from('<I', data, 40)[0]
+    if ver != EEPROMRD_VERSION:
+        print(f"[EEPROM] unexpected version 0x{ver:08X}")
+    if status == 1 and nbytes == 0:
+        print(f"[EEPROM] no ACK from 0x{i2c_addr:02X} on port {'B' if p else 'A'}")
+        return None
+    if status == 1:
+        # The firmware also reports 1 for a NACK/arbitration loss part-way
+        # through the read, after some bytes have landed. Those bytes are real
+        # -- discarding them would read as "the device is absent" when it is
+        # actually present and the transfer was cut short.
+        print(f"[EEPROM] transfer cut short after {nbytes} of {length} bytes "
+              f"(NACK or lost arbitration mid-read); showing what arrived")
+    if (status & 0xFF) in (2, 3):
+        print(f"[EEPROM] timed out (got {nbytes}/{length} bytes) -- wedged bus "
+              f"or wrong addr width?")
+        if not nbytes:
+            return None
+    print(f"[EEPROM] port {'B' if p else 'A'} dev 0x{i2c_addr:02X} "
+          f"offset {offset} ({width}-byte addressing): {nbytes} bytes")
+    for i in range(0, len(payload), 16):
+        chunk = payload[i:i + 16]
+        hexs = " ".join(f"{b:02x}" for b in chunk)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"    {offset + i:04x}: {hexs:<47} {text}")
+    return bytes(payload)
+
+# --- Config swap on the acquisition firmware (CMD_SET_CONFIG) -----------------
+# PCAP-swap the whole PL fabric to a named config. Only accepted when NOT
+# streaming (stop first); the board resets the master timestamp on a successful
+# acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
+# Append-only selectors (firmware pl_configs order): acquisition=128-ch/no-IMU,
+# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables,
+# acq_imu_port_a/_b = one cable 64-ch+IMU and the other 128-ch LVDS.
+# PCAP loader status codes, shared by every command that programs the PL.
+_PL_STATUS = {
+    0: "ok", 1: "SD mount failed", 2: "bitstream not found on SD",
+    3: "SD read failed", 4: "empty bitstream file", 5: "bitstream too large",
+    6: "devcfg init failed", 7: "fabric init timeout", 8: "PCAP transfer rejected",
+    9: "PCAP DMA never done", 10: "FPGA done never asserted", 11: "PCAP error flags set",
+    0xFFFFFFFF: "unknown image selector",
+}
+
+CMD_SET_CONFIG = 0xB4
+# Selector order mirrors the firmware's pl_configs[] exactly -- it is an index
+# into that table, so the two move together.
+CONFIGS = {"acquisition": 0, "acq_imu_both": 1,
+           "acq_imu_port_a": 2, "acq_imu_port_b": 3}
+CENSUS_FABRIC = "acq_imu_both"   # the only fabric with I2C on BOTH ports
+
+def set_config(sock, name):
+    if name not in CONFIGS:
+        print(f"[CONFIG] unknown '{name}'; known: {', '.join(CONFIGS)}")
+        return None
+    ok, data = send_binary_command(sock, CMD_SET_CONFIG, param1=CONFIGS[name], timeout=15.0)
+    if not ok:
+        print("[CONFIG] refused/failed -- streaming active? (stop first), or wrong firmware")
+        return None
+    if data is None or len(data) < 12:
+        print("[CONFIG] short/no response")
+        return None
+    rc, nbytes, flags = struct.unpack('<iII', data[:12])
+    is_acq, link_up = bool(flags & 1), bool(flags & 2)
+    if rc == 0:
+        kind = "acquisition ready" if is_acq else "scan fabric (no streaming)"
+        print(f"Config '{name}': {nbytes} bytes loaded, {kind}, "
+              f"link {'UP' if link_up else 'DOWN(!)'}, master timestamp reset.")
+    elif rc < 0:
+        print(f"Config '{name}' FAILED: unknown selector (rc={rc})")
+    else:
+        print(f"Config '{name}' FAILED: {_PL_STATUS.get(rc, f'error {rc}')} (rc={rc})")
+    return {"rc": rc, "bytes": nbytes, "is_acq": is_acq, "link_up": link_up}
+
+CMD_PL_STATUS = 0xB5
+_CONFIG_NAMES = {v: k for k, v in CONFIGS.items()}   # 0->acquisition ... 4->acq_imu_port_b
+_CONFIG_NAMES[-1] = "blank (no fabric)"
+
+def pl_status(sock, verbose=True):
+    """Query which PL fabric is loaded. Works in ANY fabric state (blank / scan /
+    acquisition) because the firmware answers from its loader record, not from a PL
+    register -- so a host reconnecting after a drop can learn the board's config and
+    recover (e.g. it was left in the detect fabric mid-rescan). Returns a dict or
+    None. docs/deferred-boot.md."""
+    ok, data = send_binary_command(sock, CMD_PL_STATUS, timeout=2.0)
+    if not ok or data is None or len(data) < 8:
+        if verbose:
+            print("[PL] no PL_STATUS response -- firmware without the config-swap loader?")
+        return None
+    config, flags = struct.unpack('<iI', data[:8])
+    is_acq, link_up = bool(flags & 1), bool(flags & 2)
+    name = _CONFIG_NAMES.get(config, f"config {config}")
+    if verbose:
+        print(f"PL fabric: {name} (config={config}), "
+              f"{'acquisition' if is_acq else 'non-acq'}, link {'UP' if link_up else 'DOWN'}")
+    return {"config": config, "name": name, "is_acq": is_acq, "link_up": link_up}
+
+# --- rescan: one-shot inventory + fabric selection ----------------------------
+# DRAFT (overnight 2026-07-30) -- composes existing pieces; no new firmware.
+#
+# Why it is shaped this way -- survey of the detection machinery it builds on:
+#   * auto_cable_detect (CableDetection.detect) is the ONLY per-cable "is an RHD
+#     headstage present?" probe: ce=0xFF packs all four CIPO lanes (A0/A1/B0/B1)
+#     into every packet and a 16-phase sweep scores each lane independently.
+#   * CMD_READ_REGISTER 0x73 / aux_selftest ('INTAN' ROM regs 40-44) CANNOT
+#     serve: the slot-2 inject result register is PORT A ONLY (register-map.md,
+#     status reg 12) and the inject path requires active streaming.
+#   * detect_imu (CMD_DETECT_IMU) probes a port's BNO055 only on a fabric whose
+#     port has an AXI IIC; the 'scan' fabric has both.
+# No single fabric can run both probes on one port (the IMU I2C occupies the
+# freed CIPO1 balls), so rescan is a two-fabric dance:
+#     scan -> IMU census -> pick fabric -> load it -> phase-sweep chip detect.
+#
+# ASSUMPTIONS (review in the morning):
+#   1. IMU presence alone selects the fabric (both->acq_imu_both, A->_port_a,
+#      B->_port_b, neither->acquisition). Chip detection runs AFTER, only to set
+#      phases + channel mask on the chosen fabric -- it cannot influence the
+#      choice because it needs an acquisition fabric to run at all.
+#   2. Probing I2C on a cable that carries a plain 128-ch headstage (the scan
+#      fabric drives SCL/SDA into what that headstage drives as LVDS CIPO1) is
+#      assumed electrically harmless for the ~ms probe and reads as "no IMU".
+#   3. On acq_imu_* fabrics the freed CIPO1 lane(s) are expected to score below
+#      DETECTION_THRESHOLD in the sweep (tied-off input, no test sine) -- and
+#      rescan ENFORCES it: any freed-lane bit that sneaks into the detected
+#      mask is corrected out (_RESCAN_FREED_MASK) and re-applied before use.
+#   4. The ce=0xFF detection packet keeps its 154-word four-lane layout on the
+#      64-ch variants (the packetizer RTL is unchanged; only the LVDS buffer
+#      drops a lane), so the validator/scorer need no resize.
+#   5. set_config resets the master timestamp -- a rescan starts a fresh epoch,
+#      so never run it mid-recording.
+#
+# OPEN QUESTIONS (for Caleb):
+#   * Is (2) actually safe on your cables, or should rescan refuse to I2C-probe
+#     a port that streamed chips on its last known fabric?
+#   * Empty cable (no IMU, no chip) currently contributes "plain LVDS" to the
+#     fabric choice -- i.e. two empty ports load 'acquisition'. Prefer that, or
+#     leave the board on 'scan' until something is found?
+#   * Should "IMU present but no chip on that cable's CIPO0" be flagged as a
+#     seating fault rather than silently accepted?
+#   * rescan leaves streaming STOPPED (detection's apply stops to latch the
+#      mask). Auto-start instead?
+
+# (imu_a_present, imu_b_present) -> fabric name in CONFIGS
+_RESCAN_FABRIC = {
+    (True, True): "acq_imu_both",
+    (True, False): "acq_imu_port_a",
+    (False, True): "acq_imu_port_b",
+    (False, False): "acquisition",
+}
+# Channel-enable bits with no LVDS pair behind them on each IMU fabric (the
+# freed CIPO1 lanes: A.CIPO1 = bits 2|3, B.CIPO1 = bits 6|7). Detection scoring
+# should never pass threshold on a tied-off input, but if it ever does, rescan
+# CORRECTS the applied mask (a phantom lane would stream garbage words forever)
+# and says so.
+_RESCAN_FREED_MASK = {
+    "acq_imu_both": 0xCC, "acq_imu_port_a": 0x0C, "acq_imu_port_b": 0xC0,
+    "acquisition": 0x00,
+}
+
+def rescan(sock, with_chip_detect=True):
+    """Work out what is plugged into each headstage port and load the matching
+    fabric: scan-fabric IMU census -> set_config the right acq variant -> full
+    phase-sweep chip detection (phases + channel mask) on the result. Returns
+    {'imu_a','imu_b','fabric','detection'} or None on abort; the board is left
+    on whatever fabric was loaded last (check pl_status)."""
+    pl = pl_status(sock, verbose=False)
+    if pl is None:
+        print("[RESCAN] aborted -- no PL_STATUS reply (firmware without the "
+              "config-swap loader?)")
+        return None
+    print(f"[RESCAN] starting from fabric '{pl['name']}'")
+
+    # set_config refuses while streaming, so stop first -- but ONLY on an
+    # acquisition fabric. A blank or scan PL refuses every command outside the
+    # fabric-swap allow-list, so an unconditional stop prints a bare "Command
+    # failed (status: 0x15)" before rescan has done anything, which reads like
+    # a fault when it is just a command that does not apply yet.
+    if pl['is_acq']:
+        send_binary_command(sock, CMD_STOP)
+        time.sleep(0.05)
+
+    # Census on acq_imu_both: it is the only fabric with I2C on BOTH ports, so
+    # it is the only one that can see a headstage on either. It is also an
+    # ACQUISITION fabric with the UART routed, so unlike the retired scan fabric
+    # the console stays alive here -- and when the answer turns out to be "both
+    # ports", we are already on the right fabric and skip a second PCAP load.
+    print(f"[RESCAN] 1/3 IMU census on '{CENSUS_FABRIC}' ...")
+    r = set_config(sock, CENSUS_FABRIC)
+    if not r or r["rc"] != 0:
+        print(f"[RESCAN] aborted -- could not load '{CENSUS_FABRIC}'")
+        return None
+    imu = detect_imu(sock)
+    if imu is None:
+        print(f"[RESCAN] aborted -- detect_imu refused on '{CENSUS_FABRIC}' (bug?)")
+        return None
+    imu_a, imu_b = imu['A']['present'], imu['B']['present']
+
+    target = _RESCAN_FABRIC[(imu_a, imu_b)]
+    census = f"A={'yes' if imu_a else 'no'} B={'yes' if imu_b else 'no'}"
+    if target == CENSUS_FABRIC:
+        # Already here -- the census fabric IS the answer, so skip a PCAP load.
+        print(f"[RESCAN] 2/3 IMU: {census} -> '{target}' already loaded")
+        r = {"rc": 0}
+    else:
+        print(f"[RESCAN] 2/3 IMU: {census} -> loading '{target}' ...")
+        r = set_config(sock, target)
+    if not r or r["rc"] != 0:
+        print(f"[RESCAN] aborted -- could not load '{target}'; the board is "
+              f"still on 'scan' (pl_status to confirm)")
+        return None
+
+    detection = None
+    if with_chip_detect:
+        print("[RESCAN] 3/3 chip detection (phase sweep) ...")
+        detection = run_detection(sock, verbose=False)
+        freed = _RESCAN_FREED_MASK[target]
+        # What the BOARD is actually left holding, which is not the same as what
+        # detection returned. The sweep unconditionally programs
+        # DETECTION_CHANNEL_ENABLE (0xFF) to score all four lanes, and only
+        # applies a narrowed mask when it SUCCEEDS. So a failed sweep -- chips
+        # unseated, say -- leaves 0xFF on an IMU fabric, i.e. every freed CIPO1
+        # lane enabled with no LVDS pair behind it. That is exactly the phantom
+        # lane this correction exists to prevent, so it must run whether or not
+        # detection succeeded.
+        on_board = (detection.optimal_channel_mask if detection.success
+                    else DETECTION_CHANNEL_ENABLE)
+        if on_board & freed:
+            fixed = on_board & ~freed
+            why = "detected" if detection.success else "left by the sweep"
+            print(f"[RESCAN] correcting mask 0x{on_board:02X} -> 0x{fixed:02X} "
+                  f"({why}): bits 0x{on_board & freed:02X} have no LVDS pair on "
+                  f"'{target}' (freed for the IMU I2C)")
+            # Latches only while stopped; apply_config already stopped us, and on
+            # the failure path the sweep never started streaming.
+            send_binary_command(sock, CMD_SET_CHANNEL_ENABLE, fixed)
+            validator.set_channel_enable(fixed)
+            if fixed == 0:
+                print("[RESCAN] no real lanes remain -- reseat the headstage, "
+                      "then rescan (phases left as-is)")
+            detection.optimal_channel_mask = fixed
+    else:
+        print("[RESCAN] 3/3 chip detection skipped (with_chip_detect=False)")
+
+    print(f"[RESCAN] done: fabric '{target}', IMU A={'Y' if imu_a else 'n'} "
+          f"B={'Y' if imu_b else 'n'}"
+          + (f", {detection.get_channel_summary()}" if detection else ""))
+    if imu_a or imu_b:
+        spec = 'both' if (imu_a and imu_b) else ('a' if imu_a else 'b')
+        print(f"[RESCAN] IMU ready: `imu_stream {spec}` (before `start`), "
+              f"then `imu_recv` / `imu_csv`")
+    return {"imu_a": imu_a, "imu_b": imu_b, "fabric": target,
+            "detection": detection}
+
+def print_command_help():
+    """The single command menu -- printed at connect AND by the `help` command,
+    so the two can't drift. (The `help` command used to be a separate stale copy
+    missing stim / IMU / PL / set_config.)"""
+    print("\n[TCP] Available commands:")
+    print("  Basic: start, stop, reset_timestamp, loop <count>")
+    print("  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
+    print("  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
+    print("  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
+    print("  Debug: dump_bram [start] [count], stats, hex")
+    print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], lfp_sink  (UDP_PORT, stream_type=2)")
+    print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
+    print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
+    print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
+    print("       imu_read [a|b]  (one NDOF sample: quat/accel/gyro/calib -- not while streaming)")
+    print("       imu_stream [a|b|both|off] [period_ms]  (continuous 100 Hz stream_type=3; start BEFORE 'start')")
+    print("       imu_recv [n]  (print live samples)   imu_csv [file|stop]  (record to CSV)")
+    print("  I2C: i2c_scan [a|b]  (bus ACK map 0x08-0x77)   eeprom_read [a|b] [dev=0x50] [off=0] [len=32] [width=1]")
+    print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
+    print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
+    print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
+    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
+    print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
+    print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
+    print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
+    print("          (stim_arm = fire playback from a digital-in line: edge=once per trigger edge, gate=play while asserted; pol 0=rising/high, 1=falling/low)")
+    print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
+    print("  auto_cable_detect - Automated cable detection!")
+    print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
+    print("       read_reg <r>, write_reg <r> <v>, aux_selftest")
+    print("       fast_settle <0|1> [dsp] | gpio <pin> | off")
+    print("       digout <0|1> | gpio <pin> | hiz")
+    print("  Utility: help, quit")
 
 # Unified port: the LFP band now arrives on UDP_PORT mixed with broadband,
 # demuxed by stream_type=2. The persistent UnifiedSink (created in __main__)
@@ -1421,7 +2073,7 @@ def verify_debug_sine(sock, channel_enable=0xFF, n_packets=300):
     # Read the BRAM write pointer after stop so the analysis can give absolute
     # BRAM addresses for corrupted samples (for dump_bram correlation). NOTE: the
     # PL usually writes a few packets between the last UDP packet this host got
-    # and the stop, so treat the absolute address as the centre of a small window.
+    # and the stop, so treat the absolute address as the center of a small window.
     wrptr = None
     st = get_status(sock)
     if st is not None:
@@ -1459,6 +2111,12 @@ class UnifiedSink:
         self._lfp_gaps = 0
         self.lfp_pkts = 0
         self.lfp_bytes = 0
+        # IMU fan-out (stream_type=3): same inline pub/sub shape as LFP, with
+        # SEQ continuity tracked PER PORT (each port is its own stream).
+        self._imu_subs = []
+        self._imu_last_seq = [None, None]
+        self._imu_gaps = [0, 0]
+        self.imu_pkts = 0
         self.bb_pkts = 0
         self.other_pkts = 0
         self.last_addr = None
@@ -1532,7 +2190,8 @@ class UnifiedSink:
             if struct.unpack_from('<I', mv, 0)[0] != UNIFIED_MAGIC:
                 self.other_pkts += 1
                 continue
-            stream_type = struct.unpack_from('<I', mv, 4)[0] & 0xFF
+            type_ver = struct.unpack_from('<I', mv, 4)[0]
+            stream_type = type_ver & 0xFF
             if stream_type == STREAM_TYPE_BROADBAND:
                 # validate_packet returns the timestamp for a good broadband
                 # packet, None otherwise.
@@ -1555,6 +2214,19 @@ class UnifiedSink:
                 self._lfp_last_seq = seq
                 if self._lfp_subs:          # empty unless lfp_recv/lfp_sink is running
                     self._fanout_lfp(bytes(mv))
+            elif stream_type == STREAM_TYPE_IMU:
+                # 100 Hz worst case, but it rides the broadband thread, so the
+                # same discipline as LFP: count + per-port SEQ check in place,
+                # copy only when a subscriber (imu_recv / imu_csv) exists.
+                self.imu_pkts += 1
+                p = (type_ver >> 16) & 1
+                seq = struct.unpack_from('<I', mv, 16)[0]      # header word 4
+                if self._imu_last_seq[p] is not None and \
+                        seq != (self._imu_last_seq[p] + 1) & 0xFFFFFFFF:
+                    self._imu_gaps[p] += 1
+                self._imu_last_seq[p] = seq
+                if self._imu_subs:
+                    self._fanout_imu(bytes(mv))
             else:
                 self.other_pkts += 1
 
@@ -1579,6 +2251,26 @@ class UnifiedSink:
         with self._lock:
             if q in self._lfp_subs:
                 self._lfp_subs.remove(q)
+
+    def _fanout_imu(self, data):
+        with self._lock:
+            subs = list(self._imu_subs)
+        for q in subs:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+    def subscribe_imu(self, maxsize=20000):
+        q = queue.Queue(maxsize=maxsize)
+        with self._lock:
+            self._imu_subs.append(q)
+        return q
+
+    def unsubscribe_imu(self, q):
+        with self._lock:
+            if q in self._imu_subs:
+                self._imu_subs.remove(q)
 
     def stop(self):
         self._running = False
@@ -2321,8 +3013,12 @@ def get_status(sock):
 
     return status
 
-def print_status(status):
-    """Pretty print status information"""
+def print_status(status, sock=None):
+    """Print the full device status. `sock` is optional: with it, the dump also
+    reports which PL fabric is loaded and the IMU stream state, neither of which
+    lives in the status struct -- the fabric is firmware state (CMD_PL_STATUS)
+    and the IMU state is the stream engine's (CMD_IMU_STREAM query). Without a
+    socket the dump is exactly what it always was."""
     if not status:
         return
     
@@ -2333,6 +3029,16 @@ def print_status(status):
     print(f"Device Type: 0x{status['device_type']:04X}")
     print(f"Firmware: v{fw_str}")
     print(f"Protocol Version: {status['version']}")
+    if sock is not None:
+        # Which fabric is loaded is NOT in the status struct -- it is firmware
+        # state, readable in any PL state, so it needs its own query. Worth
+        # showing here because almost every "why is this not working" answer
+        # starts with which fabric is live.
+        pl = pl_status(sock, verbose=False)
+        if pl:
+            print(f"PL fabric: {pl['name']} (config={pl['config']}, "
+                  f"{'acquisition' if pl['is_acq'] else 'non-acq'}, "
+                  f"link {'UP' if pl['link_up'] else 'DOWN'})")
     
     print("\n--- PL Hardware ---")
     print(f"Timestamp: {status['timestamp']}")
@@ -2436,6 +3142,31 @@ def print_status(status):
           f"(-> {30000.0/R:.0f} sps)  num_taps={status['lfp_num_taps']}")
     print(f"  packets sent: {status['lfp_packets_sent']}   "
           f"overrun: {'YES' if status['lfp_overrun'] else 'no'}")
+
+    if sock is not None:
+        # IMU side channel. Board-side state comes from the stream engine (a
+        # report-only query, so this cannot disturb a running stream); the
+        # received counts come from our own sink, because the board counts what
+        # it SENT and the host counts what ARRIVED -- and the difference is
+        # exactly what a loss investigation needs.
+        print(f"\n--- IMU (BNO055, UDP {UDP_PORT} stream_type=3) ---")
+        q = imu_stream_query(sock)
+        if q is None:
+            print("  state unavailable (firmware without the IMU stream, or a "
+                  "fabric that refuses the command)")
+        elif q['active'] == 0:
+            print("  streaming: OFF   (imu_stream a|b|both to start -- before 'start')")
+        else:
+            names = {1: 'A', 2: 'B', 3: 'A+B'}
+            hz = 1000.0 / max(q['period_ms'], 1)
+            print(f"  streaming: {names.get(q['active'], q['active'])} "
+                  f"@ {hz:.0f} Hz (period {q['period_ms']} ms)")
+        if UNIFIED_SINK is not None:
+            ga, gb = UNIFIED_SINK._imu_gaps
+            print(f"  received here: {UNIFIED_SINK.imu_pkts} pkts   "
+                  f"SEQ gaps A={ga} B={gb}"
+                  + ("   (gaps are lost samples -- board never retries a send)"
+                     if (ga or gb) else ""))
 
     # Analytic chirp NCO config
     f_hi = (status['chirp_fspan'] << CHIRP_FSPAN_SHIFT) / (1 << CHIRP_PHW) * PACKET_RATE_HZ
@@ -2856,32 +3587,6 @@ def run_detection(sock, verbose=True):
         validator.last_seq = None
 
 
-def print_command_help():
-    """The single command menu -- printed at connect AND by the `help` command,
-    so the two can't drift. (The `help` command used to be a separate stale copy
-    that had fallen behind -- e.g. missing the stim section.)"""
-    print("\n[TCP] Available commands:")
-    print("  Basic: start, stop, reset_timestamp, loop <count>")
-    print("  COPI: convert, init, cable_test, full_cable_test, manual_cable_test")
-    print("  Config: set_phase <p0> <p1> [p2 p3], set_debug <0|1>, set_channels <0x00-0xFF>")
-    print("  Network: set_udp <ip> <port>, get_status, perf_reset, ping")
-    print("  Debug: dump_bram [start] [count], stats, hex")
-    print("  LFP: lfp_config [linear|minimum] [taps], lfp_on, lfp_off, lfp_recv [n], sink  (UDP_PORT, stream_type=2)")
-    print("         verify_sine [ce=FF] [n=300] - check debug sinewaves vs RTL ref")
-    print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
-    print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
-    print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")
-    print("        stim_start [cont], stim_stop, stim_trigger, stim_zero, stim_powerdown")
-    print("        stim_rate <k>, stim_arm <line> <edge|gate> [pol] [minpulse_us] [retrig], stim_disarm")
-    print("          (stim_arm = fire playback from a digital-in line: edge=once per trigger edge, gate=play while asserted; pol 0=rising/high, 1=falling/low)")
-    print("  LFP sweep: lfp_sweep [f_max=1490] [period=2.0] [n_periods=2]  (measure anti-alias |H(f)|)")
-    print("  auto_cable_detect - Automated cable detection!")
-    print("  Aux: aux_demo, aux_bank <slot> <bank>, aux")
-    print("       read_reg <r>, write_reg <r> <v>, aux_selftest")
-    print("       fast_settle <0|1> [dsp] | gpio <pin> | off")
-    print("       digout <0|1> | gpio <pin> | hiz")
-    print("  Utility: help, quit")
-
 def configure_tcp_keepalive(sock):
     """Enable TCP keepalive to detect dead connections faster.
 
@@ -3011,18 +3716,32 @@ def tcp_control():
             print(f"[TCP] Failed to configure UDP destination")
             print(f"[TCP] Device may still be sending to default: 192.168.18.100:{UDP_PORT}")
         
-        # Get and display initial status
-        print("\n[TCP] Getting initial device status...")
-        status = get_status(sock)
-        if status:
-            print_status(status)
-            validator.set_channel_enable(status['channel_enable'])
-        
+        # Which PL fabric is loaded? Query this FIRST -- it works in any state
+        # (blank / scan / acquisition), so a deferred-boot board, or one left in the
+        # detect fabric after a host drop, is understood before we try the
+        # acquisition-only status (which would time out on a non-acq fabric).
+        print("\n[TCP] Checking loaded PL fabric...")
+        pl = pl_status(sock)
+        if pl is None or pl['is_acq']:
+            # Acquisition fabric (or older firmware without PL_STATUS): show status.
+            print("[TCP] Getting initial device status...")
+            status = get_status(sock)
+            if status:
+                print_status(status, sock)
+                validator.set_channel_enable(status['channel_enable'])
+        else:
+            print(f"[TCP] Board is on the '{pl['name']}' fabric (not acquisition). "
+                  f"Run `set_config acquisition` (or rescan) before streaming.")
+
         print_command_help()
         
         while True:
             try:
-                cmd = input("\n[TCP] Command: ").strip().lower()
+                raw_cmd = input("\n[TCP] Command: ").strip()
+                # Commands are case-insensitive, but ARGUMENTS may not be:
+                # imu_csv takes a filesystem path, and lowercasing it silently
+                # retargets the write (or fails outright on a case-sensitive FS).
+                cmd = raw_cmd.lower()
 
                 if cmd == "quit":
                     break
@@ -3050,10 +3769,53 @@ def tcp_control():
                 elif cmd == "get_status":
                     status = get_status(sock)
                     if status:
-                        print_status(status)
+                        print_status(status, sock)
                 elif cmd == "perf_reset":
                     ok, _ = send_binary_command(sock, CMD_PERF_RESET)
                     print("[PERF] window reset" if ok else "[PERF] reset failed")
+                elif cmd == "detect_imu":
+                    detect_imu(sock)
+                elif cmd == "imu_read" or cmd.startswith("imu_read "):
+                    parts = cmd.split()
+                    imu_read(sock, parts[1] if len(parts) > 1 else 'a')
+                elif cmd == "i2c_scan" or cmd.startswith("i2c_scan "):
+                    parts = cmd.split()
+                    i2c_scan(sock, parts[1] if len(parts) > 1 else 'a')
+                elif cmd.startswith("eeprom_read"):
+                    parts = cmd.split()
+                    eeprom_read(sock,
+                                parts[1] if len(parts) > 1 else 'a',
+                                int(parts[2], 0) if len(parts) > 2 else 0x50,
+                                int(parts[3], 0) if len(parts) > 3 else 0,
+                                int(parts[4], 0) if len(parts) > 4 else 32,
+                                int(parts[5], 0) if len(parts) > 5 else 1)
+                elif cmd == "imu_stream" or cmd.startswith("imu_stream "):
+                    parts = cmd.split()
+                    imu_stream(sock, parts[1] if len(parts) > 1 else 'both',
+                               int(parts[2]) if len(parts) > 2 else 0)
+                elif cmd == "imu_recv" or cmd.startswith("imu_recv "):
+                    parts = cmd.split()
+                    imu_recv(int(parts[1]) if len(parts) > 1 else 20)
+                elif cmd.startswith("imu_csv"):
+                    parts = cmd.split()
+                    raw_parts = raw_cmd.split()
+                    if len(parts) > 1 and parts[1] == "stop":
+                        imu_csv_stop()
+                    else:
+                        imu_csv_start(raw_parts[1] if len(raw_parts) > 1
+                                      else "imu_data.csv")
+                elif cmd == "rescan" or cmd.startswith("rescan "):
+                    # "rescan noapply" = fabric selection only, skip the phase
+                    # sweep (leaves phases/mask untouched).
+                    rescan(sock, with_chip_detect=("noapply" not in cmd.split()[1:]))
+                elif cmd == "set_config" or cmd.startswith("set_config "):
+                    parts = cmd.split()
+                    if len(parts) > 1:
+                        set_config(sock, parts[1])
+                    else:
+                        print(f"usage: set_config <{'|'.join(CONFIGS)}>  (only when not streaming)")
+                elif cmd == "pl_status":
+                    pl_status(sock)
                 elif cmd == "stim_status":
                     print_stim_status(stim_get_status(sock))
                 elif cmd.startswith("stim_gaussian"):
@@ -3280,7 +4042,9 @@ def tcp_control():
                               f"broadband={UNIFIED_SINK.bb_pkts} LFP={UNIFIED_SINK.lfp_pkts} "
                               f"other={UNIFIED_SINK.other_pkts} pkts, "
                               f"LFP={UNIFIED_SINK.lfp_bytes/1024.0:.0f} KB, "
-                              f"bb_seq_gaps={validator.seq_gaps} lfp_seq_gaps={UNIFIED_SINK._lfp_gaps}, "
+                              f"IMU={UNIFIED_SINK.imu_pkts} pkts, "
+                              f"bb_seq_gaps={validator.seq_gaps} lfp_seq_gaps={UNIFIED_SINK._lfp_gaps} "
+                              f"imu_seq_gaps=A:{UNIFIED_SINK._imu_gaps[0]}/B:{UNIFIED_SINK._imu_gaps[1]}, "
                               f"host-ring-drops={UNIFIED_SINK._ring_drops}, last from {UNIFIED_SINK.last_addr}")
                     else:
                         print("[UDP-SINK] not running")
@@ -3365,6 +4129,12 @@ def tcp_control():
                 # Re-enable TCP keepalive on reconnection
                 configure_tcp_keepalive(sock)
                 print(f"[TCP] Reconnected successfully!")
+                # Re-check the loaded fabric: the board may have been left in the
+                # detect fabric (mid-rescan) when the link dropped. Works in any state.
+                pl = pl_status(sock)
+                if pl and not pl['is_acq']:
+                    print(f"[TCP] Board is on the '{pl['name']}' fabric (not acquisition). "
+                          f"Run `set_config acquisition` (or rescan) before streaming.")
                 
     except ConnectionRefusedError:
         print(f"[TCP] Could not connect to {ZYNQ_IP}:{TCP_PORT}")
@@ -3454,6 +4224,11 @@ if __name__ == "__main__":
 
     tcp_control()
 
+    # Close out any recording first: the worker is a daemon thread, so without
+    # this the interpreter exits and whatever it had buffered is lost.
+    if _IMU_CSV['thread'] is not None:
+        imu_csv_stop()
+
     # Shutdown summary: the broadband no-loss assertion (gap count MUST be 0).
     if UNIFIED_SINK is not None:
         UNIFIED_SINK.stop()
@@ -3464,5 +4239,8 @@ if __name__ == "__main__":
               f"({validator.seq_lost_packets} packets implied missing)  "
               f"{'OK (no loss)' if validator.seq_gaps == 0 else 'LOSS DETECTED'}")
         print(f"[UDP] LFP SEQ gaps = {UNIFIED_SINK._lfp_gaps}")
+        if UNIFIED_SINK.imu_pkts:
+            print(f"[UDP] IMU: {UNIFIED_SINK.imu_pkts} pkts, SEQ gaps "
+                  f"A={UNIFIED_SINK._imu_gaps[0]} B={UNIFIED_SINK._imu_gaps[1]}")
     validator.print_statistics()
     time.sleep(0.5)

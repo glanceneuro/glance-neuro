@@ -1,0 +1,9 @@
+//arch = zynq; split = false; format = BIN
+// Deferred-load BOOT: FSBL + orchestrator app, NO bitstream. The PL is left
+// blank at boot (pins Hi-Z, safe); the app loads a fabric from SD via PCAP after
+// the network is up. See docs/deferred-boot.md.
+the_ROM_image:
+{
+	[bootloader]./vitis_detect/detect-platform/export/detect-platform/sw/boot/fsbl.elf
+	./vitis_detect/klab-detect/build/klab-detect.elf
+}
