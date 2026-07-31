@@ -350,6 +350,8 @@ uint32_t pl_imu_stream_set(uint32_t mask, uint32_t period_ms)
             p->tick_count = 0;
             p->burst_idx = 0;
             p->in_flight = 0;
+            p->await_count = 0;
+            p->await_idle = 0;
             p->hk_due = 1;                    // first tick fetches temp/calib
             p->calib_stat = 0xFF;
             p->temp_c = 0;
@@ -374,6 +376,8 @@ void pl_imu_stream_stop_all(void)
         if (p->running && p->in_flight) XIic_DynInit(p->base);
         p->running = 0;
         p->in_flight = 0;
+        p->await_count = 0;
+        p->await_idle = 0;
     }
 }
 

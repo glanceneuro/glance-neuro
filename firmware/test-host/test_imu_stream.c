@@ -306,6 +306,59 @@ static void test_service_gap(void)
     pl_imu_stream_set(0, 0);
 }
 
+static void test_lifecycle(void)
+{
+    printf("lifecycle: fabric-swap stop then restart, and adding a port live\n");
+    mock_reset();
+    pl_imu_stream_set(1, 10);
+    run_ms(50);
+    int first_run = mock_n_pkts;
+    CHECK(first_run > 3, "no packets in the first run");
+    uint32_t last_seq = pkt_word(first_run - 1, 4);
+
+    // What set_config does when the fabric (and its IICs) are torn down.
+    pl_imu_stream_stop_all();
+    run_ms(30);
+    CHECK(mock_n_pkts == first_run, "sent packets after the fabric went away");
+
+    // Restart on the new fabric: SEQ must restart at 0, so the host's loss
+    // check sees a stream restart (backward jump) rather than a huge gap.
+    pl_imu_stream_set(1, 10);
+    run_ms(50);
+    CHECK(mock_n_pkts > first_run + 3, "did not resume after restart");
+    CHECK(pkt_word(first_run, 4) == 0,
+          "SEQ did not restart at 0 (got %u after %u)",
+          pkt_word(first_run, 4), last_seq);
+    CHECK(mock_bad_sequence == 0, "ordering broke across the restart");
+
+    // Adding port B while A streams must not disturb A: its SEQ keeps
+    // counting, and only B starts from 0. (The plugin and net.py both do this
+    // when a second headstage appears.)
+    pl_imu_stream_set(0, 0);      // firmware state persists across mock_reset()
+    mock_reset();
+    pl_imu_stream_set(1, 10);
+    run_ms(50);
+    int before_b = mock_n_pkts;
+    uint32_t seq_a_before = pkt_word(before_b - 1, 4);
+    int a_arms_before = mock_ndof_calls[0];
+    CHECK(pl_imu_stream_set(3, 10) == 3, "port B did not join");
+    CHECK(mock_ndof_calls[0] == a_arms_before,
+          "port A was re-armed when B joined (NDOF re-entered, losing fusion state)");
+    CHECK(mock_ndof_calls[1] == 1, "port B was not armed exactly once");
+    run_ms(50);
+    uint32_t seq_a = seq_a_before, seq_b = 0;
+    int b_seen = 0, a_ok = 1, b_ok = 1;
+    for (int n = before_b; n < mock_n_pkts; n++) {
+        int port = (pkt_word(n, 1) >> 16) & 1;
+        if (port == 0) { if (pkt_word(n, 4) != ++seq_a) a_ok = 0; }
+        else { if (pkt_word(n, 4) != seq_b++) b_ok = 0; b_seen++; }
+    }
+    CHECK(a_ok, "port A's SEQ was disturbed when B joined");
+    CHECK(b_ok, "port B's SEQ did not start clean");
+    CHECK(b_seen > 3, "port B produced almost nothing (%d)", b_seen);
+    pl_imu_stream_set(0, 0);
+}
+
 static void test_period_clamp(void)
 {
     printf("period_clamp: out-of-range periods clamp to [10,1000]\n");
@@ -360,6 +413,7 @@ int main(void)
     test_stop_all_mid_flight();
     test_bus_ordering();
     test_service_gap();
+    test_lifecycle();
     test_period_clamp();
     const char *dump = getenv("IMU_TEST_DUMP");
     if (dump) dump_packets(dump);

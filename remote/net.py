@@ -467,12 +467,20 @@ def imu_csv_start(path):
     if UNIFIED_SINK is None:
         print("[IMU] unified sink not running")
         return
+    # Open here, not in the worker: a bad path must fail in front of the user
+    # rather than killing a background thread that leaves the recorder looking
+    # busy forever.
+    try:
+        f = open(path, 'w')
+    except OSError as e:
+        print(f"[IMU] cannot record to {path}: {e}")
+        return
     stop = threading.Event()
     q = UNIFIED_SINK.subscribe_imu()
 
     def worker():
         n = 0
-        with open(path, 'w') as f:
+        try:
             f.write("host_time,port,seq,timestamp,qw,qx,qy,qz,"
                     "ax,ay,az,gx,gy,gz,calib,temp_c,iic_errors,send_drops\n")
             while not stop.is_set():
@@ -491,7 +499,14 @@ def imu_csv_start(path):
                         f"{pkt['iic_errors']},{pkt['send_drops']}\n")
                 n += 1
                 _IMU_CSV['rows'] = n
-        UNIFIED_SINK.unsubscribe_imu(q)
+        except Exception as e:                      # disk full, etc.
+            print(f"\n[IMU] recording stopped after {n} rows: {e}")
+        finally:
+            # Always drop the subscription and close, or the sink keeps feeding
+            # a queue nobody drains and the file is left open.
+            UNIFIED_SINK.unsubscribe_imu(q)
+            f.close()
+            _IMU_CSV['thread'] = None
 
     t = threading.Thread(target=worker, name="imu-csv", daemon=True)
     _IMU_CSV.update(thread=t, stop=stop, path=path, rows=0)
@@ -499,11 +514,12 @@ def imu_csv_start(path):
     print(f"[IMU] recording to {path} (imu_csv stop to finish)")
 
 def imu_csv_stop():
-    if _IMU_CSV['thread'] is None:
+    t = _IMU_CSV['thread']
+    if t is None:
         print("[IMU] not recording")
         return
     _IMU_CSV['stop'].set()
-    _IMU_CSV['thread'].join(timeout=2.0)
+    t.join(timeout=2.0)
     print(f"[IMU] recorded {_IMU_CSV['rows']} samples to {_IMU_CSV['path']}")
     _IMU_CSV.update(thread=None, stop=None, path=None)
 
