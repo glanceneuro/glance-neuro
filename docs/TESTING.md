@@ -70,6 +70,28 @@ A clean suite is **3 testbenches, 0 errors**.
 The shipped LFP **coefficients (`*_coefs.hex`) are tracked** — they are the filter that ships
 in the bitstream — and `design_lfp_filters.py` regenerates them along with `lfp_coef_pkg.sv`.
 
+## Firmware/host logic tests (no board, no Xilinx tools)
+
+```bash
+bash firmware/test-host/run_imu_stream_test.sh   # IMU state machine (C, simulated I2C)
+python3 remote/test_imu_host.py                  # firmware<->net.py wire contract + sink
+python3 remote/test_rescan.py                    # rescan orchestration + I2C decoders
+```
+
+Each prints `TB_PASS  Errors: 0`. These cover the parts of the IMU/rescan work that are
+decidable in logic rather than on silicon, so a regression surfaces in seconds instead of
+at the bench:
+
+| Test | Guards |
+|---|---|
+| `firmware/test-host/` | The **non-blocking IMU state machine** compiled on the host against a register-accurate simulated AXI IIC core + BNO055: tick cadence, packet layout, per-port SEQ, NACK / wedged-bus recovery, auto-stop after 16 consecutive errors, dual-port independence, per-port fabric gating, send-drop accounting, teardown mid-transfer, period clamping. The mock also asserts the command-FIFO traffic is exactly the canonical combined write-then-read — the one thing silicon must still confirm is that the IIC core accepts it |
+| `remote/test_imu_host.py` | The **wire contract between firmware and `net.py`**: datagrams the simulated firmware actually emitted are parsed field-for-field by `parse_imu_packet`. Two independent implementations of `docs/protocol.md`, so drift fails here. Plus a loopback-UDP `UnifiedSink` demux / fan-out / per-port SEQ-gap test |
+| `remote/test_rescan.py` | **`rescan` decision logic** against a simulated board: fabric selection for all four headstage populations, the scan-then-target config order, and the freed-CIPO lane correction (a mask bit with no LVDS pair behind it must never reach the board). Plus `i2c_scan` / `eeprom_read` decoding, including the wedged-bus report |
+
+The plugin repo's `test/run_imu_decode_test.sh` closes the same loop for the **third**
+consumer: it runs `firmware/test-host` here to emit datagrams and decodes them with the
+plugin's own offsets and scale factors.
+
 ## check-dma guardrail (`.claude/skills/check-dma/`)
 
 Scans for the anti-pattern where a PL→PS bulk-data path loops the CPU over BRAM or the

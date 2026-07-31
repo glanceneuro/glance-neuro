@@ -13,6 +13,12 @@ sender-bound run (harness artifact) can't be mistaken for a receiver-bound one
   python3 netperf_loopback.py            # open-loop: blast max, read net.py's ceiling
   python3 netperf_loopback.py 30 6 154   # paced 30k for 6s, 154-word packets
   python3 netperf_loopback.py max 6 154  # explicit open-loop
+  python3 netperf_loopback.py 30 6 154 10 300   # + LFP mix + IMU mix (both ports)
+
+The 5th argument mixes in stream_type=4 IMU datagrams (300 == the real 100 Hz
+vs 30 kHz ratio). Use it to confirm the IMU side channel costs the broadband
+drain nothing -- CLAUDE.md rule 4 is about the receive path, and the IMU demux
+branch lives on it.
 
 Interpretation:
   * sent < 30k                  -> SENDER-bound (this box can't even generate 30k
@@ -26,7 +32,8 @@ import importlib.util, struct, socket, time, os, contextlib, multiprocessing, sy
 
 PORT = 15055
 
-def blaster(port, words, target_pps, seconds, counter, lfp_every=0, lfp_words=142):
+def blaster(port, words, target_pps, seconds, counter, lfp_every=0, lfp_words=142,
+            imu_every=0):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 << 20)
     pkt = bytearray(words * 4)
@@ -37,8 +44,13 @@ def blaster(port, words, target_pps, seconds, counter, lfp_every=0, lfp_words=14
     lpkt = bytearray(lfp_words * 4)
     struct.pack_into('<I', lpkt, 0, 0xCAFEBABE)
     struct.pack_into('<I', lpkt, 4, 0x00000102)    # stream_type = 2 (LFP)
+    # IMU datagrams (13 words) alternating ports, as the board interleaves them.
+    ipkt = bytearray(13 * 4)
+    struct.pack_into('<I', ipkt, 0, 0xCAFEBABE)
+    struct.pack_into('<I', ipkt, 4, 0x00000104)    # stream_type = 4 (IMU), port A
     sendto = s.sendto; pack_into = struct.pack_into
     dest = ('127.0.0.1', port); seq = 0; sent = 0; lseq = 0
+    iseq = [0, 0]
     end = time.perf_counter() + seconds
     open_loop = target_pps <= 0
     if open_loop:
@@ -48,6 +60,16 @@ def blaster(port, words, target_pps, seconds, counter, lfp_every=0, lfp_words=14
                 seq = (seq + 1) & 0xFFFFFFFF
                 pack_into('<I', pkt, 16, seq)      # SEQ at word 4
                 sendto(pkt, dest)
+                if lfp_every and seq % lfp_every == 0:
+                    lseq = (lseq + 1) & 0xFFFFFFFF
+                    pack_into('<I', lpkt, 16, lseq)
+                    sendto(lpkt, dest)
+                if imu_every and seq % imu_every == 0:
+                    port = (seq // imu_every) & 1
+                    iseq[port] = (iseq[port] + 1) & 0xFFFFFFFF
+                    pack_into('<I', ipkt, 4, 0x00000104 | (port << 16))
+                    pack_into('<I', ipkt, 16, iseq[port])
+                    sendto(ipkt, dest)
             sent += 512
             counter.value = sent
     else:
@@ -64,6 +86,12 @@ def blaster(port, words, target_pps, seconds, counter, lfp_every=0, lfp_words=14
                     lseq = (lseq + 1) & 0xFFFFFFFF
                     pack_into('<I', lpkt, 16, lseq)
                     sendto(lpkt, dest)
+                if imu_every and seq % imu_every == 0:
+                    port = (seq // imu_every) & 1
+                    iseq[port] = (iseq[port] + 1) & 0xFFFFFFFF
+                    pack_into('<I', ipkt, 4, 0x00000104 | (port << 16))
+                    pack_into('<I', ipkt, 16, iseq[port])
+                    sendto(ipkt, dest)
             sent += per_slice
             counter.value = sent
             while time.perf_counter() < deadline:
@@ -82,6 +110,9 @@ def main():
     # 4th arg: broadband packets per LFP frame. 10 == the real 30k/3k mix,
     # 0 == broadband only.
     lfp_every   = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    # 5th arg: broadband packets per IMU datagram. 300 == the real 30k/100 Hz
+    # mix (both ports interleaved), 0 == no IMU.
+    imu_every   = int(sys.argv[5]) if len(sys.argv) > 5 else 0
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location('netmod', os.path.join(here, 'net.py'))
     m = importlib.util.module_from_spec(spec)
@@ -95,21 +126,23 @@ def main():
     counter = multiprocessing.Value('q', 0, lock=False)
     p = multiprocessing.Process(target=blaster,
                                 args=(PORT, words, int(target_kpps * 1000), seconds,
-                                      counter, lfp_every),
+                                      counter, lfp_every, 142, imu_every),
                                 daemon=True)
     p.start(); time.sleep(1.0)                       # warm-up
     s0, c0, g0, t0 = counter.value, m.validator.packet_count, m.validator.seq_gaps, time.perf_counter()
-    l0 = sink.lfp_pkts
+    l0, i0 = sink.lfp_pkts, sink.imu_pkts
     time.sleep(max(1.0, seconds - 2.0))
     s1, c1, g1, t1 = counter.value, m.validator.packet_count, m.validator.seq_gaps, time.perf_counter()
-    l1 = sink.lfp_pkts
+    l1, i1 = sink.lfp_pkts, sink.imu_pkts
     p.join(); sink.stop()
     dt = t1 - t0
     sent_rate = (s1 - s0) / dt / 1000
     drain_rate = (c1 - c0) / dt / 1000
     lfp_rate = (l1 - l0) / dt / 1000
+    imu_rate = (i1 - i0) / dt / 1000
     mode = 'open-loop' if target_kpps == 0 else f'paced {target_kpps:.0f}k'
     mode += ' +LFP' if lfp_every else ' broadband-only'
+    mode += ' +IMU' if imu_every else ''
     if lfp_every:
         # The per-30000 [INFO] lines above come from net.py's broadband validator
         # and count broadband ONLY -- LFP frames are demuxed to a separate
@@ -120,6 +153,11 @@ def main():
               f"= {drain_rate + lfp_rate:.1f}k/s total.")
         print(f"        (the [INFO] Rate: lines above are BROADBAND ONLY -- "
               f"{drain_rate:.1f}k is the expected reading, not {drain_rate + lfp_rate:.1f}k)")
+    if imu_every:
+        gaps_a, gaps_b = sink._imu_gaps
+        print(f"  [imu] 1 IMU datagram per {imu_every} broadband (52 B, ports "
+              f"alternating). Drained {imu_rate * 1000:.0f}/s IMU, "
+              f"SEQ gaps A={gaps_a} B={gaps_b}.")
     print(f"[{mode}] sender sent {sent_rate:.1f}k/s | net.py drained {drain_rate:.1f}k/s | "
           f"seq_gaps in window: {g1 - g0} | ring_drops: {sink._ring_drops}")
     if sent_rate < 29:
