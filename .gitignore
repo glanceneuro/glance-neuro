@@ -70,5 +70,12 @@ vitis_detect/
 vivado_detect_build.log
 vitis_detect_build.log
 
-# acq_imu_both fabric build project (generated, like vivado_project/)
+# acq_imu_* fabric build projects (generated, like vivado_project/)
 vivado_acq_imu_both/
+vivado_acq_imu_port_a/
+vivado_acq_imu_port_b/
+
+# Vitis/lopper leftovers dumped into the repo root during a build
+cpulist.yaml
+vitis_journal.py
+vitis_journal.py~

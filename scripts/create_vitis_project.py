@@ -16,16 +16,35 @@ advanced_options = client.create_advanced_options_dict(dt_overlay="0")
 # and pl_imu_detect.c links -- the firmware then probes IMUs on any fabric that
 # has the IICs. The core acq peripherals sit at the same addresses in both, so
 # the firmware still drives the plain acq / detect fabrics unchanged.
-platform = client.create_platform_component(name = "klab-platform",
-        hw_design = os.environ.get("KLAB_XSA", "./vivado_project/klab_project.xsa"),
-        os = "standalone",
-        cpu = "ps7_cortexa9_0",
-        domain_name = "standalone_ps7_cortexa9_0",
-        generate_dtb = False,
-        advanced_options = advanced_options,
-        compiler = "gcc")
+def _make_platform():
+    return client.create_platform_component(name = "klab-platform",
+            hw_design = os.environ.get("KLAB_XSA", "./vivado_project/klab_project.xsa"),
+            os = "standalone",
+            cpu = "ps7_cortexa9_0",
+            domain_name = "standalone_ps7_cortexa9_0",
+            generate_dtb = False,
+            advanced_options = advanced_options,
+            compiler = "gcc")
 
-domain = platform.get_domain(name='standalone_ps7_cortexa9_0')
+# Vitis 2025.1 toolchain race workaround (NOT a blind build retry). On the FIRST
+# platform creation, Vitis fires two concurrent `empyro repo -st` writes to the
+# shared _ide/.wsdata/.repo.yaml while the standalone domain's `empyro create_bsp`
+# reads it -- so create_bsp intermittently sees a half-written schema and fails
+# "Couldnt find the src directory for empty_application" (see _ide/logs/vitis.log).
+# The .repo.yaml is complete afterward, so recreating the platform reads a SETTLED
+# schema and succeeds -- exactly why running the platform command twice works.
+# Create, confirm the standalone domain actually resolved, recreate if it raced.
+platform = _make_platform()
+domain = None
+for _attempt in range(5):
+    try:
+        domain = platform.get_domain(name='standalone_ps7_cortexa9_0')
+        break
+    except Exception as _e:
+        print(f"[create_vitis] platform raced the repo schema (attempt {_attempt+1}/5); recreating on the now-settled .repo.yaml ...")
+        platform = _make_platform()
+if domain is None:
+    raise RuntimeError("platform creation kept racing the repo schema after 5 attempts")
 
 domain.set_config('lib', lib_name='xiltimer', param='XILTIMER_tick_timer', value='ps7_scutimer_0')
 domain.set_lib('lwip220')

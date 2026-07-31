@@ -359,10 +359,11 @@ def load_pl(sock, name="detect"):
 # streaming (stop first); the board resets the master timestamp on a successful
 # acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
 # Append-only selectors (firmware pl_configs order): acquisition=128-ch/no-IMU,
-# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables. Later
-# variants add acq_imu_port_a / _b (one IIC + one 128-ch LVDS port).
+# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables,
+# acq_imu_port_a/_b = one cable 64-ch+IMU and the other 128-ch LVDS.
 CMD_SET_CONFIG = 0xB4
-CONFIGS = {"acquisition": 0, "scan": 1, "acq_imu_both": 2}
+CONFIGS = {"acquisition": 0, "scan": 1, "acq_imu_both": 2,
+           "acq_imu_port_a": 3, "acq_imu_port_b": 4}
 
 def set_config(sock, name):
     if name not in CONFIGS:
@@ -388,7 +389,7 @@ def set_config(sock, name):
     return {"rc": rc, "bytes": nbytes, "is_acq": is_acq, "link_up": link_up}
 
 CMD_PL_STATUS = 0xB5
-_CONFIG_NAMES = {v: k for k, v in CONFIGS.items()}   # 0->acquisition, 1->scan, 2->acq_imu_both
+_CONFIG_NAMES = {v: k for k, v in CONFIGS.items()}   # 0->acquisition ... 4->acq_imu_port_b
 _CONFIG_NAMES[-1] = "blank (no fabric)"
 
 def pl_status(sock, verbose=True):

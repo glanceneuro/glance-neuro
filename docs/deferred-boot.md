@@ -186,6 +186,12 @@ lose across a machine reboot (both surfaced as deterministic platform-gen failur
   Symptom: `package require sdtgen FAILED` / `error loading hsi ... libtinfo.so.5`. Fix:
   `ln -s libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5` (or a user-dir symlink on
   `LD_LIBRARY_PATH`).
-- **`ESW_REPO`** — must point at the complete embeddedsw repo so the FSBL/sw_apps
-  resolve. Symptom: `[ERROR] Couldnt find the src directory for zynq_fsbl`. Fix:
-  `export ESW_REPO=/opt/Xilinx/2025.1/data/embeddedsw`.
+- **Vitis platform-creation race (worked around in-script; NO env var needed).** On the
+  first `create_platform_component`, Vitis fires two concurrent `empyro repo -st` writes to
+  the shared `vitis_workspace/_ide/.wsdata/.repo.yaml` while a domain's `empyro create_bsp`
+  reads it, so it intermittently fails `[ERROR] Couldnt find the src directory for
+  empty_application` / `zynq_fsbl` (see `vitis_workspace/_ide/logs/vitis.log` for the exact
+  command timeline). The schema is complete afterward, so `scripts/create_vitis_project.py`
+  recreates the platform on the settled schema (the scripted "run it twice") and it becomes
+  deterministic. `ESW_REPO` is **not** needed — Vitis uses its bundled
+  `Vitis/data/embeddedsw` repo regardless of that env var.

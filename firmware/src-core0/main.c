@@ -199,9 +199,11 @@ volatile int pl_has_iic = 0;
 // "acq_imu_both.bin" (12-char base). The host-facing `name` is unconstrained.
 typedef struct { const char *name; const char *file; int is_acq; int has_iic; } pl_config_t;
 static const pl_config_t pl_configs[] = {
-  { "acquisition",  "acq",      1, 0 },   // 128-ch LVDS acquisition, no IMU
-  { "scan",         "detect",   0, 1 },   // single-ended I2C-probe fabric (both IICs)
-  { "acq_imu_both", "aimuboth", 1, 1 },   // 64-ch/port acquisition + BNO055 on both cables
+  { "acquisition",    "acq",      1, 0 },   // 128-ch LVDS acquisition, no IMU
+  { "scan",           "detect",   0, 1 },   // single-ended I2C-probe fabric (both IICs)
+  { "acq_imu_both",   "aimuboth", 1, 1 },   // both cables 64-ch + a BNO055 each
+  { "acq_imu_port_a", "aimu_a",   1, 1 },   // port A 64-ch + IMU, port B 128-ch LVDS
+  { "acq_imu_port_b", "aimu_b",   1, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU
 };
 #define PL_NUM_CONFIGS ((uint32_t)(sizeof(pl_configs) / sizeof(pl_configs[0])))
 static int current_config = -1;
