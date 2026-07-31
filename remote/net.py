@@ -419,6 +419,14 @@ def imu_stream(sock, spec='both', period_ms=0):
     active, period, ver = struct.unpack('<III', data[:12])
     if ver != IMUSTREAM_VERSION:
         print(f"[IMU] unexpected version 0x{ver:08X} (expected 0x{IMUSTREAM_VERSION:08X})")
+    # The firmware sets p->seq = 0 every time a port is ARMED, so a restart is
+    # a backward jump the sink would otherwise score as a gap -- and under hard
+    # rule 3 a nonzero gap count reads as data loss on a clean run. Re-baseline
+    # the ports this command (re)started.
+    if UNIFIED_SINK is not None:
+        for _p in (0, 1):
+            if active & (1 << _p):
+                UNIFIED_SINK._imu_last_seq[_p] = None
     names = {0: 'none', 1: 'A', 2: 'B', 3: 'A+B'}
     if m and active != m:
         print(f"[IMU] note: asked for {names[m]} but got {names[active]} -- "
@@ -471,7 +479,11 @@ def imu_csv_start(path):
     # rather than killing a background thread that leaves the recorder looking
     # busy forever.
     try:
-        f = open(path, 'w')
+        # buffering=1 (line buffered). The worker is a DAEMON thread, so the
+        # interpreter exits without unwinding it: anything sitting in a 8 KB
+        # block buffer is simply lost, which silently truncated -- or entirely
+        # emptied -- short recordings.
+        f = open(path, 'w', buffering=1)
     except OSError as e:
         print(f"[IMU] cannot record to {path}: {e}")
         return
@@ -506,7 +518,12 @@ def imu_csv_start(path):
             # a queue nobody drains and the file is left open.
             UNIFIED_SINK.unsubscribe_imu(q)
             f.close()
-            _IMU_CSV['thread'] = None
+            # Only disown the slot if it is still OURS. A worker that outlived
+            # its stop timeout would otherwise deregister the NEXT recording,
+            # leaving that one unstoppable and its subscriber queue attached to
+            # the recv path for the life of the process.
+            if _IMU_CSV['thread'] is threading.current_thread():
+                _IMU_CSV['thread'] = None
 
     t = threading.Thread(target=worker, name="imu-csv", daemon=True)
     _IMU_CSV.update(thread=t, stop=stop, path=path, rows=0)
@@ -526,6 +543,7 @@ def imu_csv_stop():
 # --- I2C bus scan + EEPROM read (CMD_I2C_SCAN / CMD_EEPROM_READ) --------------
 # Generic probes of a headstage port's freed-CIPO I2C bus. Keep the reply
 # layouts in sync with firmware pl_i2c_probe.h.
+I2C_ADDR_FIRST, I2C_ADDR_LAST = 0x08, 0x77   # firmware refuses outside this (network.c)
 CMD_I2C_SCAN = 0xB7
 CMD_EEPROM_READ = 0xB9
 I2CSCAN_VERSION = 0x49324353    # "I2CS"
@@ -581,13 +599,24 @@ def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
     register file). width: 1 = one offset byte (<=16Kbit 24xx), 2 = two
     (>=32Kbit). Non-destructive."""
     p = 0 if str(port).lower() in ('0', 'a') else 1
+    # Do NOT mask. 0xA0 is the 8-bit write address printed on essentially every
+    # 24xx datasheet, so it is what a user reaches for -- and masking it to 7
+    # bits yields 0x20, a perfectly plausible OTHER device, whose bytes would
+    # then be hex-dumped under the 0xA0 heading. Refuse instead.
+    addr = int(i2c_addr, 0) if isinstance(i2c_addr, str) else int(i2c_addr)
+    if not (I2C_ADDR_FIRST <= addr <= I2C_ADDR_LAST):
+        print(f"[EEPROM] device address 0x{addr:02X} is outside the "
+              f"7-bit range 0x{I2C_ADDR_FIRST:02X}-0x{I2C_ADDR_LAST:02X}. "
+              f"Datasheets often quote the 8-bit form (0xA0); use the 7-bit "
+              f"address (0x50).")
+        return None
     if int(length) > 32:
         # One command is one bounded I2C transaction; say so rather than
         # silently returning a third of what was asked for.
         print(f"[EEPROM] {length} bytes requested; reading 32 (the per-command "
               f"maximum). Repeat with offset {offset + 32} for the next chunk.")
     length = min(int(length), 32)
-    p1 = (p << 16) | ((int(width) & 0xFF) << 8) | (int(i2c_addr) & 0x7F)
+    p1 = (p << 16) | ((int(width) & 0xFF) << 8) | (int(i2c_addr) & 0x7F)   # in range, checked above
     p2 = ((int(offset) & 0xFFFF) << 8) | length
     ok, data = send_binary_command(sock, CMD_EEPROM_READ, param1=p1, param2=p2,
                                    timeout=3.0)
@@ -600,9 +629,16 @@ def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
     ver = struct.unpack_from('<I', data, 40)[0]
     if ver != EEPROMRD_VERSION:
         print(f"[EEPROM] unexpected version 0x{ver:08X}")
-    if status == 1:
+    if status == 1 and nbytes == 0:
         print(f"[EEPROM] no ACK from 0x{i2c_addr:02X} on port {'B' if p else 'A'}")
         return None
+    if status == 1:
+        # The firmware also reports 1 for a NACK/arbitration loss part-way
+        # through the read, after some bytes have landed. Those bytes are real
+        # -- discarding them would read as "the device is absent" when it is
+        # actually present and the transfer was cut short.
+        print(f"[EEPROM] transfer cut short after {nbytes} of {length} bytes "
+              f"(NACK or lost arbitration mid-read); showing what arrived")
     if (status & 0xFF) in (2, 3):
         print(f"[EEPROM] timed out (got {nbytes}/{length} bytes) -- wedged bus "
               f"or wrong addr width?")
@@ -819,20 +855,29 @@ def rescan(sock, with_chip_detect=True):
         print("[RESCAN] 3/3 chip detection (phase sweep) ...")
         detection = run_detection(sock, verbose=False)
         freed = _RESCAN_FREED_MASK[target]
-        if detection.success and (detection.optimal_channel_mask & freed):
-            # A tied-off lane scored above threshold: correct the mask (that
-            # lane would stream garbage words forever) and re-apply. Latches
-            # while stopped -- apply_config left us stopped.
-            fixed = detection.optimal_channel_mask & ~freed
-            print(f"[RESCAN] correcting mask 0x{detection.optimal_channel_mask:02X} "
-                  f"-> 0x{fixed:02X}: bits 0x{detection.optimal_channel_mask & freed:02X} "
-                  f"have no LVDS pair on '{target}' (freed for the IMU I2C)")
+        # What the BOARD is actually left holding, which is not the same as what
+        # detection returned. The sweep unconditionally programs
+        # DETECTION_CHANNEL_ENABLE (0xFF) to score all four lanes, and only
+        # applies a narrowed mask when it SUCCEEDS. So a failed sweep -- chips
+        # unseated, say -- leaves 0xFF on an IMU fabric, i.e. every freed CIPO1
+        # lane enabled with no LVDS pair behind it. That is exactly the phantom
+        # lane this correction exists to prevent, so it must run whether or not
+        # detection succeeded.
+        on_board = (detection.optimal_channel_mask if detection.success
+                    else DETECTION_CHANNEL_ENABLE)
+        if on_board & freed:
+            fixed = on_board & ~freed
+            why = "detected" if detection.success else "left by the sweep"
+            print(f"[RESCAN] correcting mask 0x{on_board:02X} -> 0x{fixed:02X} "
+                  f"({why}): bits 0x{on_board & freed:02X} have no LVDS pair on "
+                  f"'{target}' (freed for the IMU I2C)")
+            # Latches only while stopped; apply_config already stopped us, and on
+            # the failure path the sweep never started streaming.
+            send_binary_command(sock, CMD_SET_CHANNEL_ENABLE, fixed)
+            validator.set_channel_enable(fixed)
             if fixed == 0:
-                print("[RESCAN] nothing real detected after correction -- "
-                      "phases left as-is, set_channels by hand if needed")
-            else:
-                send_binary_command(sock, CMD_SET_CHANNEL_ENABLE, fixed)
-                validator.set_channel_enable(fixed)
+                print("[RESCAN] no real lanes remain -- reseat the headstage, "
+                      "then rescan (phases left as-is)")
             detection.optimal_channel_mask = fixed
     else:
         print("[RESCAN] 3/3 chip detection skipped (with_chip_detect=False)")
@@ -3653,7 +3698,11 @@ def tcp_control():
         
         while True:
             try:
-                cmd = input("\n[TCP] Command: ").strip().lower()
+                raw_cmd = input("\n[TCP] Command: ").strip()
+                # Commands are case-insensitive, but ARGUMENTS may not be:
+                # imu_csv takes a filesystem path, and lowercasing it silently
+                # retargets the write (or fails outright on a case-sensitive FS).
+                cmd = raw_cmd.lower()
 
                 if cmd == "quit":
                     break
@@ -3710,10 +3759,12 @@ def tcp_control():
                     imu_recv(int(parts[1]) if len(parts) > 1 else 20)
                 elif cmd.startswith("imu_csv"):
                     parts = cmd.split()
+                    raw_parts = raw_cmd.split()
                     if len(parts) > 1 and parts[1] == "stop":
                         imu_csv_stop()
                     else:
-                        imu_csv_start(parts[1] if len(parts) > 1 else "imu_data.csv")
+                        imu_csv_start(raw_parts[1] if len(raw_parts) > 1
+                                      else "imu_data.csv")
                 elif cmd == "rescan" or cmd.startswith("rescan "):
                     # "rescan noapply" = fabric selection only, skip the phase
                     # sweep (leaves phases/mask untouched).
@@ -4136,6 +4187,11 @@ if __name__ == "__main__":
     UNIFIED_SINK.start()
 
     tcp_control()
+
+    # Close out any recording first: the worker is a daemon thread, so without
+    # this the interpreter exits and whatever it had buffered is lost.
+    if _IMU_CSV['thread'] is not None:
+        imu_csv_stop()
 
     # Shutdown summary: the broadband no-loss assertion (gap count MUST be 0).
     if UNIFIED_SINK is not None:

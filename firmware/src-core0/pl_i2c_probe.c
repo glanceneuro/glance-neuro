@@ -6,10 +6,9 @@
 #include "xiic_l.h"
 #include "sleep.h"
 
-// One address probe = the shortest legal write: START+addr, one 0x00 data
-// byte, STOP. For every 24xx (sets the read pointer low byte) and the BNO055
-// (sets the register pointer) this is a no-op write -- non-destructive by
-// construction. The blocking XIic_DynSend is NOT used: on a bus that is
+// One address probe = START + address + STOP, with NO data phase at all, so it
+// is non-destructive against every device rather than only against ones whose
+// first byte is a register pointer. The blocking XIic_DynSend is NOT used: on a bus that is
 // actually an LVDS lane it can spin forever, and this firmware has already
 // paid once for an unbounded wait (the absent-slave hang) -- everything here
 // runs against a deadline.
@@ -19,9 +18,15 @@ static int probe_addr(UINTPTR base, uint8_t addr7, int *ack)
 {
     XIic_DynInit(base);
     XIic_ClearIisr(base, XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK);
+    // START+STOP+address in ONE word: an address-only probe with no data phase.
+    // The earlier form queued a 0x00 data byte, which is harmless to a
+    // register-pointer device (BNO055, 24xx) but is a COMMAND to any device
+    // that takes bare command bytes -- and a bus scan must not be able to
+    // trigger a measurement or a soft reset on something it is merely looking
+    // for. Same ACK/NACK semantics either way.
     XIic_WriteReg(base, XIIC_DTR_REG_OFFSET,
-                  XIIC_TX_DYN_START_MASK | ((uint32_t)addr7 << 1));
-    XIic_WriteReg(base, XIIC_DTR_REG_OFFSET, XIIC_TX_DYN_STOP_MASK | 0x00);
+                  XIIC_TX_DYN_START_MASK | XIIC_TX_DYN_STOP_MASK
+                  | ((uint32_t)addr7 << 1));
 
     int seen_busy = 0;
     for (int us = 0; us < 5000; us += 10) {

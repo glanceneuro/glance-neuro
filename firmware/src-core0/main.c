@@ -19,6 +19,11 @@
 #include "pl_imu_stream.h"  // continuous BNO055 readout (stream_type=4)
 #include "xiltimer.h"  // XTime_GetTime / COUNTS_PER_SECOND for perf instrumentation
 
+// How long to wait for PHY link before continuing boot. Bounded so a board with
+// no cable still reaches the point where core 1 wakes and the serial console
+// starts -- see the wait loop for why that matters.
+#define LINK_WAIT_TIMEOUT_S 20
+
 // Forward declare eth_link_detect from xemacpsif adapter
 // This function is provided by the LWIP library's Xilinx EMAC adapter
 extern void eth_link_detect(struct netif *netif);
@@ -639,7 +644,8 @@ int main() {
   // loading right after link-up -- dropped the PHY (err -4). A load over a
   // settled link is safe and is how every set_config swap works (verified: the
   // fabric changes with the link intact). So: never PCAP here, only on command.
-  if (pl_loader_init() != 0)
+  int loader_ok = (pl_loader_init() == 0);
+  if (!loader_ok)
     xil_printf("WARNING: pl_loader_init failed -- set_config loads unavailable\r\n");
 
   // BOOT.bin bakes the default acquisition bitstream, so the FSBL has already
@@ -652,7 +658,12 @@ int main() {
   // core 1 is draining the print ring. Splitting them is why acq_pl_init_early
   // and acq_pl_init_late exist -- calling the combined acq_pl_bringup() here
   // would break one ordering or the other.
-  int pl_live_at_boot = pl_loader_pl_configured();
+  // Gate on the init result: a failed XDcfg_CfgInitialize leaves DcfgInst's
+  // base address at 0, so pl_loader_pl_configured() would read offset 0x0C of
+  // DDR rather than devcfg and could report a configured PL that is not there --
+  // sending acq_pl_init_early() at an unconfigured fabric, which is the
+  // never-returning AXI read this firmware keeps paying for.
+  int pl_live_at_boot = loader_ok && pl_loader_pl_configured();
   if (pl_live_at_boot)
     acq_pl_init_early();
 
@@ -678,12 +689,30 @@ int main() {
     send_message("Network link DOWN at boot - waiting for cable connection...\r\n");
   }
 
-  while (!link_is_up) {
-    service_network();   // keep draining RX while waiting for PHY link-up
-    eth_link_detect(&server_netif);
-    if (netif_is_link_up(&server_netif)) {
-      link_is_up = 1;
-      send_message("Network link UP\r\n");
+  // Bounded, because core 1 is still parked and the console does not exist
+  // until it wakes (below). An unbounded wait here means a board with no
+  // Ethernet -- the exact case the baked bitstream exists to keep diagnosable --
+  // sits mute forever with no serial console and no network. Give the PHY a
+  // generous window, then carry on: link_is_up is re-evaluated by the
+  // maintenance loop, so a cable plugged in later still comes up.
+  {
+    XTime wait_start; XTime_GetTime(&wait_start);
+    const XTime wait_limit = (XTime)COUNTS_PER_SECOND * LINK_WAIT_TIMEOUT_S;
+    while (!link_is_up) {
+      service_network();   // keep draining RX while waiting for PHY link-up
+      eth_link_detect(&server_netif);
+      if (netif_is_link_up(&server_netif)) {
+        link_is_up = 1;
+        send_message("Network link UP\r\n");
+        break;
+      }
+      XTime now_wait; XTime_GetTime(&now_wait);
+      if ((now_wait - wait_start) > wait_limit) {
+        send_message("Network link DOWN after %ds -- continuing so the serial "
+                     "console comes up; plug the cable in and it will link\r\n",
+                     LINK_WAIT_TIMEOUT_S);
+        break;
+      }
     }
   }
 

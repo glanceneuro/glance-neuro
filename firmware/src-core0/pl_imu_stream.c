@@ -181,7 +181,7 @@ static void imu_error(imu_port_t *p, int port)
 
 static void imu_publish(imu_port_t *p, int port)
 {
-    uint32_t *w = imu_staging[imu_slot];
+    uint32_t *w = imu_staging[imu_slot];  // DMA-EXEMPT: not a DMA staging buffer -- this stream's source is I2C, not a PL BRAM, so there is no CDMA copy to read; the PS builds the whole 52-byte packet here at 100 Hz
     imu_slot = (imu_slot + 1u) % IMU_N_SLOTS;
 
     uint64_t ts = pl_get_timestamp();
@@ -380,8 +380,13 @@ uint32_t pl_imu_stream_set(uint32_t mask, uint32_t period_ms)
             p->temp_c = 0;
             p->iic_errors = p->send_drops = p->consec_errors = 0;
             // Stagger port B half a period so the two ports' bursts interleave
-            // instead of landing their FIFO work in the same passes.
-            p->next_tick = now + imu_ms_to_ticks(port ? period_ms / 2 : 0);
+            // instead of landing their FIFO work in the same passes. Re-read the
+            // clock here rather than using the pre-loop sample: arming a port
+            // runs a blocking NDOF entry that can take ~125 ms, which would
+            // leave port B's "now + half a period" already in the past and
+            // collapse the stagger to zero.
+            XTime armed_at; XTime_GetTime(&armed_at);
+            p->next_tick = armed_at + imu_ms_to_ticks(port ? period_ms / 2 : 0);
             p->running = 1;
         } else if (!want && p->running) {
             p->running = 0;
@@ -431,10 +436,18 @@ void pl_imu_stream_service(void)
     XTime now; XTime_GetTime(&now);
     if (imu_last_service) {
         XTime gap = now - imu_last_service;
-        if (gap > imu_ms_to_ticks(IMU_SERVICE_GAP_MS)) {
+        XTime normal = imu_ms_to_ticks(IMU_SERVICE_GAP_MS);
+        if (gap > normal) {
+            // Credit the EXCESS only, never the whole interval. Crediting the
+            // full gap advances the deadline 1:1 with wall clock, so any
+            // sustained slow-service condition makes it unreachable -- and the
+            // deadline is the ONLY wedged-bus detector. A bus stuck with SDA
+            // low would then never trip imu_error(), never DynInit out of the
+            // wedge, and never auto-stop: the stream would just go quiet with
+            // iic_errors still reading 0.
             for (int i = 0; i < 2; i++)
                 if (imu_port[i].running)
-                    imu_port[i].deadline += gap;
+                    imu_port[i].deadline += (gap - normal);
         }
     }
     imu_last_service = now;

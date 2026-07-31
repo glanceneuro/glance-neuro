@@ -5,6 +5,7 @@
 #include "pl_imu_detect.h"   // IMUDET_*_BASE, BNO055_I2C_ADDR
 #include "xiic_l.h"
 #include "sleep.h"
+#include <string.h>
 
 // The BNO055 needs time to switch operation modes (data sheet table 3-6):
 // 19 ms into CONFIG, 7 ms out of it. Rounded up generously -- this runs once
@@ -127,7 +128,12 @@ int pl_imu_read_sample(int port, imu_sample_response_t *out)
     uint8_t raw[32];   // one burst 0x08..0x27: acc, mag, gyr, euler, quat
     uint8_t mode = 0;
 
-    out->status = 0;
+    // Zero EVERYTHING first. The early returns below fill only status and
+    // version, but the command handler transmits all 32 bytes unconditionally,
+    // so an unprobed field would put whatever the previous handler left on
+    // core 0's stack onto the wire -- and net.py would decode that as a
+    // perfectly plausible quaternion.
+    memset(out, 0, sizeof(*out));
     out->version = IMUREAD_VERSION;
 
     XIic_DynInit(base);

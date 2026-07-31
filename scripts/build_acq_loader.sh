@@ -87,8 +87,12 @@ else
     || die "acq (128-ch) bitstream build failed (see vivado_build.log)"
   [ -f "$BIT" ] || die "acq (128-ch) implementation produced no bitstream"
 fi
-[ ! -f "$TIMING" ] || grep -q "All user specified timing constraints are met" "$TIMING" \
-  || die "acq (128-ch) bitstream TIMING NOT MET"
+# Must DIE on a missing report, not skip: this is the fabric baked into
+# BOOT.bin, so "no verdict" is the one fabric where silence is least acceptable.
+# (The old form was `[ ! -f X ] || grep ... || die`, which short-circuits to
+# success when the report is absent -- the inverse of the other three gates.)
+[ -f "$TIMING" ] && grep -q "All user specified timing constraints are met" "$TIMING" \
+  || die "acq (128-ch) bitstream TIMING NOT MET (or routed report missing)"
 
 # --- acq_imu_both fabric (also the firmware platform) ---
 if [ -f "$IMU_XSA" ] && [ -f "$IMU_BIT" ]; then
