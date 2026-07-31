@@ -20,17 +20,24 @@ Two access paths:
 
 A fused sample is ~22 bytes of I2C: ~2.5 ms of bus time at 100 kHz — ~75
 broadband sample budgets, so the pump could never wait on it. Instead each
-transfer is a **combined write-then-read preloaded into the AXI IIC's 16-deep
-command FIFO in one shot** (dynamic mode, PG090): START+addr(W), register
-pointer, repeated START+addr(R), STOP+count. The core then runs the bus by
-itself; the main loop comes back once per pass and
+transfer is a **combined write-then-read fed to the AXI IIC's command FIFO**
+(dynamic mode, PG090): START+addr(W), register pointer, repeated START+addr(R),
+then — once the core has actually taken the bus — STOP+count. That two-phase
+ordering is deliberate: it is exactly what the vendor's blocking
+`XIic_DynRecv` does (and what the silicon-proven detect path on this board
+uses), reproduced without the blocking wait. `BUS_BUSY` does not assert on the
+register write; the core has to drive a START and the address onto the wire
+first, so the count is written on a later main-loop pass. The core then runs
+the bus by itself; the main loop comes back once per pass and
 
 - checks the interrupt status register once (NACK / arbitration loss),
 - drains whatever the RX FIFO holds (SR empty-flag gated),
 
 which costs a couple of AXI-Lite reads per pass while a transfer is in flight
 and nothing when idle. Three bursts per tick (quat 8 B @0x20, acc 6 B @0x08,
-gyr 6 B @0x14 — each far under the 16-deep RX FIFO), publish on the third,
+gyr 6 B @0x14 — each far under the 16-deep RX FIFO, which `XIic_DynInit`
+programs to throttle only at 16 bytes, so a burst lands whole without
+mid-transfer drains), publish on the third,
 and every 100th tick a 2-byte housekeeping burst (temp 0x34, calib 0x35)
 refreshes the health fields in AUX1. Port B's ticks are staggered half a
 period from port A's so the two ports' FIFO work interleaves.

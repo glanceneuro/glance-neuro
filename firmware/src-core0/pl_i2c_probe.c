@@ -79,8 +79,13 @@ void pl_i2c_read(int port, uint8_t i2c_addr, int addr_width, uint16_t offset,
     if (nbytes > EEPROM_READ_MAX) nbytes = EEPROM_READ_MAX;
     if (nbytes == 0) return;
 
-    // Combined write-then-read, same preloaded shape the IMU stream uses --
-    // offset write (1 or 2 big-endian bytes), repeated START, n-byte read.
+    // Combined write-then-read: offset write (1 or 2 big-endian bytes),
+    // repeated START, n-byte read. The byte count goes in only once the core
+    // has actually taken the bus -- the ordering the vendor's XIic_DynRecv
+    // uses, and the one the IMU stream reproduces (docs/imu-ingestion.md).
+    // BUS_BUSY does not assert on the register write, so this waits for it --
+    // bounded, because this is a cold path and a bus that never goes busy must
+    // not become a hang.
     XIic_DynInit(base);
     XIic_ClearIisr(base, XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK);
     XIic_WriteReg(base, XIIC_DTR_REG_OFFSET,
@@ -90,6 +95,26 @@ void pl_i2c_read(int port, uint8_t i2c_addr, int addr_width, uint16_t offset,
     XIic_WriteReg(base, XIIC_DTR_REG_OFFSET, offset & 0xFF);
     XIic_WriteReg(base, XIIC_DTR_REG_OFFSET,
                   XIIC_TX_DYN_START_MASK | ((uint32_t)i2c_addr << 1) | 1);
+
+    int busy = 0;
+    for (int us = 0; us < 5000; us += 10) {
+        uint32_t iisr = XIic_ReadIisr(base);
+        if (iisr & (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK)) {
+            XIic_DynInit(base);
+            out->status = 1;                 // NACK on the address phase
+            return;
+        }
+        if (XIic_ReadReg(base, XIIC_SR_REG_OFFSET) & XIIC_SR_BUS_BUSY_MASK) {
+            busy = 1;
+            break;
+        }
+        usleep(10);
+    }
+    if (!busy) {
+        XIic_DynInit(base);
+        out->status = 2;                     // bus never went busy
+        return;
+    }
     XIic_WriteReg(base, XIIC_DTR_REG_OFFSET, XIIC_TX_DYN_STOP_MASK | nbytes);
 
     // 32 bytes at 100 kHz is ~3.2 ms on the wire; 20 ms of deadline covers
