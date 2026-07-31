@@ -256,17 +256,30 @@ int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
   if (sel >= PL_NUM_CONFIGS) return -1;
   const pl_config_t *c = &pl_configs[sel];
   if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
+  // Shut the serial console's INPUT for the duration. Clearing the PL floats
+  // the EMIO UART RX ball, and core 1 would otherwise parse the resulting noise
+  // as a debug command -- "dump" with a garbage count, or "start" -- either of
+  // which leaves the board unresponsive. Output is unaffected (it is merely
+  // lost on the wire while the pins are gone).
+  command_flags->serial_input_ok = 0;
   pl_imu_stream_stop_all();              // the IICs it polls are about to vanish
   pl_is_acq = 0;                         // tearing the PL down -> stop touching it
   pl_has_iic_a = pl_has_iic_b = pl_has_iic = 0;  // its IICs are gone until reloaded
   uint32_t bytes = 0;
   pl_status_t st = pl_loader_load(c->file, &bytes);
   if (out_bytes) *out_bytes = bytes;
-  if (st != PL_OK) { current_config = -1; return (int)st; }
+  if (st != PL_OK) {
+    current_config = -1;
+    command_flags->serial_input_ok = 1;   // failed load: pins are as they were
+    return (int)st;
+  }
   current_config = (int)sel;
   pl_has_iic_a = c->iic_a;               // per-port IIC presence (0x43D0 / 0x43D1)
   pl_has_iic_b = c->iic_b;
   pl_has_iic   = c->iic_a || c->iic_b;   // any IIC -> CMD_DETECT_IMU is allowed
+  // The fabric is back, so the console pins are real again. Core 1 flushes
+  // whatever noise arrived while the gate was shut before honouring input.
+  command_flags->serial_input_ok = 1;
   if (c->is_acq) {
     acq_pl_bringup();
     pl_reset_timestamp();                // new fabric -> fresh timeline for the host
@@ -760,6 +773,8 @@ int main() {
     acq_pl_init_late();     // early half already ran, before the network
     pl_reset_timestamp();
     pl_is_acq = 1;
+    // The PL is up, so the console's RX ball is real: honour typed commands.
+    command_flags->serial_input_ok = 1;
     send_message("System ready: PL configured at boot (%s). "
                  "set_config / rescan to swap fabrics.\r\n",
                  pl_configs[PL_CONFIG_BAKED].name);

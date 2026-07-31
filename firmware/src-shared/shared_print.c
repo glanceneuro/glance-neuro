@@ -46,6 +46,10 @@ volatile int monitor_enabled = 0;   // core-1 "mon" toggle (~1 Hz auto-status)
 void process_serial_command(const char* cmd);
 
 void init_command_flags(void) {
+    // FAIL CLOSED. The console RX ball only exists when the PL is configured,
+    // so input stays disabled until core 0 has established that it is -- see
+    // the field's note in shared_print.h.
+    command_flags->serial_input_ok = 0;
     command_flags->lock = 0;
     command_flags->enable_streaming_flag = 0;
     command_flags->disable_streaming_flag = 0;
@@ -62,6 +66,17 @@ void check_serial_input(void) {
         // send_message("debug> ");
         xil_printf("debug> ");
     }
+    // While the PL is being reprogrammed the console RX pin floats (it is an
+    // EMIO PL ball), so anything "received" is noise. Drain and discard it
+    // rather than letting it accumulate into a command -- a line that merely
+    // STARTS with "dump" or "start" is enough to match.
+    if (!command_flags->serial_input_ok) {
+        while (XUartPs_IsReceiveData(STDIN_BASEADDRESS))
+            (void)XUartPs_RecvByte(STDIN_BASEADDRESS);
+        serial_cmd_index = 0;
+        return;
+    }
+
     // Check if UART has data available
     if (XUartPs_IsReceiveData(STDIN_BASEADDRESS)) {
         char ch = XUartPs_RecvByte(STDIN_BASEADDRESS);

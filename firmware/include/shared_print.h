@@ -57,6 +57,18 @@ typedef struct {
     volatile int cable_test_flag;
     volatile uint32_t start_bram_addr;
     volatile uint32_t word_count;
+    // Serial DEBUG-console input gate, owned by core 0, read by core 1.
+    //
+    // The console UART leaves this chip through PL balls (EMIO to M14/M15 via
+    // JX2), so while the PL is unconfigured or being reprogrammed its RX line
+    // FLOATS and the receiver picks up noise. Core 1's check_serial_input()
+    // accumulates that into a command line and executes it -- and the command
+    // set includes "dump [start] [count]", whose sscanf'd word_count then sends
+    // core 0 into an enormous BRAM read loop, and "start", which begins
+    // streaming. Both leave the board unresponsive to the network. Core 0
+    // therefore closes this gate across every PCAP reconfiguration; core 1
+    // discards RX bytes while it is shut.
+    volatile int serial_input_ok;
 } command_flags_t;
 
 extern volatile command_flags_t *command_flags;
