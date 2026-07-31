@@ -7,6 +7,7 @@
 #include "pl_imu_detect.h"  // per-cable BNO055 probe over the AXI IICs (CMD_DETECT_IMU)
 #include "pl_imu_read.h"    // one-shot BNO055 NDOF sample (CMD_IMU_READ)
 #include "pl_imu_stream.h"  // continuous BNO055 readout (CMD_IMU_STREAM)
+#include "pl_i2c_probe.h"   // bus scan + EEPROM read (CMD_I2C_SCAN / CMD_EEPROM_READ)
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -100,6 +101,8 @@ ID   | Command          | Param1              | Param2
 #define CMD_PL_STATUS         0xB5  // query the loaded fabric -- works in ANY fabric state
 #define CMD_IMU_READ          0xB6  // param1 = port (0=A,1=B); one-shot BNO055 NDOF sample
 #define CMD_IMU_STREAM        0xB8  // param1 = port mask (absolute; 0=stop all); param2 = period ms
+#define CMD_I2C_SCAN          0xB7  // param1 = port; scan 0x08..0x77 -> 24-byte ACK bitmap
+#define CMD_EEPROM_READ       0xB9  // param1 = port<<16|width<<8|i2c_addr; param2 = offset<<8|len
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -407,7 +410,8 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     // gets a response -> the core hangs. Refuse them until an acq fabric is live.
     if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
         cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU &&
-        cmd->cmd_id != CMD_IMU_READ) {
+        cmd->cmd_id != CMD_IMU_READ && cmd->cmd_id != CMD_I2C_SCAN &&
+        cmd->cmd_id != CMD_EEPROM_READ) {
         send_message("cmd 0x%02X refused: no acquisition fabric "
                      "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
         send_ack(tpcb, cmd->ack_id, ACK_ERROR);
@@ -612,6 +616,62 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             imu_sample_response_t sample;
             pl_imu_read_sample(port, &sample);
             send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &sample, sizeof(sample));
+            return;  // response already sent
+        }
+
+        case CMD_I2C_SCAN: {
+            // Inventory one port's I2C bus (0x08..0x77 ACK bitmap). Cold path,
+            // deadline-bounded (~25 ms clean, one 5 ms deadline if wedged);
+            // same gates as IMU_READ: the port must have an IIC, and neither
+            // the pump nor the IMU stream may own the bus.
+            int port = cmd->param1 & 1;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            if (!has_iic) {
+                send_message("I2C_SCAN refused: port %c has no I2C on this "
+                             "fabric\r\n", port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if ((pl_is_acq && pl_is_transmission_active()) ||
+                pl_imu_stream_active(port)) {
+                send_message("I2C_SCAN refused: stop streaming / imu_stream "
+                             "first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            i2c_scan_response_t scan;
+            pl_i2c_scan(port, &scan);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &scan, sizeof(scan));
+            return;  // response already sent
+        }
+
+        case CMD_EEPROM_READ: {
+            // Bounded combined-read from an arbitrary device on the port's bus
+            // (identification / EEPROM contents). Non-destructive: the offset
+            // write only moves the device's read pointer.
+            int port = (cmd->param1 >> 16) & 1;
+            int width = (cmd->param1 >> 8) & 0xFF;
+            uint8_t i2c_addr = cmd->param1 & 0x7F;
+            uint16_t offset = (cmd->param2 >> 8) & 0xFFFF;
+            uint8_t len = cmd->param2 & 0xFF;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            if (!has_iic || (width != 1 && width != 2)) {
+                send_message("EEPROM_READ refused: %s\r\n",
+                             has_iic ? "addr width must be 1 or 2"
+                                     : "port has no I2C on this fabric");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if ((pl_is_acq && pl_is_transmission_active()) ||
+                pl_imu_stream_active(port)) {
+                send_message("EEPROM_READ refused: stop streaming / imu_stream "
+                             "first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            eeprom_read_response_t rd;
+            pl_i2c_read(port, i2c_addr, width, offset, len, &rd);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &rd, sizeof(rd));
             return;  // response already sent
         }
 

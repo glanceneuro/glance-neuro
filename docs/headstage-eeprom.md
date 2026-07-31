@@ -1,10 +1,13 @@
-# Headstage EEPROM — investigation & probe proposal
+# Headstage EEPROM — investigation & probe tooling
 
-**Status: DRAFT (overnight 2026-07-30), investigation only — no firmware change.**
-The headstage schematic is not in this repo or glance-neuro-hardware (the carrier
-KiCad files have no EEPROM/BNO055; those parts are on the headstage itself), so
-everything below is inferred from the bus facts we have validated plus 24xx-family
-convention. Caleb has the schematic — see the open questions.
+**Status: probe tooling IMPLEMENTED** (`CMD_I2C_SCAN 0xB7` / `CMD_EEPROM_READ
+0xB9`, `net.py i2c_scan` / `eeprom_read` — see `docs/protocol.md`); the part
+identification below still needs the schematic or a bench scan. The headstage
+schematic is not in this repo or glance-neuro-hardware (the carrier KiCad files
+have no EEPROM/BNO055; those parts are on the headstage itself), so the part
+inference comes from the validated bus facts plus 24xx-family convention.
+First bench step: `set_config scan` → `i2c_scan a` prints the full bus map and
+flags the block-addressing signature automatically.
 
 ## What we know (validated)
 
@@ -42,27 +45,27 @@ assembled.
 - 0x28/0x29 (BNO055 primary/alternate) and 0x50–0x57 don't collide, so a scan
   can't confuse the two.
 
-## Proposed probe (when we next touch firmware — not committed yet)
+## The probe tooling (implemented)
 
-Extend the detect path with a generic per-port **bus scan** rather than an
-EEPROM-specific read:
+1. **`CMD_I2C_SCAN 0xB7`** (`firmware/src-core0/pl_i2c_probe.c`): for each
+   7-bit address 0x08–0x77, the shortest legal write (START, addr, one 0x00
+   byte, STOP) with ACK/NACK recorded in a 16-byte bitmap. Finds the BNO055
+   (sanity check), the EEPROM, and anything else in one shot with no
+   assumption about the part. Per-port IIC-gated (the mixed-fabric hang
+   lesson), and — unlike the blocking `XIic_DynSend` — every wait is
+   **deadline-bounded**: a wedged bus (e.g. the pair is actually an LVDS
+   output) aborts the scan with a status code instead of hanging core 0.
+   `net.py i2c_scan [a|b]` prints an i2cdetect-style map and auto-flags the
+   ≤16 Kbit block-addressing signature (all of 0x50–0x57 ACKing = one chip).
+2. **`CMD_EEPROM_READ 0xB9`**: bounded combined write-then-read of ≤32 bytes
+   from any device/offset, with 1- or 2-byte offset addressing selected by
+   the host. `net.py eeprom_read [a|b] [dev] [off] [len] [width]` hex-dumps
+   the result. Non-destructive: the offset write only moves the device's
+   read pointer.
 
-1. `CMD_I2C_SCAN` (new, e.g. 0xB7 — 0xB6 is now CMD_IMU_READ): for each 7-bit
-   address in 0x08–0x77, one
-   `XIic_DynSend(base, addr, &zero, 1, stop)` and record ACK/no-ACK. Reply = a
-   16-byte bitmap per port. This finds the BNO055 (sanity check), the EEPROM,
-   and anything else on the bus in one shot, and needs no assumption about the
-   part. Runs on any fabric with that port's IIC, gated per-port like
-   detect_imu (`pl_has_iic_a/_b` — the mixed-fabric hang lesson).
-2. Once the address is known, a `CMD_EEPROM_READ` with {addr, offset, len ≤ 32}
-   using the word-addressing width established from the schematic (or from the
-   block-ACK signature above).
-3. `net.py`: `i2c_scan` command printing per-port maps; later `eeprom_read`.
-   `rescan` could then also read identity bytes instead of inferring headstage
-   type purely from the IMU census.
-
-A scan writes nothing (a single address byte to a 24xx only sets its read
-pointer), so it is non-destructive even against a live EEPROM.
+Follow-up once the part is confirmed: `rescan` can read identity bytes
+instead of inferring headstage type purely from the IMU census, and the
+BNO055 calibration profile could persist here (`docs/imu-ingestion.md`).
 
 ## Assumptions
 

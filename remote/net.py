@@ -507,6 +507,95 @@ def imu_csv_stop():
     print(f"[IMU] recorded {_IMU_CSV['rows']} samples to {_IMU_CSV['path']}")
     _IMU_CSV.update(thread=None, stop=None, path=None)
 
+# --- I2C bus scan + EEPROM read (CMD_I2C_SCAN / CMD_EEPROM_READ) --------------
+# Generic probes of a headstage port's freed-CIPO I2C bus. Keep the reply
+# layouts in sync with firmware pl_i2c_probe.h.
+CMD_I2C_SCAN = 0xB7
+CMD_EEPROM_READ = 0xB9
+I2CSCAN_VERSION = 0x49324353    # "I2CS"
+EEPROMRD_VERSION = 0x45455244   # "EERD"
+
+def i2c_scan(sock, port='a'):
+    """Scan one port's I2C bus (0x08-0x77) and print an i2cdetect-style map.
+    Needs a fabric with that port's IIC; refused while streaming/imu_stream."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    ok, data = send_binary_command(sock, CMD_I2C_SCAN, param1=p, timeout=3.0)
+    if not ok or data is None or len(data) < 24:
+        print(f"[I2C] scan refused/failed on port {'B' if p else 'A'} -- fabric "
+              f"without that port's I2C, or streaming/imu_stream active?")
+        return None
+    status = struct.unpack_from('<I', data, 0)[0]
+    bitmap = data[4:20]
+    ver = struct.unpack_from('<I', data, 20)[0]
+    if ver != I2CSCAN_VERSION:
+        print(f"[I2C] unexpected version 0x{ver:08X}")
+    if status & 1:
+        print(f"[I2C] port {'B' if p else 'A'}: BUS WEDGED at address "
+              f"0x{(status >> 8) & 0xFF:02X} -- scan aborted (is this cable "
+              f"actually a 128-ch LVDS headstage?)")
+        return None
+    found = [a for a in range(0x08, 0x78) if bitmap[a >> 3] & (1 << (a & 7))]
+    print(f"[I2C] port {'B' if p else 'A'} bus map (0x08-0x77):")
+    print("      " + " ".join(f"{c:2x}" for c in range(16)))
+    for row in range(0, 0x80, 16):
+        cells = []
+        for a in range(row, row + 16):
+            if a < 0x08 or a > 0x77:
+                cells.append("  ")
+            elif bitmap[a >> 3] & (1 << (a & 7)):
+                cells.append(f"{a:02x}")
+            else:
+                cells.append("--")
+        print(f"  {row:02x}: " + " ".join(cells))
+    notes = []
+    if 0x28 in found:
+        notes.append("0x28 = BNO055")
+    eep = [a for a in found if 0x50 <= a <= 0x57]
+    if len(eep) == 8:
+        notes.append("0x50-0x57 all ACK: likely ONE <=16Kbit 24xx EEPROM "
+                     "(block addressing), not 8 devices")
+    elif eep:
+        notes.append(f"24xx EEPROM candidate at {', '.join(hex(a) for a in eep)}")
+    if notes:
+        print("      " + "; ".join(notes))
+    return found
+
+def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
+    """Read bytes from a device on the port's I2C bus (24xx EEPROM, or any
+    register file). width: 1 = one offset byte (<=16Kbit 24xx), 2 = two
+    (>=32Kbit). Non-destructive."""
+    p = 0 if str(port).lower() in ('0', 'a') else 1
+    length = min(int(length), 32)
+    p1 = (p << 16) | ((int(width) & 0xFF) << 8) | (int(i2c_addr) & 0x7F)
+    p2 = ((int(offset) & 0xFFFF) << 8) | length
+    ok, data = send_binary_command(sock, CMD_EEPROM_READ, param1=p1, param2=p2,
+                                   timeout=3.0)
+    if not ok or data is None or len(data) < 44:
+        print("[EEPROM] read refused/failed -- fabric without that port's I2C, "
+              "or streaming/imu_stream active?")
+        return None
+    status, nbytes = struct.unpack_from('<II', data, 0)
+    payload = data[8:8 + min(nbytes, 32)]
+    ver = struct.unpack_from('<I', data, 40)[0]
+    if ver != EEPROMRD_VERSION:
+        print(f"[EEPROM] unexpected version 0x{ver:08X}")
+    if status == 1:
+        print(f"[EEPROM] no ACK from 0x{i2c_addr:02X} on port {'B' if p else 'A'}")
+        return None
+    if (status & 0xFF) in (2, 3):
+        print(f"[EEPROM] timed out (got {nbytes}/{length} bytes) -- wedged bus "
+              f"or wrong addr width?")
+        if not nbytes:
+            return None
+    print(f"[EEPROM] port {'B' if p else 'A'} dev 0x{i2c_addr:02X} "
+          f"offset {offset} ({width}-byte addressing): {nbytes} bytes")
+    for i in range(0, len(payload), 16):
+        chunk = payload[i:i + 16]
+        hexs = " ".join(f"{b:02x}" for b in chunk)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"    {offset + i:04x}: {hexs:<47} {text}")
+    return bytes(payload)
+
 # Deferred PL load (step 2, docs/deferred-boot.md): the loader image boots with a
 # blank PL and programs a fabric from the SD card via PCAP on command.
 CMD_LOAD_PL = 0xB2
@@ -736,6 +825,7 @@ def print_command_help():
     print("       imu_read [a|b]  (one NDOF sample: quat/accel/gyro/calib -- not while streaming)")
     print("       imu_stream [a|b|both|off] [period_ms]  (continuous 100 Hz stream_type=4; start BEFORE 'start')")
     print("       imu_recv [n]  (print live samples)   imu_csv [file|stop]  (record to CSV)")
+    print("  I2C: i2c_scan [a|b]  (bus ACK map 0x08-0x77)   eeprom_read [a|b] [dev=0x50] [off=0] [len=32] [width=1]")
     print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
@@ -3561,6 +3651,17 @@ def tcp_control():
                 elif cmd == "imu_read" or cmd.startswith("imu_read "):
                     parts = cmd.split()
                     imu_read(sock, parts[1] if len(parts) > 1 else 'a')
+                elif cmd == "i2c_scan" or cmd.startswith("i2c_scan "):
+                    parts = cmd.split()
+                    i2c_scan(sock, parts[1] if len(parts) > 1 else 'a')
+                elif cmd.startswith("eeprom_read"):
+                    parts = cmd.split()
+                    eeprom_read(sock,
+                                parts[1] if len(parts) > 1 else 'a',
+                                int(parts[2], 0) if len(parts) > 2 else 0x50,
+                                int(parts[3], 0) if len(parts) > 3 else 0,
+                                int(parts[4], 0) if len(parts) > 4 else 32,
+                                int(parts[5], 0) if len(parts) > 5 else 1)
                 elif cmd == "imu_stream" or cmd.startswith("imu_stream "):
                     parts = cmd.split()
                     imu_stream(sock, parts[1] if len(parts) > 1 else 'both',
