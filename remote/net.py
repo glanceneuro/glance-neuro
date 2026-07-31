@@ -713,10 +713,10 @@ def pl_status(sock, verbose=True):
 #   2. Probing I2C on a cable that carries a plain 128-ch headstage (the scan
 #      fabric drives SCL/SDA into what that headstage drives as LVDS CIPO1) is
 #      assumed electrically harmless for the ~ms probe and reads as "no IMU".
-#   3. On acq_imu_* fabrics the freed CIPO1 lane(s) are assumed to score below
-#      DETECTION_THRESHOLD in the sweep (tied-off input, no test sine), so the
-#      auto-applied mask gains no phantom lane. rescan warns if one scores
-#      anyway; if hardware shows that, mask the freed lanes before apply.
+#   3. On acq_imu_* fabrics the freed CIPO1 lane(s) are expected to score below
+#      DETECTION_THRESHOLD in the sweep (tied-off input, no test sine) -- and
+#      rescan ENFORCES it: any freed-lane bit that sneaks into the detected
+#      mask is corrected out (_RESCAN_FREED_MASK) and re-applied before use.
 #   4. The ce=0xFF detection packet keeps its 154-word four-lane layout on the
 #      64-ch variants (the packetizer RTL is unchanged; only the LVDS buffer
 #      drops a lane), so the validator/scorer need no resize.
@@ -741,11 +741,14 @@ _RESCAN_FABRIC = {
     (False, True): "acq_imu_port_b",
     (False, False): "acquisition",
 }
-# Freed-CIPO1 detection lanes per IMU fabric (indexes into the A0/A1/B0/B1 lane
-# order) -- used only to warn if a lane that has no LVDS pair "detects" a chip.
-_RESCAN_FREED_LANES = {
-    "acq_imu_both": (1, 3), "acq_imu_port_a": (1,), "acq_imu_port_b": (3,),
-    "acquisition": (),
+# Channel-enable bits with no LVDS pair behind them on each IMU fabric (the
+# freed CIPO1 lanes: A.CIPO1 = bits 2|3, B.CIPO1 = bits 6|7). Detection scoring
+# should never pass threshold on a tied-off input, but if it ever does, rescan
+# CORRECTS the applied mask (a phantom lane would stream garbage words forever)
+# and says so.
+_RESCAN_FREED_MASK = {
+    "acq_imu_both": 0xCC, "acq_imu_port_a": 0x0C, "acq_imu_port_b": 0xC0,
+    "acquisition": 0x00,
 }
 
 def rescan(sock, with_chip_detect=True):
@@ -790,21 +793,32 @@ def rescan(sock, with_chip_detect=True):
     if with_chip_detect:
         print("[RESCAN] 3/3 chip detection (phase sweep) ...")
         detection = run_detection(sock, verbose=False)
-        for lane_idx in _RESCAN_FREED_LANES[target]:
-            lane = ("A.CIPO0", "A.CIPO1", "B.CIPO0", "B.CIPO1")[lane_idx]
-            flagged = (detection.cipo1_detected if lane_idx == 1
-                       else detection.portb_cipo1_detected)
-            if flagged:
-                print(f"[RESCAN] WARNING: {lane} 'detected' a chip but that "
-                      f"lane has no LVDS pair on '{target}' (it is the IMU "
-                      f"I2C) -- the applied channel mask includes a phantom "
-                      f"lane; re-check assumption 3.")
+        freed = _RESCAN_FREED_MASK[target]
+        if detection.success and (detection.optimal_channel_mask & freed):
+            # A tied-off lane scored above threshold: correct the mask (that
+            # lane would stream garbage words forever) and re-apply. Latches
+            # while stopped -- apply_config left us stopped.
+            fixed = detection.optimal_channel_mask & ~freed
+            print(f"[RESCAN] correcting mask 0x{detection.optimal_channel_mask:02X} "
+                  f"-> 0x{fixed:02X}: bits 0x{detection.optimal_channel_mask & freed:02X} "
+                  f"have no LVDS pair on '{target}' (freed for the IMU I2C)")
+            if fixed == 0:
+                print("[RESCAN] nothing real detected after correction -- "
+                      "phases left as-is, set_channels by hand if needed")
+            else:
+                send_binary_command(sock, CMD_SET_CHANNEL_ENABLE, fixed)
+                validator.set_channel_enable(fixed)
+            detection.optimal_channel_mask = fixed
     else:
         print("[RESCAN] 3/3 chip detection skipped (with_chip_detect=False)")
 
     print(f"[RESCAN] done: fabric '{target}', IMU A={'Y' if imu_a else 'n'} "
           f"B={'Y' if imu_b else 'n'}"
           + (f", {detection.get_channel_summary()}" if detection else ""))
+    if imu_a or imu_b:
+        spec = 'both' if (imu_a and imu_b) else ('a' if imu_a else 'b')
+        print(f"[RESCAN] IMU ready: `imu_stream {spec}` (before `start`), "
+              f"then `imu_recv` / `imu_csv`")
     return {"imu_a": imu_a, "imu_b": imu_b, "fabric": target,
             "detection": detection}
 
