@@ -785,10 +785,14 @@ def rescan(sock, with_chip_detect=True):
         return None
     print(f"[RESCAN] starting from fabric '{pl['name']}'")
 
-    # set_config refuses while streaming; stop unconditionally (harmless when
-    # already stopped) rather than guessing at stream state.
-    send_binary_command(sock, CMD_STOP)
-    time.sleep(0.05)
+    # set_config refuses while streaming, so stop first -- but ONLY on an
+    # acquisition fabric. A blank or scan PL refuses every command outside the
+    # fabric-swap allow-list, so an unconditional stop prints a bare "Command
+    # failed (status: 0x15)" before rescan has done anything, which reads like
+    # a fault when it is just a command that does not apply yet.
+    if pl['is_acq']:
+        send_binary_command(sock, CMD_STOP)
+        time.sleep(0.05)
 
     print("[RESCAN] 1/3 IMU census on the scan fabric ...")
     r = set_config(sock, "scan")

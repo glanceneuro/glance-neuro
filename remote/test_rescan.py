@@ -142,8 +142,27 @@ def test_fabric_selection():
         configs = [p1 for (c, p1, _) in board.commands if c == net.CMD_SET_CONFIG]
         check(configs == [net.CONFIGS["scan"], want_sel],
               f"config sequence {configs}")
-        # And it must stop streaming before swapping fabrics.
-        check(board.commands[1][0] == net.CMD_STOP, "did not stop before set_config")
+        # Starting from a blank PL there is nothing to stop, and sending STOP
+        # anyway just draws an ACK error from the non-acq command guard.
+        check(not any(c == net.CMD_STOP for (c, _, _) in board.commands),
+              "sent STOP to a blank PL (draws a bogus 'Command failed')")
+
+
+def test_stop_only_when_acq():
+    print("stop_gating: STOP is sent when re-scanning FROM an acquisition fabric")
+    # The other half of the rule: if the board is already streaming, set_config
+    # would be refused, so the stop is required here.
+    board = MockBoard(imu_a=True, imu_b=True, config=net.CONFIGS["acquisition"])
+    restore = install_mock(board, detection_mask=0x11)
+    try:
+        net.rescan(None)
+    finally:
+        restore()
+    stops = [i for i, (c, _, _) in enumerate(board.commands) if c == net.CMD_STOP]
+    check(len(stops) == 1, f"expected exactly one STOP, got {len(stops)}")
+    first_cfg = next(i for i, (c, _, _) in enumerate(board.commands)
+                     if c == net.CMD_SET_CONFIG)
+    check(stops and stops[0] < first_cfg, "stopped after the fabric swap, not before")
 
 
 def test_freed_lane_correction():
@@ -370,6 +389,7 @@ def test_abort_paths():
 
 def main():
     test_fabric_selection()
+    test_stop_only_when_acq()
     test_freed_lane_correction()
     test_rescan_noapply()
     test_i2c_scan_decode()
