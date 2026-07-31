@@ -86,8 +86,8 @@ class MockBoard:
 
 class MockDetection:
     """Stand-in for the phase-sweep result rescan post-processes."""
-    def __init__(self, mask):
-        self.success = True
+    def __init__(self, mask, success=True):
+        self.success = success
         self.chips_detected = True
         self.optimal_channel_mask = mask
 
@@ -95,13 +95,14 @@ class MockDetection:
         return f"mask 0x{self.optimal_channel_mask:02X}"
 
 
-def install_mock(board, detection_mask=0x11):
+def install_mock(board, detection_mask=0x11, detection_success=True):
     """Point net.py's board-facing calls at the mock. Returns a restore fn."""
     saved = (net.send_binary_command, net.run_detection, net.validator)
 
     net.send_binary_command = lambda sock, cmd_id, param1=0, param2=0, \
         timeout=0.5: board.send(cmd_id, param1, param2, timeout)
-    net.run_detection = lambda sock, verbose=True: MockDetection(detection_mask)
+    net.run_detection = lambda sock, verbose=True: MockDetection(
+        detection_mask, detection_success)
 
     class V:
         def __init__(self):
@@ -208,6 +209,22 @@ def test_freed_lane_correction():
     finally:
         restore()
     check(board.applied_mask is None, "corrected a mask on the plain acq fabric")
+
+
+def test_freed_lane_when_detection_fails():
+    print("freed_lane_on_failure: a failed sweep must not leave phantom lanes")
+    # The sweep unconditionally programs DETECTION_CHANNEL_ENABLE (0xFF) and only
+    # narrows it when it SUCCEEDS. So a failed sweep on an IMU fabric leaves every
+    # freed CIPO1 lane enabled -- exactly what the correction exists to prevent.
+    board = MockBoard(imu_a=True, imu_b=True)
+    restore = install_mock(board, detection_mask=0x00, detection_success=False)
+    try:
+        net.rescan(None)
+    finally:
+        restore()
+    check(board.applied_mask == 0x33,
+          f"after a failed sweep the board holds 0x{board.applied_mask if board.applied_mask is not None else 0xFF:02X}, "
+          f"want 0x33 (0xFF with the freed CIPO1 lanes removed)")
 
 
 def test_rescan_noapply():
@@ -407,6 +424,22 @@ def test_status_extras():
         restore()
 
 
+def test_eeprom_address_refused():
+    print("eeprom_addr: an 8-bit datasheet address is refused, not masked")
+    board = MockBoard()
+    restore = install_mock(board)
+    try:
+        # 0xA0 is the 8-bit write address printed on every 24xx datasheet.
+        # Masking it yields 0x20 -- a plausible OTHER device -- whose bytes would
+        # then be dumped under the 0xA0 heading.
+        check(net.eeprom_read(None, 'a', 0xA0, 0, 32, 1) is None,
+              "accepted an 8-bit address")
+        check(not any(c == net.CMD_EEPROM_READ for (c, _, _) in board.commands),
+              "sent a read to the masked address 0x20")
+    finally:
+        restore()
+
+
 def test_abort_paths():
     print("abort_paths: rescan gives up cleanly when the board can't comply")
 
@@ -443,11 +476,13 @@ def main():
     test_fabric_selection()
     test_stop_only_when_acq()
     test_freed_lane_correction()
+    test_freed_lane_when_detection_fails()
     test_rescan_noapply()
     test_i2c_scan_decode()
     test_imu_command_decode()
     test_eeprom_failure_statuses()
     test_status_extras()
+    test_eeprom_address_refused()
     test_abort_paths()
     if failures:
         print(f"TB_FAIL  Errors: {failures}")

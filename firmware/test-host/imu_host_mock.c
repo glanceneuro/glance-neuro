@@ -28,6 +28,9 @@ int        mock_dyninit_calls[2];
 uint32_t   mock_timestamp_hi, mock_timestamp_lo;
 uint32_t   mock_xfer_us = 900;      // ~8 data bytes + addressing at 100 kHz
 int        mock_bad_sequence;
+uint32_t   mock_dtr_log[MOCK_DTR_LOG_MAX];
+int        mock_dtr_n;
+uint8_t    mock_i2c_present[128];
 
 static uint64_t mock_now;
 
@@ -47,6 +50,7 @@ typedef struct {
     int      pending;       // 0 none, 1 data due, 2 NACK due
     uint64_t due_at;
     uint8_t  pend_reg, pend_len;
+    int      never_busy;
 } sim_iic_t;
 
 static sim_iic_t sim[2];
@@ -65,6 +69,7 @@ static int port_of(UINTPTR base) { return base == IMUDET_A_BASE ? 0 : 1; }
 // transaction's STOP still releasing the bus.
 static int sim_bus_busy(const sim_iic_t *s)
 {
+    if (s->never_busy) return 0;        // dead line: SDA/SCL never move
     if (s->pending) return 1;
     if (s->addr_phase_busy && mock_now >= s->busy_at) return 1;
     return mock_now < s->release_at;
@@ -91,6 +96,7 @@ static uint8_t bno_reg_byte(int port, uint8_t addr)
     if (addr == BNO055_REG_TEMP)       return (uint8_t)b->temp;
     if (addr == BNO055_REG_CALIB_STAT) return b->calib;
     if (addr == BNO055_REG_OPR_MODE)   return BNO055_MODE_NDOF;
+    if (addr == BNO055_CHIP_REG)       return BNO055_CHIP_ID;
     return 0;
 }
 
@@ -157,6 +163,26 @@ void mock_iic_write(UINTPTR base, uint32_t offset, uint32_t value)
         return;
     }
     if (offset != XIIC_DTR_REG_OFFSET) return;
+    if (mock_dtr_n < MOCK_DTR_LOG_MAX) mock_dtr_log[mock_dtr_n++] = value;
+    s->never_busy = mock_bno[port].never_busy;
+
+    // An ADDRESS-ONLY probe is one word carrying START and STOP together, with
+    // no data phase at all -- what pl_i2c_probe uses to scan the bus without
+    // sending a byte any device could read as a command.
+    if (s->st == 0 && (value & XIIC_TX_DYN_START_MASK)
+                   && (value & XIIC_TX_DYN_STOP_MASK)) {
+        uint8_t a = (uint8_t)((value >> 1) & 0x7F);
+        if (!mock_i2c_present[a]) {
+            s->pending = 2;                       // NACK
+            s->due_at  = mock_now + 200;
+        } else {
+            // ACK: the core drives START+addr+STOP and then lets go. Model only
+            // the release window -- addr_phase_busy is for the combined
+            // write-then-read, which stays busy awaiting its byte count.
+            s->release_at = mock_now + MOCK_START_LATENCY_US + MOCK_STOP_RELEASE_US;
+        }
+        return;
+    }
 
     // Dynamic command FIFO parse -- must be exactly the combined sequence.
     uint32_t addr_w = XIIC_TX_DYN_START_MASK | (BNO055_I2C_ADDR << 1);
@@ -272,6 +298,7 @@ void send_message(const char *fmt, ...)
     va_end(ap);
 }
 
+#ifndef IMU_PROBE_TEST   // the probe binary links the REAL one from pl_imu_read.c
 int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out)
 {
     int port = port_of(base);
@@ -280,6 +307,7 @@ int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out)
     *mode_out = BNO055_MODE_NDOF;
     return 1;
 }
+#endif
 
 void mock_reset(void)
 {
@@ -289,6 +317,9 @@ void mock_reset(void)
     memset(mock_ndof_calls, 0, sizeof(mock_ndof_calls));
     memset(mock_dyninit_calls, 0, sizeof(mock_dyninit_calls));
     mock_n_pkts = 0; mock_pbuf_fail = 0; mock_bad_sequence = 0;
+    mock_dtr_n = 0;
+    memset(mock_i2c_present, 0, sizeof(mock_i2c_present));
+    mock_i2c_present[BNO055_I2C_ADDR] = 1;
     mock_xfer_us = 900;
     mock_timestamp_hi = 0; mock_timestamp_lo = 0;
     mock_bno[0].present = mock_bno[1].present = 1;

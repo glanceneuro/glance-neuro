@@ -334,6 +334,31 @@ static void test_end_of_read_nack(void)
     pl_imu_stream_set(0, 0);
 }
 
+static void test_deadline_survives_slow_service(void)
+{
+    printf("deadline_slow_service: the wedge detector must still fire\n");
+    // The service-gap credit exists so a busy command loop cannot manufacture
+    // I2C errors -- but it must give back only the EXCESS. Crediting the whole
+    // interval advances the deadline 1:1 with wall clock, and since that
+    // deadline is the ONLY wedged-bus detector, the port would then never
+    // recover, never auto-stop, and go quiet with iic_errors reading 0.
+    //
+    // Must be driven ABOVE IMU_SERVICE_GAP_MS (2 ms), or the credit path never
+    // runs at all -- which is why run_ms()'s 50 us cadence cannot catch this.
+    mock_reset();
+    pl_imu_stream_set(1, 10);
+    run_ms(20);
+    mock_bno[0].wedge = 1;
+    int before = mock_dyninit_calls[0];
+    for (int i = 0; i < 200; i++) {          // 200 x 5 ms = 1 s, 50x the deadline
+        pl_imu_stream_service();
+        mock_advance_us(5000);
+    }
+    CHECK(mock_dyninit_calls[0] > before,
+          "wedged bus never detected under slow service (deadline unreachable)");
+    pl_imu_stream_set(0, 0);
+}
+
 static void test_lifecycle(void)
 {
     printf("lifecycle: fabric-swap stop then restart, and adding a port live\n");
@@ -441,6 +466,7 @@ int main(void)
     test_stop_all_mid_flight();
     test_bus_ordering();
     test_service_gap();
+    test_deadline_survives_slow_service();
     test_end_of_read_nack();
     test_lifecycle();
     test_period_clamp();

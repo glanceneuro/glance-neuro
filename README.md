@@ -17,7 +17,7 @@ cables of RHD2000 chips over a DDR SPI protocol; the PS streams the data over th
 - A user-programmable per-cable phase delay compensates for cable length.
 - **TCP control** (port 0x6900 / 26880) + **UDP data stream** (port 0x6800 / 26624, ~9 MB/s per cable, ~18 MB/s at full config).
 - Data path: `Intan ──SPI(DDR)──► PL ──BRAM──► (AXI CDMA) ──► PS ──UDP──► host`.
-- **On-PL LFP band** — a second stream (`stream_type=2`) decimates the 30 kHz broadband to a ~3 kHz LFP band right in the PL (polyphase /5 + two half-band /2 FIR cascade), sharing the one UDP port. See [docs/lfp.md](docs/lfp.md).
+- **On-PL LFP band** — a second stream (`stream_type=2`) decimates the 30 kHz broadband to a ~3 kHz LFP band right in the PL (one half-band /2 + polyphase /5 FIR cascade), sharing the one UDP port. See [docs/lfp.md](docs/lfp.md).
 - **DAC stimulus playback** — arbitrary analog waveforms out of two on-board SMA connectors (a dual-channel DAC70502), software- or hardware-triggered, looping or one-shot, and independent of neural acquisition. See [docs/stim.md](docs/stim.md).
 
 MicroZed SOMs are ~$300 (e.g. [Newark](https://www.newark.com/avnet/aes-z7mb-7z020-som-i-g-rev-h/eval-brd-32bit-fpga-arm-cortex/dp/62AJ7410)).

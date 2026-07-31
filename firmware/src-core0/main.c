@@ -785,7 +785,7 @@ int main() {
     pl_is_acq = 0;
     current_config = -1;   // blank -- CMD_PL_STATUS reports "blank"
     send_message("System ready (PL BLANK -- no baked bitstream). "
-                 "Load a fabric: set_config <acquisition|scan|acq_imu_both>\r\n");
+                 "Load a fabric: set_config <acquisition|acq_imu_both|acq_imu_port_a|acq_imu_port_b>\r\n");
   }
   send_message("debug> ");
 

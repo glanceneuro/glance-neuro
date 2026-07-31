@@ -78,8 +78,10 @@ int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out);   // mock-controlled
 #include "pl_imu_stream.h"
 #define UNIFIED_MAGIC   0xCAFEBABE
 #define UNIFIED_VERSION 1
-// BNO055 register constants, verbatim from pl_imu_read.h (which cannot be
-// included here: it declares pl_imu_ndof_enter with the target's UINTPTR).
+// BNO055 register constants, mirrored from pl_imu_read.h. That header CAN be
+// included here (the stub xil_types.h supplies UINTPTR) -- what collides is the
+// mock's own stand-in definition of pl_imu_ndof_enter, which is a link-time
+// clash the probe binary resolves with IMU_PROBE_TEST.
 #define BNO055_REG_ACC_DATA   0x08
 #define BNO055_REG_GYR_DATA   0x14
 #define BNO055_REG_QUA_DATA   0x20
@@ -93,11 +95,15 @@ int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out);   // mock-controlled
 typedef struct {
     int     present;            // 0 -> every transaction NACKs (TX_ERROR)
     int     wedge;              // 1 -> accept commands but never return data
+    int     never_busy;         // 1 -> the bus never asserts BUS_BUSY (dead line)
     int16_t quat[4], acc[3], gyr[3];
     int8_t  temp;
     uint8_t calib;
     uint8_t regs_read;          // count of completed read transactions
 } mock_bno_t;
+
+// Which 7-bit addresses ACK an address-only probe (used by the i2c_scan tests).
+extern uint8_t mock_i2c_present[128];
 
 typedef struct {
     uint8_t  data[2048];
@@ -113,7 +119,13 @@ extern int          mock_ndof_calls[2];
 extern int          mock_dyninit_calls[2];
 extern uint32_t     mock_timestamp_hi, mock_timestamp_lo;
 extern uint32_t     mock_xfer_us;       // simulated bus time per transaction
-extern int          mock_bad_sequence;  // FIFO writes deviating from the combined sequence
+extern int          mock_bad_sequence;   // FIFO writes deviating from the combined sequence
+// Every word written to the TX command FIFO, in order. Lets a test assert the
+// EXACT bus traffic -- e.g. that an address probe emits one word and no data
+// byte -- rather than inferring it from an ACK.
+#define MOCK_DTR_LOG_MAX 256
+extern uint32_t     mock_dtr_log[MOCK_DTR_LOG_MAX];
+extern int          mock_dtr_n;
 
 void mock_reset(void);                  // fresh state for each test
 void mock_advance_us(uint64_t us);      // move the mock clock forward

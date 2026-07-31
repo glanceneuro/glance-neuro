@@ -576,7 +576,7 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // also works on the non-acq scan fabric (past the guard allow-list).
             if (!pl_has_iic) {
                 send_message("DETECT_IMU refused: loaded fabric has no I2C "
-                             "(set_config acq_imu_both or scan first)\r\n");
+                             "(set_config acq_imu_both first)\r\n");
                 send_ack(tpcb, cmd->ack_id, ACK_ERROR);
                 return;
             }

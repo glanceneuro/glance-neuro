@@ -6,8 +6,8 @@ identification below still needs the schematic or a bench scan. The headstage
 schematic is not in this repo or glance-neuro-hardware (the carrier KiCad files
 have no EEPROM/BNO055; those parts are on the headstage itself), so the part
 inference comes from the validated bus facts plus 24xx-family convention.
-First bench step: `set_config scan` → `i2c_scan a` prints the full bus map and
-flags the block-addressing signature automatically.
+First bench step: `set_config acq_imu_both` → `i2c_scan a` prints the full bus
+map and flags the block-addressing signature automatically.
 
 ## What we know (validated)
 
@@ -16,8 +16,11 @@ flags the block-addressing signature automatically.
   `docs/imu-detect.md`, `detect_pins.xdc`).
 - A BNO055 sits on that bus at **0x28** (chip_id 0xA0 read on hardware,
   2026-07-30, port A).
-- The probe path that works: `XIic_DynInit` → `XIic_DynSend`(addr, reg-pointer,
-  repeated start) → `XIic_DynRecv` (`firmware/src-core0/pl_imu_detect.c`).
+- The probe path that works: `XIic_DynInit`, then the same combined
+  write-then-read the rest of the firmware uses, driven by the BOUNDED
+  `pl_imu_bno_read` (`firmware/src-core0/pl_imu_read.c`). The vendor's
+  `XIic_DynSend`/`XIic_DynRecv` are deliberately NOT used anywhere reachable
+  from a command handler: they spin on `BUS_BUSY` with no timeout.
 
 ## What the EEPROM most likely is
 

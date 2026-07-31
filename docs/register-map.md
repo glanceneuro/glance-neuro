@@ -2,7 +2,7 @@
 
 The control interface is a flat AXI-Lite register bank at **`0x40000000`**: **28 control
 registers** (PS → PL, regs 0–27) immediately followed by **14 status registers** (PL → PS,
-regs 0–12, so status reg *n* is at `0x40000000 + (25 + n)·4`).
+regs 0–12, so status reg *n* is at `0x40000000 + (28 + n)·4` (`PL_N_CTRL_REGS` = 28)).
 
 `firmware/include/main.h` declares the layout; the PL **consumes** the control regs and
 **produces** the status regs in `programmable_logic/src/data_generator_core.sv` (regs, phases,
@@ -10,7 +10,7 @@ command table, status 0–9, aux) and `data_generator_wrapper.v` (status 10–12
 is cross-referenced against both — every field below is confirmed by the PL line that uses it.
 If you change the map, change `main.h`, the RTL, and this file together.
 
-## Control registers — PS → PL (`0x40000000`, 25 regs)
+## Control registers — PS → PL (`0x40000000`, 28 regs)
 
 | reg | offset | purpose |
 |----:|--------|---------|
@@ -160,12 +160,11 @@ full IP blocks at their own base addresses:
 | base | peripheral | present on | purpose |
 |------|-----------|------------|---------|
 | `0x44A00000` | AXI CDMA | all fabrics | bulk PL→PS data path (result BRAM → DDR staging); see `.claude/skills/check-dma` |
-| `0x43D00000` | `axi_iic_a` | `acq_imu_*`, `scan`/`detect` | port-A cable I2C — BNO055 IMU (+ headstage EEPROM) |
-| `0x43D10000` | `axi_iic_b` | `acq_imu_*`, `scan`/`detect` | port-B cable I2C — BNO055 IMU (+ headstage EEPROM) |
+| `0x43D00000` | `axi_iic_a` | `acq_imu_*` fabrics | port-A cable I2C — BNO055 IMU (+ headstage EEPROM) |
+| `0x43D10000` | `axi_iic_b` | `acq_imu_*` fabrics | port-B cable I2C — BNO055 IMU (+ headstage EEPROM) |
 
 The two AXI IICs exist **only** on fabrics that route the freed second-CIPO pins to I2C:
-the `acq_imu_*` acquisition fabrics free port A `M19/M20` and port B `J16/K16`, and the
-single-ended `scan`/`detect` fabric. On the plain 128-ch `acquisition` fabric they are
+the `acq_imu_*` acquisition fabrics free port A `M19/M20` and port B `J16/K16`. On the plain 128-ch `acquisition` fabric they are
 absent, and an AXI read at `0x43D0xxxx` there never returns — which is why **every**
 command that touches a controller is gated on the **per-port** flags `pl_has_iic_a` /
 `pl_has_iic_b` (a single fabric-level "has I2C" is insufficient the moment a peripheral
@@ -182,7 +181,7 @@ the vendor's (`XIic_DynRecv`) and is what the detect path proved on this board:
 
 | user | file | waits for BUS_BUSY by |
 |---|---|---|
-| one-shot detect / read | `pl_imu_detect.c`, `pl_imu_read.c` | the blocking `XIic_Dyn*` API |
+| one-shot detect / read | `pl_imu_detect.c`, `pl_imu_read.c` | a bounded poll in `pl_imu_bno_read` |
 | continuous IMU stream | `pl_imu_stream.c` | a state-machine pass (never blocks — 30 kHz pump) |
 | bus scan / EEPROM read | `pl_i2c_probe.c` | a bounded polled wait (cold path) |
 

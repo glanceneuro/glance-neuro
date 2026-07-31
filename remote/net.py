@@ -668,11 +668,14 @@ def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
         print(f"    {offset + i:04x}: {hexs:<47} {text}")
     return bytes(payload)
 
-# Deferred PL load (step 2, docs/deferred-boot.md): the loader image boots with a
-# blank PL and programs a fabric from the SD card via PCAP on command.
-CMD_LOAD_PL = 0xB2
-PL_LOAD_VERSION = 0x4C4F4144   # "LOAD"
-PL_IMAGES = {"detect": 0}      # name -> param1 selector (firmware pl_image_name)
+# --- Config swap on the acquisition firmware (CMD_SET_CONFIG) -----------------
+# PCAP-swap the whole PL fabric to a named config. Only accepted when NOT
+# streaming (stop first); the board resets the master timestamp on a successful
+# acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
+# Append-only selectors (firmware pl_configs order): acquisition=128-ch/no-IMU,
+# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables,
+# acq_imu_port_a/_b = one cable 64-ch+IMU and the other 128-ch LVDS.
+# PCAP loader status codes, shared by every command that programs the PL.
 _PL_STATUS = {
     0: "ok", 1: "SD mount failed", 2: "bitstream not found on SD",
     3: "SD read failed", 4: "empty bitstream file", 5: "bitstream too large",
@@ -681,36 +684,6 @@ _PL_STATUS = {
     0xFFFFFFFF: "unknown image selector",
 }
 
-def load_pl(sock, name="detect"):
-    """Ask the loader image to program a fabric from SD via PCAP. `name` picks the
-    <name>.bin file on the SD card (must be in PL_IMAGES)."""
-    if name not in PL_IMAGES:
-        print(f"[LOAD] unknown image '{name}'; known: {', '.join(sorted(PL_IMAGES))}")
-        return None
-    # PCAP program + a multi-MB SD read can take a couple of seconds; be generous.
-    ok, data = send_binary_command(sock, CMD_LOAD_PL, param1=PL_IMAGES[name], timeout=15.0)
-    if not ok or data is None or len(data) < 12:
-        print("[LOAD] no/short response -- is the loader (deferred-boot) image running?")
-        return None
-    status, nbytes, ver = struct.unpack('<III', data[:12])
-    if ver != PL_LOAD_VERSION:
-        print(f"[LOAD] unexpected version 0x{ver:08X} (expected 0x{PL_LOAD_VERSION:08X}); "
-              f"wrong image?")
-    msg = _PL_STATUS.get(status, f"error {status}")
-    if status == 0:
-        print(f"Loaded '{name}.bin' into the PL: {nbytes} bytes, PCAP OK. "
-              f"The fabric is live -- try detect_imu.")
-    else:
-        print(f"Load of '{name}.bin' FAILED: {msg} (status={status}, {nbytes} bytes read)")
-    return {"status": status, "bytes": nbytes}
-
-# --- Config swap on the acquisition firmware (CMD_SET_CONFIG) -----------------
-# PCAP-swap the whole PL fabric to a named config. Only accepted when NOT
-# streaming (stop first); the board resets the master timestamp on a successful
-# acquisition load, so treat everything after as a fresh epoch. Phase 1a exposes
-# Append-only selectors (firmware pl_configs order): acquisition=128-ch/no-IMU,
-# scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables,
-# acq_imu_port_a/_b = one cable 64-ch+IMU and the other 128-ch LVDS.
 CMD_SET_CONFIG = 0xB4
 # Selector order mirrors the firmware's pl_configs[] exactly -- it is an index
 # into that table, so the two move together.
@@ -939,7 +912,6 @@ def print_command_help():
     print("       imu_recv [n]  (print live samples)   imu_csv [file|stop]  (record to CSV)")
     print("  I2C: i2c_scan [a|b]  (bus ACK map 0x08-0x77)   eeprom_read [a|b] [dev=0x50] [off=0] [len=32] [width=1]")
     print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
-    print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
     print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
     print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
@@ -3836,9 +3808,6 @@ def tcp_control():
                     # "rescan noapply" = fabric selection only, skip the phase
                     # sweep (leaves phases/mask untouched).
                     rescan(sock, with_chip_detect=("noapply" not in cmd.split()[1:]))
-                elif cmd == "load_pl" or cmd.startswith("load_pl "):
-                    parts = cmd.split()
-                    load_pl(sock, parts[1] if len(parts) > 1 else "detect")
                 elif cmd == "set_config" or cmd.startswith("set_config "):
                     parts = cmd.split()
                     if len(parts) > 1:
