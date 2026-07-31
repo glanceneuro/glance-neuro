@@ -106,7 +106,10 @@ packet (the loss check). Max packet = 14 + 140 = 154 words = 616 B (≤ 1 datagr
 header (no sub-block) then the decimated samples. `num_samples` = `popcount(lane_mask)·32`
 (`lane_mask` mirrors the broadband `channel_enable`). The PL builds the whole frame
 (header + samples) in its output BRAM; the PS DMAs it and sends it on UDP 0x6800 with
-stream_type=2. Verified in `programmable_logic/sim/lfp_dsp_block_tb.sv`.
+stream_type=2. The cascade was validated in simulation against the reference response from
+`design_lfp_filters.py`; that bench was retired once the engine was built and tested on
+hardware, per `docs/TESTING.md` — one-off benches are deleted outright rather than carried,
+and git history keeps them.
 
 ### IMU (type 3) — BNO055 side channel
 

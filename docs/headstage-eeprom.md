@@ -16,7 +16,8 @@ Open-Ephys-authored identity record that names the board. Probe tooling is
 
 - Each cable carries an I2C bus on the freed 2nd-CIPO pair (SCL on the -P pin,
   SDA on the -N pin; 2 kOhm pull-ups on the headstage; 100 kHz; LVCMOS25 —
-  `detect_pins.xdc`).
+  `constraints/variants/acq_imu_*_pins.xdc`: M20=SDA/M19=SCL on port A,
+  J16=SDA/K16=SCL on port B).
 - A BNO055 sits on that bus at **0x28** (chip_id 0xA0, hardware, 2026-07-30).
 - The EEPROM answers at **0x50** with **1-byte word addressing**: two reads at
   offsets 0 and 32 returned a record that is contiguous across the boundary

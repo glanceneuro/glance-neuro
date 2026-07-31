@@ -407,16 +407,16 @@ static void send_response(struct tcp_pcb *tpcb, uint32_t ack_id, uint8_t status,
 static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     uint8_t status = ACK_SUCCESS;
 
-    // On a non-acquisition fabric (scan) or a torn-down PL, refuse anything
-    // that reads/writes acquisition registers at 0x40000000 / CDMA / BRAM:
-    // those are not present, and such an AXI access never gets a response, so
-    // the core hangs. The allow-list is therefore "touches no PL", not "looks
+    // With no acquisition fabric live -- a torn-down PL mid-swap, or a blank one
+    // because the bitstream was omitted from BOOT.bin or a load failed -- refuse
+    // anything that reads/writes acquisition registers at 0x40000000 / CDMA /
+    // BRAM: those are not present, and such an AXI access never gets a response,
+    // so the core hangs. The allow-list is therefore "touches no PL", not "looks
     // harmless" -- SET_UDP_DEST qualifies because it only reconfigures lwIP's
     // destination on the PS side, and a host must be able to say where packets
-    // go BEFORE a fabric exists (the board boots blank, so a client that
-    // configures its UDP destination at connect would otherwise be refused and
-    // conclude the board is broken). GET_STATUS deliberately stays out: it
-    // reads PL status registers.
+    // go without first proving a fabric is up, or a client that configures its
+    // UDP destination at connect gets refused and concludes the board is broken.
+    // GET_STATUS deliberately stays out: it reads PL status registers.
     if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
         cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU &&
         cmd->cmd_id != CMD_IMU_READ && cmd->cmd_id != CMD_I2C_SCAN &&
@@ -573,7 +573,7 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // carries the IICs (acq_imu_* OR the scan/detect fabric); refused on a
             // fabric without them (plain acq), where 0x43D0 is absent and the AXI
             // read would never return. Gated by pl_has_iic, not pl_is_acq, so it
-            // also works on the non-acq scan fabric (past the guard allow-list).
+            // also works without an acquisition fabric (past the guard allow-list).
             if (!pl_has_iic) {
                 send_message("DETECT_IMU refused: loaded fabric has no I2C "
                              "(set_config acq_imu_both first)\r\n");

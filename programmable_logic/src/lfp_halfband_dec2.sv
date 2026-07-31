@@ -16,7 +16,7 @@
 // whatever would fold onto the final passband.
 //
 // The default coefficients are a halfband (see lfp_coef_pkg), which is why 4 of
-// the 11 taps are zero and the center is exactly 0.5. The engine does NOT
+// the 11 taps are zero and the centre is exactly 0.5. The engine does NOT
 // exploit that: it MACs all 11 taps unconditionally. Skipping the zeros would
 // save 4 of 11 cycles the budget does not need, and would silently compute the
 // wrong answer for any non-halfband coefficients the host uploads -- and the
@@ -100,7 +100,7 @@ module lfp_halfband_dec2 #(
     localparam signed [OUT_W:0]    OUT_MIN = -(1 <<< (OUT_W-1));
 
     // =================================================================
-    // Coefficient RAM. Small enough to be distributed RAM; initialized to the
+    // Coefficient RAM. Small enough to be distributed RAM; initialised to the
     // designed halfband so the board filters correctly with no host upload.
     // =================================================================
     logic signed [COEF_W-1:0] coef_ram [0:N_TAPS-1];

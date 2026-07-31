@@ -46,7 +46,7 @@ One time-shared MAC (a single DSP48) serves every one of the 256 `(lane × slot)
 
 The default coefficients are a **halfband**: an equiripple design whose bands are symmetric
 about `fs/4` with equal ripple weights already has every second tap zero, and the design
-script snaps those to exact zero and pins the center tap to 0.5. Halfband symmetry forces
+script snaps those to exact zero and pins the centre tap to 0.5. Halfband symmetry forces
 the transition to be symmetric about `fs/4`, so choosing the passband edge also chooses the
 stopband edge (`f_stop = 15 kHz − f_pass`, i.e. 13 kHz at the shipped 2 kHz edge). The only
 free choice is how *wide* to make that transition, and widening it buys attenuation for free
@@ -73,7 +73,7 @@ is exact), with **4 MACs running in parallel**.
 ### On "polyphase"
 
 A decimating FIR only has to produce the outputs it keeps, so each output costs `num_taps`
-MACs however the sum is organized. An explicit M-branch polyphase decomposition computes
+MACs however the sum is organised. An explicit M-branch polyphase decomposition computes
 the same products in a different order for the same cost; its advantage is over the naive
 *filter everything, throw away 4 of 5*, which this engine never does. So this is the
 polyphase-efficient form written directly: on the decimation tick, walk the taps once per

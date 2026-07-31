@@ -286,7 +286,7 @@ int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
   }
   send_message("Config '%s' loaded (%lu bytes)%s\r\n", c->name,
                (unsigned long)bytes,
-               c->is_acq ? ", acquisition ready" : " (scan fabric)");
+               c->is_acq ? ", acquisition ready" : " (non-acquisition fabric)");
   return 0;
 }
 
@@ -855,7 +855,7 @@ int main() {
     network_maintenance_loop();
 
     // The stream services touch the PL, so run them only on an acquisition
-    // fabric. (stream_enabled/lfp are already 0 on a scan fabric and START is
+    // fabric. (stream_enabled/lfp are already 0 without an acq fabric and START is
     // gated on pl_is_acq, but this makes a mid-swap teardown provably safe.)
     if (!pl_is_acq)
       continue;

@@ -22,8 +22,8 @@ add_files -fileset sources_1 [glob ./programmable_logic/src/*.sv]
 update_compile_order -fileset sources_1
 
 # Constraints: the full standard acq set MINUS intan_io.xdc (its LVDS lanes are
-# replaced by the variant, which also drops CIPO1) and detect_pins.xdc (its I2C
-# lanes are folded into the variant). Everything else -- DAC/UART/LED/digital-in
+# replaced by the variant, which also drops CIPO1; the I2C lanes are in the
+# variant too). Everything else -- DAC/UART/LED/digital-in
 # pins AND zzz_clock_groups.xdc (the async 84/175 MHz declarations) -- is
 # required: without the pin files 15 ports fail DRC, without the clock groups
 # every cross-domain path is scored as a real violation.
@@ -31,7 +31,7 @@ puts "Adding variant constraints..."
 add_files -fileset constrs_1 ./programmable_logic/constraints/variants/acq_imu_both_pins.xdc
 foreach f [lsort [glob ./programmable_logic/constraints/*.xdc]] {
     set base [file tail $f]
-    if {$base eq "intan_io.xdc" || $base eq "detect_pins.xdc"} { continue }
+    if {$base eq "intan_io.xdc"} { continue }
     add_files -fileset constrs_1 $f
 }
 

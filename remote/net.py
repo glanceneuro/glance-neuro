@@ -325,8 +325,8 @@ def detect_imu(sock):
     return res
 
 # One-shot BNO055 fused sample (CMD_IMU_READ). Reply is 32 bytes -- keep in sync
-# with firmware imu_sample_response_t. DRAFT (overnight 2026-07-30), untested on
-# hardware; the continuous-ingestion design is docs/imu-ingestion.md.
+# with firmware imu_sample_response_t. Validated on hardware 2026-07-30 (chip_id
+# 0xA0, port A); the continuous-ingestion design is docs/imu-ingestion.md.
 CMD_IMU_READ = 0xB6
 IMUREAD_VERSION = 0x494D5552  # "IMUR"
 
@@ -705,7 +705,7 @@ def set_config(sock, name):
     rc, nbytes, flags = struct.unpack('<iII', data[:12])
     is_acq, link_up = bool(flags & 1), bool(flags & 2)
     if rc == 0:
-        kind = "acquisition ready" if is_acq else "scan fabric (no streaming)"
+        kind = "acquisition ready" if is_acq else "non-acquisition fabric (no streaming)"
         print(f"Config '{name}': {nbytes} bytes loaded, {kind}, "
               f"link {'UP' if link_up else 'DOWN(!)'}, master timestamp reset.")
     elif rc < 0:
@@ -738,7 +738,7 @@ def pl_status(sock, verbose=True):
     return {"config": config, "name": name, "is_acq": is_acq, "link_up": link_up}
 
 # --- rescan: one-shot inventory + fabric selection ----------------------------
-# DRAFT (overnight 2026-07-30) -- composes existing pieces; no new firmware.
+# Composes existing pieces; no new firmware.
 #
 # Why it is shaped this way -- survey of the detection machinery it builds on:
 #   * auto_cable_detect (CableDetection.detect) is the ONLY per-cable "is an RHD
@@ -748,19 +748,24 @@ def pl_status(sock, verbose=True):
 #     serve: the slot-2 inject result register is PORT A ONLY (register-map.md,
 #     status reg 12) and the inject path requires active streaming.
 #   * detect_imu (CMD_DETECT_IMU) probes a port's BNO055 only on a fabric whose
-#     port has an AXI IIC; the 'scan' fabric has both.
+#     port has an AXI IIC; acq_imu_both (CENSUS_FABRIC) has one on each.
 # No single fabric can run both probes on one port (the IMU I2C occupies the
 # freed CIPO1 balls), so rescan is a two-fabric dance:
-#     scan -> IMU census -> pick fabric -> load it -> phase-sweep chip detect.
+#     acq_imu_both -> IMU census -> pick fabric -> load it -> phase-sweep detect.
 #
-# ASSUMPTIONS (review in the morning):
+# ASSUMPTIONS:
 #   1. IMU presence alone selects the fabric (both->acq_imu_both, A->_port_a,
 #      B->_port_b, neither->acquisition). Chip detection runs AFTER, only to set
 #      phases + channel mask on the chosen fabric -- it cannot influence the
 #      choice because it needs an acquisition fabric to run at all.
-#   2. Probing I2C on a cable that carries a plain 128-ch headstage (the scan
+#   2. Probing I2C on a cable that carries a plain 128-ch headstage (the census
 #      fabric drives SCL/SDA into what that headstage drives as LVDS CIPO1) is
-#      assumed electrically harmless for the ~ms probe and reads as "no IMU".
+#      believed electrically harmless for the ~ms probe and reads as "no IMU".
+#      SO FAR WE HAVE NOT SEEN ISSUES on the cables in the lab. That is bench
+#      experience, not a datasheet argument about contention between an
+#      open-drain driver and an LVDS output, so treat it as "no evidence of
+#      harm" rather than "proven safe" -- if a cable ever misbehaves after a
+#      rescan, this is the first thing to suspect.
 #   3. On acq_imu_* fabrics the freed CIPO1 lane(s) are expected to score below
 #      DETECTION_THRESHOLD in the sweep (tied-off input, no test sine) -- and
 #      rescan ENFORCES it: any freed-lane bit that sneaks into the detected
@@ -771,16 +776,21 @@ def pl_status(sock, verbose=True):
 #   5. set_config resets the master timestamp -- a rescan starts a fresh epoch,
 #      so never run it mid-recording.
 #
-# OPEN QUESTIONS (for Caleb):
-#   * Is (2) actually safe on your cables, or should rescan refuse to I2C-probe
-#     a port that streamed chips on its last known fabric?
-#   * Empty cable (no IMU, no chip) currently contributes "plain LVDS" to the
-#     fabric choice -- i.e. two empty ports load 'acquisition'. Prefer that, or
-#     leave the board on 'scan' until something is found?
-#   * Should "IMU present but no chip on that cable's CIPO0" be flagged as a
-#     seating fault rather than silently accepted?
-#   * rescan leaves streaming STOPPED (detection's apply stops to latch the
-#      mask). Auto-start instead?
+# DECIDED (2026-07-31, Caleb):
+#   * Empty cable counts as "plain LVDS", so two empty ports load 'acquisition'.
+#     That is the wanted behavior: the board lands on a usable acquisition
+#     fabric whether or not anything is plugged in, rather than parking on a
+#     census fabric that cannot stream.
+#   * rescan leaves streaming STOPPED, deliberately. Detection's apply stops the
+#     stream to latch the channel mask, and restarting it here would hide that a
+#     rescan resets the master timestamp (assumption 5) -- the host should
+#     re-'start' knowingly, on a fresh epoch.
+#   * "IMU present but no chip on that cable's CIPO0" is a probable seating
+#     fault, but net.py deliberately does NOT special-case it: the per-port
+#     census and per-lane scores are already printed, and a human reading them
+#     can see it. It is surfaced as a notification in the Open Ephys plugin
+#     instead (IntanSocket::rescanDevice), which is where an operator is
+#     actually looking during a recording setup.
 
 # (imu_a_present, imu_b_present) -> fabric name in CONFIGS
 _RESCAN_FABRIC = {
@@ -848,7 +858,7 @@ def rescan(sock, with_chip_detect=True):
         r = set_config(sock, target)
     if not r or r["rc"] != 0:
         print(f"[RESCAN] aborted -- could not load '{target}'; the board is "
-              f"still on 'scan' (pl_status to confirm)")
+              f"still on '{CENSUS_FABRIC}' (pl_status to confirm)")
         return None
 
     detection = None
@@ -911,8 +921,8 @@ def print_command_help():
     print("       imu_stream [a|b|both|off] [period_ms]  (continuous 100 Hz stream_type=3; start BEFORE 'start')")
     print("       imu_recv [n]  (print live samples)   imu_csv [file|stop]  (record to CSV)")
     print("  I2C: i2c_scan [a|b]  (bus ACK map 0x08-0x77)   eeprom_read [a|b] [dev=0x50] [off=0] [len=32] [width=1]")
-    print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
-    print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
+    print(f"  Rescan: rescan  (IMU census on '{CENSUS_FABRIC}' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
+    print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots on 'acquisition')")
     print("       pl_status  (which fabric is loaded -- works in any state; auto-shown on connect)")
     print("  Stim: stim_status, stim_gaussian [amp_v] [sigma_ms] [k] [A|B|both], stim_sine [hz] [amp_v] [k] [A|B|both]")
     print("        stim_dc <volts_a> [volts_b] (hold constant level), stim_dc_off")

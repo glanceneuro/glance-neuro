@@ -67,19 +67,13 @@ scripts/build_acq_loader.sh              # the whole set: BOOT.bin + four fabric
 scripts/build_acq_loader.sh --app-only   # firmware only; refuses if the PL changed
 ```
 
-That is the whole build. **Use this script, not `scripts/build.sh`** — that one belongs to
-the older monolithic config and writes `blobs/BOOT.bin` from a different bif, leaving the
-four fabric blobs behind from another build. It fingerprints the PL sources to decide whether the four fabrics need re-synthesizing
+That is the whole build, and the only one — every other script that wrote `blobs/BOOT.bin`
+has been deleted. It fingerprints the PL sources to decide whether the four fabrics need re-synthesizing
 (~72 min) or can be reused (~3 min), builds the firmware against the acq_imu_both `.xsa`
 (the superset, so the BSP carries XIic), packages `blobs/BOOT.bin`, converts each fabric
 to its PCAP `.bin`, and then checks what it made — every fabric's timing closed, and the
 bitstream genuinely inside the boot image. It fails rather than emit an image it cannot
 vouch for.
-
-```bash
-scripts/build.sh --check      # say what would be rebuilt, change nothing
-scripts/build.sh --force-pl   # re-synthesize the PL even if unchanged
-```
 
 Needs **Vivado + Vitis 2025.1**; set `XILINX_ROOT` if they are not at `/opt/Xilinx/2025.1`.
 The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`.

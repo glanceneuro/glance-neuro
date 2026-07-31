@@ -33,39 +33,41 @@ These are not preferences. Violating one is a reason to stop and ask.
 
 **1. Never ship source and binary out of step.** `blobs/` **is the SD card image** —
 its contents are copied verbatim to the FAT root. It always holds `BOOT.bin` (the boot
-image; the BootROM requires exactly that name) and, in the deferred-boot model, the
-fabric `*.bin` files loaded at runtime. One config's image lives in `blobs/` per branch;
-`BOOT.bin` is built from different source depending on that config:
+image; the BootROM requires exactly that name) plus the fabric `*.bin` files loaded at
+runtime. There is **one** builder and **one** SD image:
 
-| config (branch) | `blobs/` contents = the SD card | built by |
+| `blobs/` contents = the SD card | built from | built by |
 |---|---|---|
-| acquisition | `BOOT.bin` ← `firmware/src-core0`, `firmware/include`, `programmable_logic/{src,ip,block_design/design_1_bd.tcl}` | `scripts/build.sh` |
-| deferred acq (**current — this branch's product**) | `BOOT.bin` ← `firmware/src-core0` + `firmware/src-core1` + `firmware/include` + `programmable_logic/{src,constraints,block_design,ip}` (the baked acq bitstream); `acq.bin`/`aimu*.bin` ← the respective PL | `scripts/build_acq_loader.sh` |
+| `BOOT.bin` (FSBL + baked acq bitstream + both core ELFs) and `acq.bin` / `aimu*.bin` | `firmware/src-core0` + `firmware/src-core1` + `firmware/include` + `programmable_logic/{src,constraints,block_design,ip}` | `scripts/build_acq_loader.sh` |
+
 **`BOOT.bin` is a PL artifact as well as a firmware one** — it carries a bitstream, so a
 `programmable_logic/` change must rebuild it, not just the fabric `.bin`. The build script
-enforces this with a source fingerprint (ported from `build.sh`): `--app-only` **refuses**
-rather than baking a stale fabric. Note the inputs the older rows omitted and this one
-does not: `constraints/` (the acq project globs `*.xdc`, and `uart.xdc` is what pins the
-console), `src-core1` (its ELF is inside `BOOT.bin`), and the fact that the Vitis platform —
-hence the FSBL and BSP — is generated from the **acq_imu_both** `.xsa`, so an
-`acq_imu_both_*` edit changes `BOOT.bin` too.
+enforces this with a source fingerprint: `--app-only` **refuses** rather than baking a
+stale fabric. Note the inputs that are easy to forget: `constraints/` (the acq project
+globs `*.xdc`, and `uart.xdc` is what pins the console), `src-core1` (its ELF is inside
+`BOOT.bin`), and the fact that the Vitis platform — hence the FSBL and BSP — is generated
+from the **acq_imu_both** `.xsa`, so an `acq_imu_both_*` edit changes `BOOT.bin` too.
 
 The bitstream is baked because the debug UART leaves the chip through PL balls: a blank PL
 means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
 
-**Do not run `scripts/build.sh`, `scripts/build_detect.sh` or `scripts/build_loader.sh` on
-this branch.** Each writes `blobs/BOOT.bin` from a *different* bif — `build_detect.sh`
-overwrites it in place, and `build_loader.sh` reinstates the blank-PL boot that costs the
-console and the DONE LED. They belong to the older configs above, kept for reference.
+**`build_acq_loader.sh` is the only build script.** Every other one that wrote
+`blobs/BOOT.bin` has been deleted — `build.sh` (the monolithic acquisition image),
+`build_detect.sh` and `build_loader.sh`, together with the `detect` fabric they served
+(`detect_bd.tcl`, `detect_pins.xdc`, `firmware/src-detect/`). A build script that
+overwrites `BOOT.bin` and isn't the product is a trap, not a fallback, and `build.sh` was
+the worst of them: it baked the *same* acquisition bitstream, so its image booted and
+streamed and looked correct, while its firmware was built against the plain `.xsa` and
+therefore could not drive any of the `aimu*.bin` fabrics sitting beside it on the card.
 
 A commit that changes a source subtree rebuilds every artifact that lists it. The
-corollary bit me once: the `src-detect` app grew the loader but the baked `BOOT.bin`
-image wasn't rebuilt, so it went stale. So: after touching a subtree, rebuild its
-artifact(s), and **don't leave a superseded or foreign config's blob in `blobs/`** on a
-branch where it isn't the product (the deferred-boot branch's `BOOT.bin` is the loader,
-not the monolithic acquisition image). These are the only supported build scripts; each
-decides what to rebuild and verifies what it produced. Don't hand-run the underlying
-Vivado/Vitis steps — that is how stale artifacts ship. If a build fails, bring it to the
+corollary has bitten before: an app grew a feature but the baked `BOOT.bin` image wasn't
+rebuilt, so it shipped stale. So: after touching a subtree, rebuild its
+artifact(s), and **don't leave a stale or foreign blob in `blobs/`** — the five files
+there are the SD card, and anything else in that directory gets copied onto it. This is
+the only supported build script; it decides what to rebuild and verifies what it
+produced. Don't hand-run the underlying Vivado/Vitis steps — that is how stale
+artifacts ship. If a build fails, bring it to the
 user rather than working around it, and refuse to commit. (A `blobs` manifest +
 `check_blobs.sh` to enforce this across artifacts is planned — see `docs/deferred-boot.md`.)
 

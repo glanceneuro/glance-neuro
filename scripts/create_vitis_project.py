@@ -10,7 +10,7 @@ client.set_workspace(path="vitis_workspace")
 
 advanced_options = client.create_advanced_options_dict(dt_overlay="0")
 
-# The platform's hardware handoff. The monolithic acq build (build.sh) uses the
+# The platform's hardware handoff. The plain acq project uses the
 # plain acq .xsa; the deferred-load build (build_acq_loader.sh) sets KLAB_XSA to
 # the acq_imu_both superset (.xsa with the two AXI IICs) so the BSP carries XIic
 # and pl_imu_detect.c links -- the firmware then probes IMUs on any fabric that

@@ -11,7 +11,7 @@
 // On "polyphase"
 // --------------
 // A decimating FIR only has to produce the outputs it keeps, so each output
-// costs num_taps MACs no matter how the sum is organized. An explicit
+// costs num_taps MACs no matter how the sum is organised. An explicit
 // M-branch polyphase decomposition computes the same products in a different
 // order for the same cost; its advantage is over the naive filter-then-throw-
 // away-4-of-5, which this never does. So this is the polyphase-efficient form

@@ -13,7 +13,7 @@
 > table). Sections in the second group are marked where they contradict the shipped code.
 
 Design note for the "network-first, then load a fabric" boot model. Step 1 (the
-IMU detector, `docs/imu-detect.md`) proved I2C detection on a single baked-in
+IMU detector, since retired) proved I2C detection on a single baked-in
 bitstream. Step 2 changes *how the PL gets loaded* so one SD image can bring up
 whichever fabric the plugged-in headstages need — decided at runtime, after the
 network is already up.
@@ -116,7 +116,7 @@ built around is retired.
 > refuses `--app-only` when the PL has changed.
 
 
-Today `build.sh` emits one `blobs/BOOT.bin` and CLAUDE.md rule 1 is "any commit
+At the time, `build.sh` emitted one `blobs/BOOT.bin` and CLAUDE.md rule 1 was "any commit
 touching `programmable_logic/`/`firmware/` carries a `BOOT.bin` built from that
 exact source." The multi-image model breaks the one-to-one: a commit now
 produces **FSBL + app + several bitstream `.bin`s**, and *all* of them must be
@@ -247,15 +247,19 @@ in that bring-up:
   | PL state | console | why |
   |---|---|---|
   | blank (from power-on) | **no** | EMIO UART signals have no PL routing |
-  | `scan` / `detect` | **no** | that BD creates *no* top-level ports, so its EMIO UART is never brought out (which is also why it passes DRC with only `detect_pins.xdc`) |
+  | mid-reprogram (PCAP in flight) | **no** | the PL is cleared, so the routing is gone until the new fabric configures |
   | `acquisition`, `acq_imu_*` | yes | full constraint set includes `uart.xdc` |
 
-  With the bitstream baked the console is live from power-on, but the dark window still
-  exists *mid-session*: a `rescan` passes through the `scan` fabric, whose BD brings out no
-  top-level ports, so serial goes quiet for that second and returns when the acquisition
-  variant loads. Writing to the UART while dark is **safe** — UART1 is a PS peripheral at
-  `0xE0001000`, always present, so the writes complete and only the bits on the wire are
-  lost. Nothing hangs.
+  With the bitstream baked the console is live from power-on. Every fabric that still ships
+  brings the EMIO UART out, so the only dark window left is the reprogram itself — a second
+  or so during a `set_config`/`rescan` swap, between the PL being cleared and the new
+  bitstream taking effect. (An earlier `scan`/`detect` fabric created *no* top-level ports
+  and so was dark for as long as it was loaded; it was retired once the acquisition
+  variants gained the same AXI IICs, and with it that failure mode.) Writing to the UART
+  while dark is **safe** — UART1 is a PS peripheral at `0xE0001000`, always present, so the
+  writes complete and only the bits on the wire are lost. Nothing hangs. Serial *input* is
+  gated across the swap for a different reason: the RX ball floats while the PL is gone and
+  core 1 would parse the noise as debug commands.
 
   This is what made a blank boot untenable: with no fabric AND no network there was no
   diagnostic channel at all, and a boot failure was invisible on both. Baking restores the

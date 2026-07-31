@@ -31,7 +31,7 @@ PART = "xc7z020clg400-1"
 CLK = "clk_out1_design_1_clk_wiz_0_84M_175M_0"  # the 84/175 MHz source, per intan_io.xdc
 
 # Per-port pin data (xc7z020clg400 balls), lifted from intan_io.xdc (LVDS lanes)
-# and detect_pins.xdc / acq_imu_both_pins.xdc (I2C). In 'imu' mode the CIPO1 pair
+# and acq_imu_both_pins.xdc (I2C). In 'imu' mode the CIPO1 pair
 # is freed for I2C: scl = cipo1_p ball, sda = cipo1_n ball.
 #   idx           -- the buffer cell / interface-port / flattened-port index.
 #   dg            -- the data_generator single-ended interface pin for this cable.
