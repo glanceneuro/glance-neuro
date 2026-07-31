@@ -655,10 +655,17 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             uint16_t offset = (cmd->param2 >> 8) & 0xFFFF;
             uint8_t len = cmd->param2 & 0xFF;
             int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
-            if (!has_iic || (width != 1 && width != 2)) {
+            // Reserved I2C addresses are refused outright, not just avoided by
+            // convention: address 0x00 is the GENERAL CALL, and a "read" there
+            // puts our offset byte on a broadcast that several device families
+            // decode as a reset command. 0x08..0x77 is the addressable range
+            // (matching I2C_SCAN), so nothing legitimate is lost.
+            int addr_ok = (i2c_addr >= I2C_SCAN_FIRST && i2c_addr <= I2C_SCAN_LAST);
+            if (!has_iic || (width != 1 && width != 2) || !addr_ok) {
                 send_message("EEPROM_READ refused: %s\r\n",
-                             has_iic ? "addr width must be 1 or 2"
-                                     : "port has no I2C on this fabric");
+                             !has_iic ? "port has no I2C on this fabric"
+                             : !addr_ok ? "device address outside 0x08..0x77"
+                                        : "addr width must be 1 or 2");
                 send_ack(tpcb, cmd->ack_id, ACK_ERROR);
                 return;
             }
