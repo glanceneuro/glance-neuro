@@ -670,7 +670,7 @@ extern const uint16_t cable_length_cmd_sequence[32];
 // Network functions (implemented in network.c)
 uint32_t sys_now(void);
 void start_tcp_server(void);
-void udp_stream_init(void);
+void broadband_stream_init(void);   // creates the broadband UDP pcb (stream_type=1)
 
 // UDP destination configuration
 int udp_reconfigure_destination(uint32_t new_ip, uint16_t new_port);

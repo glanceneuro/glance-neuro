@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 #include "pl_imu_detect.h"
+#include "pl_imu_read.h"   // pl_imu_bno_read: bounded I2C (the vendor API has no timeout)
 #include "xiic_l.h"
 
 // Probe one port's AXI IIC master for a BNO055 CHIP_ID.
@@ -23,17 +24,17 @@ static uint32_t probe_port(UINTPTR base)
     uint32_t sr = XIic_ReadReg(base, XIIC_SR_REG_OFFSET) & 0xFF;
     result |= (sr << IMUDET_R_SR_SHIFT);
 
-    uint8_t reg = BNO055_CHIP_REG;
+    // Bounded read, NOT XIic_DynSend/DynRecv: those spin on BUS_BUSY with no
+    // timeout, and this runs from a TCP command handler on core 0, so a bus that
+    // never comes ready is a hung board rather than a failed probe. A fabric
+    // swap floats these pins briefly, which is exactly that case -- and rescan
+    // probes right after one.
     uint8_t val = 0;
-    unsigned sent = XIic_DynSend(base, BNO055_I2C_ADDR, &reg, 1, XIIC_REPEATED_START);
-    if (sent == 1) {
+    if (pl_imu_bno_read(base, BNO055_CHIP_REG, &val, 1)) {
         result |= IMUDET_R_ACK;
-        unsigned rcvd = XIic_DynRecv(base, BNO055_I2C_ADDR, &val, 1);
-        if (rcvd == 1) {
-            result |= ((uint32_t)val) << IMUDET_R_ID_SHIFT;
-            if (val == BNO055_CHIP_ID)
-                result |= IMUDET_R_PRESENT;
-        }
+        result |= ((uint32_t)val) << IMUDET_R_ID_SHIFT;
+        if (val == BNO055_CHIP_ID)
+            result |= IMUDET_R_PRESENT;
     }
     return result;
 }

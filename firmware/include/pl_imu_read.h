@@ -47,6 +47,12 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(imu_sample_response_t) == 32,
                "imu sample response must stay 32 bytes (net.py decode)");
 
+// Bounded register read from the BNO055 on a controller (1-byte register
+// pointer, repeated start, n-byte read). Every wait has a deadline, unlike the
+// vendor's XIic_DynSend/DynRecv, which spin on BUS_BUSY forever -- unacceptable
+// on any path reachable from a command handler. Returns 1 on success.
+int pl_imu_bno_read(UINTPTR base, uint8_t reg, uint8_t *buf, unsigned len);
+
 // Put the chip on this port's bus into NDOF (blocking, up to ~50 ms of mode-
 // switch delays; a no-op when already there). Fills *mode_out with the mode
 // read back. Returns 1 on success. The core at `base` must be DynInit'd.

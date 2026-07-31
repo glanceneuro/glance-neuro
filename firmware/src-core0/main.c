@@ -549,7 +549,7 @@ void network_maintenance_loop(void) {
       start_tcp_server();
 
       // Restart UDP stream
-      udp_stream_init();
+      broadband_stream_init();
 
       // Announce ourselves so a reconnecting host re-learns our MAC immediately
       // (same stale-ARP antidote as at boot, for the hotplug path).
@@ -707,7 +707,7 @@ int main() {
   service_network();   // answer anything already waiting on the listener
 
   // Initialize UDP (always enabled)
-  udp_stream_init();
+  broadband_stream_init();
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
   pl_imu_stream_init();  // IMU side channel, same port, stream_type=4
 

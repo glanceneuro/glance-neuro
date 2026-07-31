@@ -165,7 +165,10 @@ int udp_reconfigure_destination(uint32_t new_ip, uint16_t new_port) {
     return 1;
 }
 
-void udp_stream_init() {
+// Create the pcb the BROADBAND stream sends on. Named for the stream, not the
+// transport: LFP and IMU are also UDP and have their own init (lfp_stream_init,
+// pl_imu_stream_init), so "udp_stream_init" read like it set up all of them.
+void broadband_stream_init(void) {
     ip_addr_t dest_ip;
     dest_ip.addr = udp_dest_ip;
     
@@ -175,7 +178,7 @@ void udp_stream_init() {
         return;
     }
     
-    send_message("UDP initialized (destination: %s:%d)\r\n",
+    send_message("Broadband stream ready (UDP destination %s:%d)\r\n",
                  ip4addr_ntoa(&dest_ip), udp_dest_port);
 }
 
