@@ -30,8 +30,9 @@ static int bno_write(UINTPTR base, uint8_t reg, uint8_t val)
 
 // Ensure the chip is in NDOF. Mode changes must route through CONFIG; a chip
 // already in NDOF (a previous read, or a warm host reconnect) is left alone so
-// the fusion filter keeps its state and calibration.
-static int bno_ensure_ndof(UINTPTR base, uint8_t *mode_out)
+// the fusion filter keeps its state and calibration. Exported: the continuous
+// stream (pl_imu_stream.c) does the same blocking entry once at imu_start.
+int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out)
 {
     uint8_t mode = 0;
     if (!bno_read(base, BNO055_REG_OPR_MODE, &mode, 1))
@@ -70,7 +71,7 @@ int pl_imu_read_sample(int port, imu_sample_response_t *out)
     out->status |= (uint32_t)(XIic_ReadReg(base, XIIC_SR_REG_OFFSET) & 0xFF)
                    << IMUREAD_R_SR_SHIFT;
 
-    if (!bno_ensure_ndof(base, &mode)) {
+    if (!pl_imu_ndof_enter(base, &mode)) {
         // Distinguish "no device" from "device but mode change failed":
         // retry the bare mode read -- an ACK here means the chip is present.
         out->status |= bno_read(base, BNO055_REG_OPR_MODE, &mode, 1)

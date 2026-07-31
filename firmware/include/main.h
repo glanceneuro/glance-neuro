@@ -90,7 +90,11 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define UNIFIED_HEADER_WORDS    8
 #define STREAM_TYPE_BROADBAND   1
 #define STREAM_TYPE_LFP         2
-// stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
+// stream_type 3 is reserved for a possible future wavelet/scalogram stream (not
+// implemented). stream_type 4 is the IMU side channel (STREAM_TYPE_IMU,
+// pl_imu_stream.h) -- the one PS-built stream: its source is I2C, not a PL BRAM,
+// so the DMA-into-pbuf rule doesn't apply and the PS assembles the 13-word
+// packet itself at 100 Hz.
 
 // Packet size calculation based on channel_enable bits.
 // channel_enable is now 8 bits: [3:0] = port 0 streams, [7:4] = port 1 (dual

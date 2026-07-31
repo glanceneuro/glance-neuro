@@ -16,6 +16,7 @@
 #include "shared_print.h"
 #include "pl_dma.h"
 #include "pl_loader.h"  // deferred fabric load from SD via PCAP (docs/deferred-boot.md)
+#include "pl_imu_stream.h"  // continuous BNO055 readout (stream_type=4)
 #include "xiltimer.h"  // XTime_GetTime / COUNTS_PER_SECOND for perf instrumentation
 
 // Forward declare eth_link_detect from xemacpsif adapter
@@ -246,6 +247,7 @@ int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq) {
   if (sel >= PL_NUM_CONFIGS) return -1;
   const pl_config_t *c = &pl_configs[sel];
   if (out_is_acq) *out_is_acq = (uint8_t)c->is_acq;
+  pl_imu_stream_stop_all();              // the IICs it polls are about to vanish
   pl_is_acq = 0;                         // tearing the PL down -> stop touching it
   pl_has_iic_a = pl_has_iic_b = pl_has_iic = 0;  // its IICs are gone until reloaded
   uint32_t bytes = 0;
@@ -677,6 +679,7 @@ int main() {
   // Initialize UDP (always enabled)
   udp_stream_init();
   lfp_stream_init();   // LFP band shares the unified UDP port (UDP_PORT), stream_type=2
+  pl_imu_stream_init();  // IMU side channel, same port, stream_type=4
 
   send_message("Network initialized. IP: %s\r\n", ip4addr_ntoa(&ipaddr));
 
@@ -724,6 +727,10 @@ int main() {
     // Kept on its own line rather than inside the network loop so that ordering
     // is a visible scheduling decision instead of an implementation detail.
     lfp_stream_service();
+
+    // IMU last: 100 Hz, and a pass costs at most a couple of IIC status reads
+    // while a transfer is in flight (the I2C itself runs in the core's FIFOs).
+    pl_imu_stream_service();
   }
   
   cleanup_platform();

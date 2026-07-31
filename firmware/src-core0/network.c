@@ -6,6 +6,7 @@
 #include "pl_stim.h"    // DAC70502 stimulus peripheral driver
 #include "pl_imu_detect.h"  // per-cable BNO055 probe over the AXI IICs (CMD_DETECT_IMU)
 #include "pl_imu_read.h"    // one-shot BNO055 NDOF sample (CMD_IMU_READ)
+#include "pl_imu_stream.h"  // continuous BNO055 readout (CMD_IMU_STREAM)
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -98,6 +99,7 @@ ID   | Command          | Param1              | Param2
 #define CMD_SET_CONFIG        0xB4  // param1 = config selector; PCAP-swap the PL fabric
 #define CMD_PL_STATUS         0xB5  // query the loaded fabric -- works in ANY fabric state
 #define CMD_IMU_READ          0xB6  // param1 = port (0=A,1=B); one-shot BNO055 NDOF sample
+#define CMD_IMU_STREAM        0xB8  // param1 = port mask (absolute; 0=stop all); param2 = period ms
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -565,6 +567,12 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
                 send_ack(tpcb, cmd->ack_id, ACK_ERROR);
                 return;
             }
+            if (pl_imu_stream_mask()) {
+                send_message("DETECT_IMU refused: IMU stream active "
+                             "(imu_stream 0 first)\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
             imu_detect_response_t resp;
             // Probe ONLY the ports whose IIC the loaded fabric carries -- a mixed
             // acq_imu_port_a/_b fabric has one IIC and one 128-ch LVDS port, and
@@ -594,9 +602,43 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
                 send_ack(tpcb, cmd->ack_id, ACK_ERROR);
                 return;
             }
+            if (pl_imu_stream_active(port)) {
+                send_message("IMU_READ refused: IMU stream active on port %c "
+                             "(its packets carry the same data)\r\n",
+                             port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
             imu_sample_response_t sample;
             pl_imu_read_sample(port, &sample);
             send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &sample, sizeof(sample));
+            return;  // response already sent
+        }
+
+        case CMD_IMU_STREAM: {
+            // Absolute port set: param1 selects which ports stream (0 = stop
+            // all), param2 = sample period ms (0 -> 10 ms = the BNO055's 100 Hz
+            // fusion rate). Requires an acquisition fabric (the guard above):
+            // packets carry the PL master timestamp, and the IICs only exist on
+            // acq_imu_* fabrics anyway. Starting a NEW port does a blocking
+            // ~50 ms NDOF entry, so that is refused mid-stream -- start the IMU
+            // BEFORE 'start'. Stopping ports never blocks and is always allowed.
+            uint32_t want = cmd->param1 & 3;
+            uint32_t newly = want & ~pl_imu_stream_mask();
+            if (newly && pl_is_transmission_active()) {
+                send_message("IMU_STREAM refused: starting a port needs a "
+                             "blocking NDOF entry -- imu_stream before start, "
+                             "or stop first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_stream_response_t r;
+            r.active_mask = pl_imu_stream_set(want, cmd->param2);
+            r.period_ms   = pl_imu_stream_period_ms();
+            r.version     = IMU_STREAM_VERSION;
+            send_message("Binary Command: IMU_STREAM mask=%lu -> active=%lu\r\n",
+                         (unsigned long)want, (unsigned long)r.active_mask);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
             return;  // response already sent
         }
 

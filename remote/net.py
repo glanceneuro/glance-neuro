@@ -209,6 +209,7 @@ UNIFIED_HEADER_WORDS = 8
 STREAM_TYPE_BROADBAND = 1
 STREAM_TYPE_LFP = 2
 # stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
+STREAM_TYPE_IMU = 4          # BNO055 side channel, one 52-byte datagram per fused sample
 
 # Binary command protocol constants
 CMD_MAGIC = 0xDEADBEEF
@@ -363,6 +364,148 @@ def imu_read(sock, port='a'):
           f"mag={cal['mag']}/3, die {temp} C")
     return {'quat': quat, 'accel': accel, 'gyro': gyro, 'calib': cal,
             'temp_c': temp, 'status': status}
+
+# --- Continuous IMU stream (CMD_IMU_STREAM, stream_type=4) --------------------
+# One 52-byte datagram per fused sample on the unified UDP port: the 8-word
+# common header + 10 LE int16s (quat wxyz / acc xyz / gyr xyz). Keep in sync
+# with firmware pl_imu_stream.h.
+#   w1 TYPE_VER: stream_type=4 | version<<8 | port<<16
+#   w5 AUX0:     period_ms[15:0] | iic_errors[23:16] | send_drops[31:24]
+#   w6 AUX1:     calib_stat[7:0] | opr_mode[15:8] | temp_c[23:16]
+CMD_IMU_STREAM = 0xB8
+IMUSTREAM_VERSION = 0x494D5553  # "IMUS"
+IMU_PKT_BYTES = 52
+
+def parse_imu_packet(data):
+    """Decode one stream_type=4 datagram into engineering units, or None."""
+    if len(data) < IMU_PKT_BYTES:
+        return None
+    magic, type_ver, ts_lo, ts_hi, seq, aux0, aux1, _ = \
+        struct.unpack_from('<IIIIIIII', data, 0)
+    if magic != UNIFIED_MAGIC or (type_ver & 0xFF) != STREAM_TYPE_IMU:
+        return None
+    v = struct.unpack_from('<10h', data, 32)
+    temp = (aux1 >> 16) & 0xFF
+    return {
+        'port': 'B' if (type_ver >> 16) & 1 else 'A',
+        'seq': seq,
+        'timestamp': ts_lo | (ts_hi << 32),     # PL master clock: aligns with neural data
+        'period_ms': aux0 & 0xFFFF,
+        'iic_errors': (aux0 >> 16) & 0xFF,
+        'send_drops': (aux0 >> 24) & 0xFF,
+        'calib': aux1 & 0xFF,                   # [7:6]sys [5:4]gyr [3:2]acc [1:0]mag
+        'opr_mode': (aux1 >> 8) & 0xFF,
+        'temp_c': temp - 256 if temp > 127 else temp,
+        'quat': tuple(x / 16384.0 for x in v[0:4]),
+        'accel': tuple(x / 100.0 for x in v[4:7]),      # m/s^2
+        'gyro': tuple(x / 16.0 for x in v[7:10]),       # deg/s
+    }
+
+def imu_stream(sock, spec='both', period_ms=0):
+    """Start/stop continuous IMU streaming. spec: a | b | both | off. The port
+    set is absolute. Start the IMU BEFORE 'start' (arming a port does a ~50 ms
+    blocking NDOF entry, refused mid-stream); stopping is always allowed."""
+    masks = {'a': 1, 'b': 2, 'both': 3, 'off': 0, '0': 0}
+    m = masks.get(str(spec).lower())
+    if m is None:
+        print(f"[IMU] unknown port spec '{spec}' (a | b | both | off)")
+        return None
+    ok, data = send_binary_command(sock, CMD_IMU_STREAM, param1=m,
+                                   param2=int(period_ms), timeout=3.0)
+    if not ok or data is None or len(data) < 12:
+        print("[IMU] imu_stream refused -- needs an acq_imu_* fabric, and "
+              "starting a port is refused while neural streaming is active")
+        return None
+    active, period, ver = struct.unpack('<III', data[:12])
+    if ver != IMUSTREAM_VERSION:
+        print(f"[IMU] unexpected version 0x{ver:08X} (expected 0x{IMUSTREAM_VERSION:08X})")
+    names = {0: 'none', 1: 'A', 2: 'B', 3: 'A+B'}
+    if m and active != m:
+        print(f"[IMU] note: asked for {names[m]} but got {names[active]} -- "
+              f"ports without an IIC on this fabric (or with no responding "
+              f"BNO055) are dropped; see the board console")
+    print(f"[IMU] streaming: {names[active]} at {1000 // max(period, 1)} Hz "
+          f"(period {period} ms, stream_type=4 on UDP {UDP_PORT})")
+    return {'active': active, 'period_ms': period}
+
+def imu_recv(n=20, timeout=5.0):
+    """Print n live IMU samples from the unified sink (imu_stream first)."""
+    if UNIFIED_SINK is None:
+        print("[IMU] unified sink not running")
+        return 0
+    q = UNIFIED_SINK.subscribe_imu()
+    got = 0
+    try:
+        while got < n:
+            try:
+                pkt = parse_imu_packet(q.get(timeout=timeout))
+            except queue.Empty:
+                print("[IMU] timeout -- is imu_stream on and an acq fabric loaded?")
+                break
+            if pkt is None:
+                continue
+            got += 1
+            qt, ac, gy = pkt['quat'], pkt['accel'], pkt['gyro']
+            c = pkt['calib']
+            print(f"[IMU {pkt['port']}] seq={pkt['seq']} ts={pkt['timestamp']} "
+                  f"quat=({qt[0]:+.3f},{qt[1]:+.3f},{qt[2]:+.3f},{qt[3]:+.3f}) "
+                  f"acc=({ac[0]:+6.2f},{ac[1]:+6.2f},{ac[2]:+6.2f}) "
+                  f"gyr=({gy[0]:+7.1f},{gy[1]:+7.1f},{gy[2]:+7.1f}) "
+                  f"cal={c >> 6 & 3}{c >> 4 & 3}{c >> 2 & 3}{c & 3}")
+    finally:
+        UNIFIED_SINK.unsubscribe_imu(q)
+    return got
+
+_IMU_CSV = {'thread': None, 'stop': None, 'path': None, 'rows': 0}
+
+def imu_csv_start(path):
+    """Record every IMU sample to a CSV until imu_csv_stop(). Background thread
+    off the sink's subscriber queue -- the recv hot path is untouched."""
+    if _IMU_CSV['thread'] is not None:
+        print(f"[IMU] already recording to {_IMU_CSV['path']} (imu_csv stop first)")
+        return
+    if UNIFIED_SINK is None:
+        print("[IMU] unified sink not running")
+        return
+    stop = threading.Event()
+    q = UNIFIED_SINK.subscribe_imu()
+
+    def worker():
+        n = 0
+        with open(path, 'w') as f:
+            f.write("host_time,port,seq,timestamp,qw,qx,qy,qz,"
+                    "ax,ay,az,gx,gy,gz,calib,temp_c,iic_errors,send_drops\n")
+            while not stop.is_set():
+                try:
+                    pkt = parse_imu_packet(q.get(timeout=0.5))
+                except queue.Empty:
+                    continue
+                if pkt is None:
+                    continue
+                f.write(f"{time.time():.6f},{pkt['port']},{pkt['seq']},"
+                        f"{pkt['timestamp']},"
+                        + ",".join(f"{x:.6f}" for x in pkt['quat'])
+                        + "," + ",".join(f"{x:.4f}" for x in pkt['accel'])
+                        + "," + ",".join(f"{x:.4f}" for x in pkt['gyro'])
+                        + f",{pkt['calib']},{pkt['temp_c']},"
+                        f"{pkt['iic_errors']},{pkt['send_drops']}\n")
+                n += 1
+                _IMU_CSV['rows'] = n
+        UNIFIED_SINK.unsubscribe_imu(q)
+
+    t = threading.Thread(target=worker, name="imu-csv", daemon=True)
+    _IMU_CSV.update(thread=t, stop=stop, path=path, rows=0)
+    t.start()
+    print(f"[IMU] recording to {path} (imu_csv stop to finish)")
+
+def imu_csv_stop():
+    if _IMU_CSV['thread'] is None:
+        print("[IMU] not recording")
+        return
+    _IMU_CSV['stop'].set()
+    _IMU_CSV['thread'].join(timeout=2.0)
+    print(f"[IMU] recorded {_IMU_CSV['rows']} samples to {_IMU_CSV['path']}")
+    _IMU_CSV.update(thread=None, stop=None, path=None)
 
 # Deferred PL load (step 2, docs/deferred-boot.md): the loader image boots with a
 # blank PL and programs a fabric from the SD card via PCAP on command.
@@ -591,6 +734,8 @@ def print_command_help():
     print("  Chirp: chirp [f_max=1400] [period=2.0] [stride=4], chirp_off  (analytic swept sine)")
     print("  IMU: detect_imu  (probe both ports for a BNO055 -- on the scan or acq_imu_both fabric)")
     print("       imu_read [a|b]  (one NDOF sample: quat/accel/gyro/calib -- not while streaming)")
+    print("       imu_stream [a|b|both|off] [period_ms]  (continuous 100 Hz stream_type=4; start BEFORE 'start')")
+    print("       imu_recv [n]  (print live samples)   imu_csv [file|stop]  (record to CSV)")
     print("  Rescan: rescan  (IMU census on 'scan' -> load the matching fabric -> chip detect; rescan noapply skips chip detect)")
     print("  PL:  load_pl [name]  (deferred-boot: PCAP-program a fabric from SD)")
     print(f"       set_config <{'|'.join(CONFIGS)}>  (PCAP-swap the whole fabric; only when NOT streaming; the board boots with the PL BLANK, so load one first)")
@@ -1792,6 +1937,12 @@ class UnifiedSink:
         self._lfp_gaps = 0
         self.lfp_pkts = 0
         self.lfp_bytes = 0
+        # IMU fan-out (stream_type=4): same inline pub/sub shape as LFP, with
+        # SEQ continuity tracked PER PORT (each port is its own stream).
+        self._imu_subs = []
+        self._imu_last_seq = [None, None]
+        self._imu_gaps = [0, 0]
+        self.imu_pkts = 0
         self.bb_pkts = 0
         self.other_pkts = 0
         self.last_addr = None
@@ -1865,7 +2016,8 @@ class UnifiedSink:
             if struct.unpack_from('<I', mv, 0)[0] != UNIFIED_MAGIC:
                 self.other_pkts += 1
                 continue
-            stream_type = struct.unpack_from('<I', mv, 4)[0] & 0xFF
+            type_ver = struct.unpack_from('<I', mv, 4)[0]
+            stream_type = type_ver & 0xFF
             if stream_type == STREAM_TYPE_BROADBAND:
                 # validate_packet returns the timestamp for a good broadband
                 # packet, None otherwise.
@@ -1888,6 +2040,19 @@ class UnifiedSink:
                 self._lfp_last_seq = seq
                 if self._lfp_subs:          # empty unless lfp_recv/lfp_sink is running
                     self._fanout_lfp(bytes(mv))
+            elif stream_type == STREAM_TYPE_IMU:
+                # 100 Hz worst case, but it rides the broadband thread, so the
+                # same discipline as LFP: count + per-port SEQ check in place,
+                # copy only when a subscriber (imu_recv / imu_csv) exists.
+                self.imu_pkts += 1
+                p = (type_ver >> 16) & 1
+                seq = struct.unpack_from('<I', mv, 16)[0]      # header word 4
+                if self._imu_last_seq[p] is not None and \
+                        seq != (self._imu_last_seq[p] + 1) & 0xFFFFFFFF:
+                    self._imu_gaps[p] += 1
+                self._imu_last_seq[p] = seq
+                if self._imu_subs:
+                    self._fanout_imu(bytes(mv))
             else:
                 self.other_pkts += 1
 
@@ -1912,6 +2077,26 @@ class UnifiedSink:
         with self._lock:
             if q in self._lfp_subs:
                 self._lfp_subs.remove(q)
+
+    def _fanout_imu(self, data):
+        with self._lock:
+            subs = list(self._imu_subs)
+        for q in subs:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+    def subscribe_imu(self, maxsize=20000):
+        q = queue.Queue(maxsize=maxsize)
+        with self._lock:
+            self._imu_subs.append(q)
+        return q
+
+    def unsubscribe_imu(self, q):
+        with self._lock:
+            if q in self._imu_subs:
+                self._imu_subs.remove(q)
 
     def stop(self):
         self._running = False
@@ -3376,6 +3561,19 @@ def tcp_control():
                 elif cmd == "imu_read" or cmd.startswith("imu_read "):
                     parts = cmd.split()
                     imu_read(sock, parts[1] if len(parts) > 1 else 'a')
+                elif cmd == "imu_stream" or cmd.startswith("imu_stream "):
+                    parts = cmd.split()
+                    imu_stream(sock, parts[1] if len(parts) > 1 else 'both',
+                               int(parts[2]) if len(parts) > 2 else 0)
+                elif cmd == "imu_recv" or cmd.startswith("imu_recv "):
+                    parts = cmd.split()
+                    imu_recv(int(parts[1]) if len(parts) > 1 else 20)
+                elif cmd.startswith("imu_csv"):
+                    parts = cmd.split()
+                    if len(parts) > 1 and parts[1] == "stop":
+                        imu_csv_stop()
+                    else:
+                        imu_csv_start(parts[1] if len(parts) > 1 else "imu_data.csv")
                 elif cmd == "rescan" or cmd.startswith("rescan "):
                     # "rescan noapply" = fabric selection only, skip the phase
                     # sweep (leaves phases/mask untouched).
@@ -3617,7 +3815,9 @@ def tcp_control():
                               f"broadband={UNIFIED_SINK.bb_pkts} LFP={UNIFIED_SINK.lfp_pkts} "
                               f"other={UNIFIED_SINK.other_pkts} pkts, "
                               f"LFP={UNIFIED_SINK.lfp_bytes/1024.0:.0f} KB, "
-                              f"bb_seq_gaps={validator.seq_gaps} lfp_seq_gaps={UNIFIED_SINK._lfp_gaps}, "
+                              f"IMU={UNIFIED_SINK.imu_pkts} pkts, "
+                              f"bb_seq_gaps={validator.seq_gaps} lfp_seq_gaps={UNIFIED_SINK._lfp_gaps} "
+                              f"imu_seq_gaps=A:{UNIFIED_SINK._imu_gaps[0]}/B:{UNIFIED_SINK._imu_gaps[1]}, "
                               f"host-ring-drops={UNIFIED_SINK._ring_drops}, last from {UNIFIED_SINK.last_addr}")
                     else:
                         print("[UDP-SINK] not running")
@@ -3807,5 +4007,8 @@ if __name__ == "__main__":
               f"({validator.seq_lost_packets} packets implied missing)  "
               f"{'OK (no loss)' if validator.seq_gaps == 0 else 'LOSS DETECTED'}")
         print(f"[UDP] LFP SEQ gaps = {UNIFIED_SINK._lfp_gaps}")
+        if UNIFIED_SINK.imu_pkts:
+            print(f"[UDP] IMU: {UNIFIED_SINK.imu_pkts} pkts, SEQ gaps "
+                  f"A={UNIFIED_SINK._imu_gaps[0]} B={UNIFIED_SINK._imu_gaps[1]}")
     validator.print_statistics()
     time.sleep(0.5)

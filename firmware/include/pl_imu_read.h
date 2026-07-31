@@ -11,6 +11,7 @@
 #define PL_IMU_READ_H
 
 #include <stdint.h>
+#include "xil_types.h"   // UINTPTR (pl_imu_ndof_enter takes a controller base)
 
 // BNO055 register map (page 0) -- data sheet section 4.3.
 #define BNO055_REG_ACC_DATA   0x08  // 6 B: acc x/y/z, int16 LE, 1 LSB = 0.01 m/s^2
@@ -45,6 +46,11 @@ typedef struct __attribute__((packed)) {
 } imu_sample_response_t;
 _Static_assert(sizeof(imu_sample_response_t) == 32,
                "imu sample response must stay 32 bytes (net.py decode)");
+
+// Put the chip on this port's bus into NDOF (blocking, up to ~50 ms of mode-
+// switch delays; a no-op when already there). Fills *mode_out with the mode
+// read back. Returns 1 on success. The core at `base` must be DynInit'd.
+int pl_imu_ndof_enter(UINTPTR base, uint8_t *mode_out);
 
 // Read one fused sample from the given port (0 = A, 1 = B). The caller MUST
 // have checked that the loaded fabric carries that port's AXI IIC (pl_has_iic_a
