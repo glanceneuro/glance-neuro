@@ -166,9 +166,28 @@ full IP blocks at their own base addresses:
 The two AXI IICs exist **only** on fabrics that route the freed second-CIPO pins to I2C:
 the `acq_imu_*` acquisition fabrics free port A `M19/M20` and port B `J16/K16`, and the
 single-ended `scan`/`detect` fabric. On the plain 128-ch `acquisition` fabric they are
-absent, and an AXI read at `0x43D0xxxx` there never returns — which is why `CMD_DETECT_IMU`
-is gated on `pl_has_iic`. Registers follow the standard Xilinx AXI IIC layout (`xiic_l.h`);
-`firmware/src-core0/pl_imu_detect.c` drives them via the dynamic-controller path.
+absent, and an AXI read at `0x43D0xxxx` there never returns — which is why **every**
+command that touches a controller is gated on the **per-port** flags `pl_has_iic_a` /
+`pl_has_iic_b` (a single fabric-level "has I2C" is insufficient the moment a peripheral
+is present on one cable and not the other — a mixed `acq_imu_port_a/_b` fabric hung the
+core exactly that way). The gated commands are `DETECT_IMU`, `IMU_READ`, `IMU_STREAM`,
+`I2C_SCAN` and `EEPROM_READ`.
+
+Registers follow the standard Xilinx AXI IIC layout (`xiic_l.h`), driven through the
+**dynamic** controller path. All four users emit the same combined write-then-read
+sequence — `START+addr(W)`, register/offset byte(s), repeated `START+addr(R)`, then
+`STOP+count` **written only after `BUS_BUSY` asserts**, because the core takes the bus a
+few tens of microseconds after the FIFO write, not on the write itself. That ordering is
+the vendor's (`XIic_DynRecv`) and is what the detect path proved on this board:
+
+| user | file | waits for BUS_BUSY by |
+|---|---|---|
+| one-shot detect / read | `pl_imu_detect.c`, `pl_imu_read.c` | the blocking `XIic_Dyn*` API |
+| continuous IMU stream | `pl_imu_stream.c` | a state-machine pass (never blocks — 30 kHz pump) |
+| bus scan / EEPROM read | `pl_i2c_probe.c` | a bounded polled wait (cold path) |
+
+`XIic_DynInit` programs the RX FIFO to throttle only at 16 bytes, so any burst ≤ 16 bytes
+lands whole and can be drained after the fact; every burst in this firmware is ≤ 8.
 
 ## RHD2000 SPI command encodings
 

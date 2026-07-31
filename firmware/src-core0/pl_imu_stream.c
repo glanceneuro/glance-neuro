@@ -90,7 +90,17 @@ static struct udp_pcb *imu_pcb;
 
 // Staging ring for the zero-copy send (PBUF_REF): a slot must outlive its TX
 // descriptor. 8 slots at 100 Hz means a slot is reused after 80 ms -- orders
-// of magnitude past TX drain. 64-byte stride keeps slots cache-line aligned.
+// of magnitude past TX drain.
+//
+// ORDINARY CACHED MEMORY, deliberately, unlike the broadband and LFP staging
+// buffers in the non-cacheable pl_dma region. Those hold data written by a PL
+// master (the CDMA), so the CPU must never hold a stale cached copy. This
+// packet is built by the CPU and read by the GEM, and the lwIP port flushes
+// each pbuf payload before handing it to the TX descriptor
+// (xemacpsif_dma.c sgsend: Xil_DCacheFlushRange when !IsCacheCoherent, which
+// is the Zynq-7000 case), so the flush is already covered. The 64-byte slot
+// stride keeps every slot on its own cache lines, so that flush can never
+// touch a neighbouring slot still pending in the TX ring.
 #define IMU_N_SLOTS 8u
 static uint32_t imu_staging[IMU_N_SLOTS][16] __attribute__((aligned(64)));
 static uint32_t imu_slot;
