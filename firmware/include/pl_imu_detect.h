@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
 // PS-side driver for the IMU-detect image: two Xilinx AXI IIC controllers (one
 // per headstage port) probe address 0x28 for a Bosch BNO055 and read its

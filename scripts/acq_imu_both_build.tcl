@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
 # Build the acq_imu_both fabric: the standard acquisition BD transformed by
 # acq_imu_both_overlay.tcl (both cables 64-ch + an AXI IIC each for a BNO055).

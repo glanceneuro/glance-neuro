@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
 # Pin constraints for the acq_imu_both fabric: both cables run 64-ch (CIPO0 only)
 # over LVDS, and the freed second-CIPO pins carry a single-ended I2C bus each for

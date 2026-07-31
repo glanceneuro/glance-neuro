@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+# SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 #
 # acq_imu_both overlay -- sourced AFTER design_1_bd.tcl, it transforms the
 # standard acquisition BD (design_1) in place into the both-ports-IMU variant:

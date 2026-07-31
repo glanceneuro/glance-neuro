@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
+// SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 
 #include "pl_imu_detect.h"
 #include "xiic_l.h"
