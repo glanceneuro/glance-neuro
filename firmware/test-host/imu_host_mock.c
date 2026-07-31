@@ -105,6 +105,12 @@ static void sim_update(int port)
             s->rx[(s->rx_r + s->rx_n++) % 16] =
                 bno_reg_byte(port, (uint8_t)(s->pend_reg + i));
         mock_bno[port].regs_read++;
+        // A master receive ENDS by NACKing the final byte to tell the slave to
+        // stop -- and that latches TX_ERROR even though the read succeeded.
+        // Xilinx's DynRecvData excludes TX_ERROR from its error mask when one
+        // byte remains for exactly this reason. Modelling it is what stops a
+        // reader from treating the normal end of a good read as a failure.
+        s->iisr |= XIIC_INTR_TX_ERROR_MASK;
     }
     s->pending = 0;
     // The STOP condition takes wire time: the bus reads busy for a while after

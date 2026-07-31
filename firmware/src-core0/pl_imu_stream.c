@@ -271,18 +271,15 @@ static void imu_service_port(imu_port_t *p, int port)
         return;
     }
 
-    // A burst is in flight. One interrupt-status read decides error/no-error;
-    // one status read gates the drain. NACK (TX_ERROR) and lost arbitration
-    // both mean this transfer is gone -- reset and resync at the next tick.
-    uint32_t iisr = XIic_ReadIisr(p->base);
-    if (iisr & (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK)) {
-        imu_error(p, port);
-        return;
-    }
-
     // Address phase queued but the count not yet supplied: hand it over as
-    // soon as the core has the bus (see imu_arm_count).
+    // soon as the core has the bus (see imu_arm_count). No data is expected
+    // yet here, so a latched TX_ERROR is an unambiguous address NACK.
     if (p->await_count) {
+        uint32_t iisr = XIic_ReadIisr(p->base);
+        if (iisr & (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK)) {
+            imu_error(p, port);
+            return;
+        }
         if (XIic_ReadReg(p->base, XIIC_SR_REG_OFFSET) & XIIC_SR_BUS_BUSY_MASK) {
             imu_arm_count(p);
         } else {
@@ -297,12 +294,28 @@ static void imu_service_port(imu_port_t *p, int port)
     uint8_t *dst = (p->burst_idx < IMU_N_DATA_BURSTS)
                      ? p->sample + imu_data_bursts[p->burst_idx].dst : p->hk;
 
+    // TAKE THE DATA FIRST. Ending a master receive means NACKing the final
+    // byte to tell the slave to stop, and that latches TX_ERROR on a read that
+    // SUCCEEDED -- the vendor's DynRecvData checks RX-not-empty before the
+    // error mask, and drops TX_ERROR from that mask entirely once one byte
+    // remains, for exactly this reason. Checking errors first discards a good
+    // burst every time (and a 1-byte read fails unconditionally, because the
+    // core must arm NO_ACK before the address even goes out).
     while (p->got < want &&
            !(XIic_ReadReg(p->base, XIIC_SR_REG_OFFSET) & XIIC_SR_RX_FIFO_EMPTY_MASK)) {
         dst[p->got++] = (uint8_t)XIic_ReadReg(p->base, XIIC_DRR_REG_OFFSET);
     }
 
     if (p->got < want) {
+        // Still short. Lost arbitration is fatal whenever it appears; a
+        // TX_ERROR only means a real NACK while more than one byte is
+        // outstanding, since the last-byte NACK is the normal terminator.
+        uint32_t iisr = XIic_ReadIisr(p->base);
+        if ((iisr & XIIC_INTR_ARB_LOST_MASK) ||
+            ((iisr & XIIC_INTR_TX_ERROR_MASK) && (want - p->got) > 1)) {
+            imu_error(p, port);
+            return;
+        }
         XTime now; XTime_GetTime(&now);
         if (now > p->deadline) imu_error(p, port);
         return;

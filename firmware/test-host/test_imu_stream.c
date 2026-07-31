@@ -306,6 +306,34 @@ static void test_service_gap(void)
     pl_imu_stream_set(0, 0);
 }
 
+static void test_end_of_read_nack(void)
+{
+    printf("end_of_read_nack: the terminating NACK is not a failure\n");
+    // Every successful master receive ends with the core NACKing the final
+    // byte, latching TX_ERROR. Treating that as an error discards every burst:
+    // the stream produces nothing and the port auto-stops after 16 "errors" --
+    // which is exactly how this presented on hardware. The mock latches
+    // TX_ERROR on every completed read, so this test is the guard.
+    mock_reset();
+    pl_imu_stream_set(1, 10);
+    run_ms(60);
+    CHECK(mock_n_pkts >= 5, "no samples survived the end-of-read NACK (%d pkts)",
+          mock_n_pkts);
+    CHECK(pl_imu_stream_active(0), "port auto-stopped on normal end-of-read NACKs");
+
+    // The 2-byte housekeeping burst is the one most exposed: with so few bytes
+    // the terminating NACK lands almost immediately after the data. If it were
+    // mishandled, calib/temp would never refresh and AUX1 would stay at its
+    // 0xFF/0 defaults forever.
+    int with_hk = -1;
+    for (int n = 0; n < mock_n_pkts; n++)
+        if ((pkt_word(n, 6) & 0xFF) == 0xC3) { with_hk = n; break; }
+    CHECK(with_hk >= 0, "housekeeping burst never completed (calib never set)");
+    if (with_hk >= 0)
+        CHECK(((pkt_word(with_hk, 6) >> 16) & 0xFF) == 23, "temperature not read");
+    pl_imu_stream_set(0, 0);
+}
+
 static void test_lifecycle(void)
 {
     printf("lifecycle: fabric-swap stop then restart, and adding a port live\n");
@@ -413,6 +441,7 @@ int main(void)
     test_stop_all_mid_flight();
     test_bus_ordering();
     test_service_gap();
+    test_end_of_read_nack();
     test_lifecycle();
     test_period_clamp();
     const char *dump = getenv("IMU_TEST_DUMP");

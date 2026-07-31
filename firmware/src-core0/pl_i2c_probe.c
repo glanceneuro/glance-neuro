@@ -119,19 +119,28 @@ void pl_i2c_read(int port, uint8_t i2c_addr, int addr_width, uint16_t offset,
 
     // 32 bytes at 100 kHz is ~3.2 ms on the wire; 20 ms of deadline covers
     // clock stretching with room to spare.
+    //
+    // TAKE THE DATA FIRST, then judge errors. Ending a master receive means
+    // NACKing the final byte, which latches TX_ERROR on a read that SUCCEEDED
+    // -- the vendor's DynRecvData checks RX-not-empty before the error mask
+    // and drops TX_ERROR from it once one byte remains. Checking errors first
+    // loses the race against the last byte on a long read, and fails a 1-byte
+    // read every time (the core arms NO_ACK before the address goes out).
     for (int us = 0; us < 20000; us += 10) {
-        uint32_t iisr = XIic_ReadIisr(base);
-        if (iisr & (XIIC_INTR_TX_ERROR_MASK | XIIC_INTR_ARB_LOST_MASK)) {
-            XIic_DynInit(base);
-            out->status = 1;                 // NACK (no device / bad offset width)
-            return;
-        }
         while (out->nbytes < nbytes &&
                !(XIic_ReadReg(base, XIIC_SR_REG_OFFSET) & XIIC_SR_RX_FIFO_EMPTY_MASK)) {
             out->data[out->nbytes++] =
                 (uint8_t)XIic_ReadReg(base, XIIC_DRR_REG_OFFSET);
         }
         if (out->nbytes == nbytes) return;   // status 0: complete
+
+        uint32_t iisr = XIic_ReadIisr(base);
+        if ((iisr & XIIC_INTR_ARB_LOST_MASK) ||
+            ((iisr & XIIC_INTR_TX_ERROR_MASK) && (nbytes - out->nbytes) > 1)) {
+            XIic_DynInit(base);
+            out->status = 1;                 // NACK (no device / bad offset width)
+            return;
+        }
         usleep(10);
     }
     XIic_DynInit(base);

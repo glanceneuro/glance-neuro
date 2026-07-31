@@ -581,6 +581,11 @@ def eeprom_read(sock, port='a', i2c_addr=0x50, offset=0, length=32, width=1):
     register file). width: 1 = one offset byte (<=16Kbit 24xx), 2 = two
     (>=32Kbit). Non-destructive."""
     p = 0 if str(port).lower() in ('0', 'a') else 1
+    if int(length) > 32:
+        # One command is one bounded I2C transaction; say so rather than
+        # silently returning a third of what was asked for.
+        print(f"[EEPROM] {length} bytes requested; reading 32 (the per-command "
+              f"maximum). Repeat with offset {offset + 32} for the next chunk.")
     length = min(int(length), 32)
     p1 = (p << 16) | ((int(width) & 0xFF) << 8) | (int(i2c_addr) & 0x7F)
     p2 = ((int(offset) & 0xFFFF) << 8) | length
