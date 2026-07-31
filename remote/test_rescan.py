@@ -47,20 +47,20 @@ class MockBoard:
     def send(self, cmd_id, param1=0, param2=0, timeout=0.5):
         self.commands.append((cmd_id, param1, param2))
         if cmd_id == net.CMD_PL_STATUS:
-            flags = (1 if self.config in (0, 2, 3, 4) else 0) | 2
+            flags = (1 if self.config in (0, 1, 2, 3) else 0) | 2
             return True, struct.pack('<iI', self.config, flags)
         if cmd_id == net.CMD_SET_CONFIG:
             self.config = param1
-            is_acq = 1 if param1 in (0, 2, 3, 4) else 0
+            is_acq = 1 if param1 in (0, 1, 2, 3) else 0
             return True, struct.pack('<iII', 0, 4045568, is_acq | 2)
         if cmd_id == net.CMD_DETECT_IMU:
             def word(present, has_iic):
                 if not has_iic:
                     return net.IMUDET_R_ABSENT
                 return (0x3 | (0xA0 << 8) | (0xC0 << 24)) if present else (0xC0 << 24)
-            # scan fabric (1) has both IICs; acq_imu_* have per-port IICs.
-            iic = {1: (True, True), 2: (True, True), 3: (True, False),
-                   4: (False, True)}.get(self.config, (False, False))
+            # acq_imu_both (1) has both IICs; the mixed variants have one each.
+            iic = {1: (True, True), 2: (True, False),
+                   3: (False, True)}.get(self.config, (False, False))
             if not any(iic):
                 return False, None
             return True, struct.pack('<III', word(self.imu_a, iic[0]),
@@ -120,9 +120,9 @@ def test_fabric_selection():
     print("fabric_selection: the IMU census picks the matching fabric")
     cases = [
         (False, False, "acquisition", 0),
-        (True,  False, "acq_imu_port_a", 3),
-        (False, True,  "acq_imu_port_b", 4),
-        (True,  True,  "acq_imu_both", 2),
+        (True,  False, "acq_imu_port_a", 2),
+        (False, True,  "acq_imu_port_b", 3),
+        (True,  True,  "acq_imu_both", 1),
     ]
     for imu_a, imu_b, want_name, want_sel in cases:
         board = MockBoard(imu_a=imu_a, imu_b=imu_b)
@@ -138,10 +138,13 @@ def test_fabric_selection():
               f"A={imu_a} B={imu_b} -> {r['fabric']}, want {want_name}")
         check(board.config == want_sel, f"board left on selector {board.config}")
         check(r["imu_a"] == imu_a and r["imu_b"] == imu_b, "IMU census echoed")
-        # It must census on the scan fabric first, then load the target.
+        # It must census on the both-port fabric first, then load the target --
+        # except when the target IS that fabric, where the second load is
+        # skipped because we are already there.
+        census_sel = net.CONFIGS[net.CENSUS_FABRIC]
         configs = [p1 for (c, p1, _) in board.commands if c == net.CMD_SET_CONFIG]
-        check(configs == [net.CONFIGS["scan"], want_sel],
-              f"config sequence {configs}")
+        expected = [census_sel] if want_sel == census_sel else [census_sel, want_sel]
+        check(configs == expected, f"config sequence {configs}, want {expected}")
         # Starting from a blank PL there is nothing to stop, and sending STOP
         # anyway just draws an ACK error from the non-acq command guard.
         check(not any(c == net.CMD_STOP for (c, _, _) in board.commands),

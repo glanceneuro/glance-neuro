@@ -11,7 +11,6 @@
 #                               UART leaves the chip through PL balls, so a blank PL
 #                               is silent. Other fabrics still swap in at runtime.
 #   - blobs/acq.bin           : 128-ch LVDS acquisition fabric (no IMU)
-#   - blobs/detect.bin        : single-ended I2C-probe fabric (both AXI IICs)
 #   - blobs/aimuboth.bin      : 64-ch/port acquisition + BNO055 on both cables
 #                               (8.3 short name -- xilffs FF_USE_LFN=0 on the loader)
 #   - blobs/aimu_a.bin        : port A 64-ch + IMU, port B 128-ch LVDS
@@ -38,7 +37,30 @@ cd "$ROOT"
 die() { echo "" >&2; echo "ACQ-LOADER BUILD FAILED: $*" >&2; exit 1; }
 
 app_only=0
-[ "${1:-}" = "--app-only" ] && app_only=1
+case "${1:-}" in
+  "")           ;;
+  --app-only)   app_only=1 ;;
+  *)            echo "unknown option: $1" >&2
+                echo "usage: $0 [--app-only]" >&2; exit 2 ;;
+esac
+
+# Fingerprint EVERY input a bitstream is built from, exactly as build.sh does.
+# "Does a .bit exist" stopped being an adequate staleness test the moment
+# BOOT.bin started embedding one: without this, an RTL edit followed by a build
+# ships a BOOT.bin whose fabric predates the source, and reports success.
+PL_STAMP=vivado_project/.pl_fingerprint
+pl_fingerprint() {
+  find programmable_logic/src programmable_logic/constraints \
+       programmable_logic/block_design programmable_logic/ip \
+       scripts/create_vivado_project.tcl scripts/build_bitstream.tcl \
+       scripts/acq_imu_both_build.tcl scripts/build_fabric.py scripts/build_fabric.tcl \
+       -type f 2>/dev/null | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1
+}
+pl_fp="$(pl_fingerprint)"
+pl_stale=0
+if [ ! -f "$PL_STAMP" ] || [ "$(cat "$PL_STAMP" 2>/dev/null)" != "$pl_fp" ]; then
+  pl_stale=1
+fi
 
 # 128-ch acquisition fabric (source of acq.bin)
 XSA=vivado_project/klab_project.xsa
@@ -68,16 +90,19 @@ need_synth=0
 for pair in "$XSA:$BIT" "$IMU_XSA:$IMU_BIT" "$PA_XSA:$PA_BIT" "$PB_XSA:$PB_BIT"; do
   { [ -f "${pair%%:*}" ] && [ -f "${pair##*:}" ]; } || need_synth=1
 done
+[ "$pl_stale" = 0 ] || need_synth=1
 if [ "$app_only" != 1 ] && [ "$need_synth" = 1 ]; then
   # shellcheck disable=SC1091
   source "$XILINX_ROOT/Vivado/settings64.sh"
 fi
 
 # --- 128-ch acquisition fabric ---
-if [ -f "$XSA" ] && [ -f "$BIT" ]; then
-  echo "   acq (128-ch): reusing existing bitstream"
+if [ -f "$XSA" ] && [ -f "$BIT" ] && [ "$pl_stale" = 0 ]; then
+  echo "   acq (128-ch): reusing existing bitstream (PL sources unchanged)"
 elif [ "$app_only" = 1 ]; then
-  die "no acquisition bitstream -- run scripts/build.sh once first"
+  [ -f "$BIT" ] \
+    && die "PL sources changed since this bitstream was built -- --app-only would bake a STALE fabric into BOOT.bin. Re-run without --app-only." \
+    || die "no acquisition bitstream -- run scripts/build.sh once first"
 else
   echo "   acq (128-ch): synthesis + implementation (~18 min)"
   rm -rf vivado_project
@@ -95,8 +120,8 @@ fi
   || die "acq (128-ch) bitstream TIMING NOT MET (or routed report missing)"
 
 # --- acq_imu_both fabric (also the firmware platform) ---
-if [ -f "$IMU_XSA" ] && [ -f "$IMU_BIT" ]; then
-  echo "   acq_imu_both: reusing existing bitstream"
+if [ -f "$IMU_XSA" ] && [ -f "$IMU_BIT" ] && [ "$pl_stale" = 0 ]; then
+  echo "   acq_imu_both: reusing existing bitstream (PL sources unchanged)"
 elif [ "$app_only" = 1 ]; then
   die "no acq_imu_both bitstream -- run 'vivado -mode batch -source scripts/acq_imu_both_build.tcl' once first"
 else
@@ -112,8 +137,8 @@ fi
 # --- acq_imu_port_a / _b fabrics (generated + built by scripts/build_fabric.py) ---
 build_variant() {  # <name> <xsa> <bit> <timing>
   local name="$1" xsa="$2" bit="$3" timing="$4"
-  if [ -f "$xsa" ] && [ -f "$bit" ]; then
-    echo "   $name: reusing existing bitstream"
+  if [ -f "$xsa" ] && [ -f "$bit" ] && [ "$pl_stale" = 0 ]; then
+    echo "   $name: reusing existing bitstream (PL sources unchanged)"
   elif [ "$app_only" = 1 ]; then
     die "no $name bitstream -- run 'scripts/build_fabric.py $name' once first"
   else
@@ -127,6 +152,10 @@ build_variant() {  # <name> <xsa> <bit> <timing>
 }
 build_variant acq_imu_port_a "$PA_XSA" "$PA_BIT" "$PA_TIMING"
 build_variant acq_imu_port_b "$PB_XSA" "$PB_BIT" "$PB_TIMING"
+
+# All four fabrics exist and passed their timing gate -- stamp the sources they
+# were built from, so a later run can tell "unchanged" from "merely present".
+echo "$pl_fp" > "$PL_STAMP"
 
 echo "== [2/5] Vitis: platform (acq_imu_both.xsa -> XIic) + both apps =="
 # shellcheck disable=SC1091
@@ -165,7 +194,7 @@ bit_sz=$(stat -c%s "$BIT")
 [ "$boot_sz" -gt "$bit_sz" ] \
   || die "BOOT.bin ($boot_sz B) is smaller than the bitstream it must contain ($bit_sz B) -- bitstream not staged"
 
-echo "== [4/5] fabrics for SD: acq + detect + aimuboth + aimu_a + aimu_b =="
+echo "== [4/5] fabrics for SD: acq + aimuboth + aimu_a + aimu_b =="
 # -process_bitstream bin strips the .bit header and byte-orders the data for
 # XDcfg/PCAP, emitting <name>.bit.bin next to the input.
 bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
@@ -178,7 +207,6 @@ bit_to_pcap() {  # <src.bit> <dst blobs/name.bin>
   cp -f "${bit}.bin" "$dst"
 }
 bit_to_pcap "$BIT" blobs/acq.bin
-bit_to_pcap "vivado_detect/detect_project.runs/impl_1/detect_bd_wrapper.bit" blobs/detect.bin
 # 8.3 short name: the loader's xilffs has FF_USE_LFN=0, so the SD filename base
 # must be <=8 chars. "acq_imu_both.bin" (12-char base) fails f_open; use aimuboth.
 bit_to_pcap "$IMU_BIT" blobs/aimuboth.bin
@@ -190,7 +218,6 @@ echo ""
 echo "   blobs/ is the SD image -- copy its contents verbatim to the SD FAT root:"
 echo "   boot        : blobs/BOOT.bin         ($(stat -c%s blobs/BOOT.bin) bytes, md5 $(md5sum blobs/BOOT.bin | cut -c1-32))"
 echo "   acq (128ch) : blobs/acq.bin          ($(stat -c%s blobs/acq.bin) bytes, md5 $(md5sum blobs/acq.bin | cut -c1-32))"
-echo "   scan/detect : blobs/detect.bin       ($(stat -c%s blobs/detect.bin) bytes, md5 $(md5sum blobs/detect.bin | cut -c1-32))"
 echo "   acq+IMU     : blobs/aimuboth.bin      ($(stat -c%s blobs/aimuboth.bin) bytes, md5 $(md5sum blobs/aimuboth.bin | cut -c1-32))"
 echo "   imu port A  : blobs/aimu_a.bin        ($(stat -c%s blobs/aimu_a.bin) bytes, md5 $(md5sum blobs/aimu_a.bin | cut -c1-32))"
 echo "   imu port B  : blobs/aimu_b.bin        ($(stat -c%s blobs/aimu_b.bin) bytes, md5 $(md5sum blobs/aimu_b.bin | cut -c1-32))"

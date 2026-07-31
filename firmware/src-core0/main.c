@@ -210,7 +210,6 @@ volatile int pl_has_iic   = 0;
 typedef struct { const char *name; const char *file; int is_acq; int iic_a; int iic_b; } pl_config_t;
 static const pl_config_t pl_configs[] = {
   { "acquisition",    "acq",      1, 0, 0 },   // 128-ch LVDS acquisition, no IMU
-  { "scan",           "detect",   0, 1, 1 },   // single-ended I2C-probe fabric (both IICs)
   { "acq_imu_both",   "aimuboth", 1, 1, 1 },   // both cables 64-ch + a BNO055 each
   { "acq_imu_port_a", "aimu_a",   1, 1, 0 },   // port A 64-ch + IMU (iic_a), port B 128-ch LVDS
   { "acq_imu_port_b", "aimu_b",   1, 0, 1 },   // port A 128-ch LVDS, port B 64-ch + IMU (iic_b)

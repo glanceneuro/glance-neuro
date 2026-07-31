@@ -712,8 +712,11 @@ def load_pl(sock, name="detect"):
 # scan=I2C-probe fabric, acq_imu_both=64-ch/port + BNO055 on both cables,
 # acq_imu_port_a/_b = one cable 64-ch+IMU and the other 128-ch LVDS.
 CMD_SET_CONFIG = 0xB4
-CONFIGS = {"acquisition": 0, "scan": 1, "acq_imu_both": 2,
-           "acq_imu_port_a": 3, "acq_imu_port_b": 4}
+# Selector order mirrors the firmware's pl_configs[] exactly -- it is an index
+# into that table, so the two move together.
+CONFIGS = {"acquisition": 0, "acq_imu_both": 1,
+           "acq_imu_port_a": 2, "acq_imu_port_b": 3}
+CENSUS_FABRIC = "acq_imu_both"   # the only fabric with I2C on BOTH ports
 
 def set_config(sock, name):
     if name not in CONFIGS:
@@ -845,21 +848,31 @@ def rescan(sock, with_chip_detect=True):
         send_binary_command(sock, CMD_STOP)
         time.sleep(0.05)
 
-    print("[RESCAN] 1/3 IMU census on the scan fabric ...")
-    r = set_config(sock, "scan")
+    # Census on acq_imu_both: it is the only fabric with I2C on BOTH ports, so
+    # it is the only one that can see a headstage on either. It is also an
+    # ACQUISITION fabric with the UART routed, so unlike the retired scan fabric
+    # the console stays alive here -- and when the answer turns out to be "both
+    # ports", we are already on the right fabric and skip a second PCAP load.
+    print(f"[RESCAN] 1/3 IMU census on '{CENSUS_FABRIC}' ...")
+    r = set_config(sock, CENSUS_FABRIC)
     if not r or r["rc"] != 0:
-        print("[RESCAN] aborted -- could not load the scan fabric")
+        print(f"[RESCAN] aborted -- could not load '{CENSUS_FABRIC}'")
         return None
     imu = detect_imu(sock)
     if imu is None:
-        print("[RESCAN] aborted -- detect_imu refused on the scan fabric (bug?)")
+        print(f"[RESCAN] aborted -- detect_imu refused on '{CENSUS_FABRIC}' (bug?)")
         return None
     imu_a, imu_b = imu['A']['present'], imu['B']['present']
 
     target = _RESCAN_FABRIC[(imu_a, imu_b)]
-    print(f"[RESCAN] 2/3 IMU: A={'yes' if imu_a else 'no'} "
-          f"B={'yes' if imu_b else 'no'} -> loading '{target}' ...")
-    r = set_config(sock, target)
+    census = f"A={'yes' if imu_a else 'no'} B={'yes' if imu_b else 'no'}"
+    if target == CENSUS_FABRIC:
+        # Already here -- the census fabric IS the answer, so skip a PCAP load.
+        print(f"[RESCAN] 2/3 IMU: {census} -> '{target}' already loaded")
+        r = {"rc": 0}
+    else:
+        print(f"[RESCAN] 2/3 IMU: {census} -> loading '{target}' ...")
+        r = set_config(sock, target)
     if not r or r["rc"] != 0:
         print(f"[RESCAN] aborted -- could not load '{target}'; the board is "
               f"still on 'scan' (pl_status to confirm)")
