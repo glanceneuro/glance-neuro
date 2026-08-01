@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Reet Sinha, Allen Mikhailov, Rice University
 #
-# Build the DEFERRED-LOAD ACQUISITION image (step 2c, docs/deferred-boot.md).
+# Build the acquisition image + runtime fabrics (docs/boot.md).
 # blobs/ is the SD card image -- copy its contents verbatim to the FAT root:
 #   - blobs/BOOT.bin          : FSBL + the DEFAULT acq bitstream + both core ELFs.
 #                               The FSBL configures the PL before the GEM/lwIP exist
@@ -102,7 +102,7 @@ if [ -f "$XSA" ] && [ -f "$BIT" ] && [ "$pl_stale" = 0 ]; then
 elif [ "$app_only" = 1 ]; then
   [ -f "$BIT" ] \
     && die "PL sources changed since this bitstream was built -- --app-only would bake a STALE fabric into BOOT.bin. Re-run without --app-only." \
-    || die "no acquisition bitstream -- run scripts/build.sh once first"
+    || die "no acquisition bitstream yet -- --app-only cannot bake one. Re-run without it."
 else
   echo "   acq (128-ch): synthesis + implementation (~18 min)"
   rm -rf vivado_project

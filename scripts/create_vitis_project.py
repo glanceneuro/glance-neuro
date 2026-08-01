@@ -55,8 +55,8 @@ domain.set_config('lib', lib_name='lwip220', param='lwip220_no_sys_no_timers', v
 # drops (v1.6 instrumentation: pbuf_alloc never failed, so it is NOT memp_n_pbuf).
 domain.set_config('lib', lib_name='lwip220', param='lwip220_n_tx_descriptors', value='256')
 domain.set_config('lib', lib_name='lwip220', param='lwip220_mem_size', value='262144')
-# xilffs (FatFs) so core0 can read the acquisition fabric off the SD card in the
-# deferred-boot model (src-loader/pl_loader.c). Short 8.3 names, no LFN needed.
+# xilffs (FatFs) so core0 can read a fabric off the SD card at runtime
+# (src-loader/pl_loader.c). Short 8.3 names, no LFN needed.
 domain.set_lib('xilffs')
 
 
@@ -116,4 +116,7 @@ app.build()
 
 vitis.dispose()
 
-print("You can run 'bootgen -image scripts/boot.bif -o BOOT.bin -w' to generate the file for booting from flash.")
+# Do NOT hand-run bootgen here: scripts/build_acq_loader.sh stages the bitstream,
+# packages BOOT.bin from scripts/boot_acq_loader.bif and verifies what it produced.
+# Hand-running the underlying steps is how stale artifacts ship (CLAUDE.md rule 1).
+print("Apps built. Packaging is scripts/build_acq_loader.sh -- do not run bootgen by hand.")

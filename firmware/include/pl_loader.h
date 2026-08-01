@@ -4,7 +4,7 @@
 // Deferred PL loader (step 2): program the PL from a bitstream file on the SD
 // card via PCAP, from the running app -- the network is already up (GEM is MIO,
 // independent of the PL). Zynq-7000 path: XDcfg (devcfg) + xilffs FatFs. See
-// docs/deferred-boot.md.
+// docs/boot.md.
 #ifndef PL_LOADER_H
 #define PL_LOADER_H
 

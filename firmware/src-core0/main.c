@@ -15,7 +15,7 @@
 //#include "xuartps.h"
 #include "shared_print.h"
 #include "pl_dma.h"
-#include "pl_loader.h"  // deferred fabric load from SD via PCAP (docs/deferred-boot.md)
+#include "pl_loader.h"  // deferred fabric load from SD via PCAP (docs/boot.md)
 #include "pl_imu_stream.h"  // continuous BNO055 readout (stream_type=3)
 #include "xiltimer.h"  // XTime_GetTime / COUNTS_PER_SECOND for perf instrumentation
 
@@ -177,7 +177,7 @@ void update_current_packet_size(void) {
 // ============================================================================
 
 // ============================================================================
-// PL CONFIGURATION SWAP (docs/deferred-boot.md)
+// PL CONFIGURATION SWAP (docs/boot.md)
 // ============================================================================
 // The shared 2nd-CIPO lane is LVDS (128-ch) or single-ended (I2C IMU / 64-ch)
 // per port; IOSTANDARD is fixed per bitstream, so changing a port's mode means
@@ -605,9 +605,9 @@ int main() {
   memset((void *)command_flags, 0, sizeof(command_flags_t));
   psmon_init();   // zero the status snapshot before core 1 reads it
   pl_rhd_shadow_init();   // seed the RHD register mirror from the init defaults
-  // pl_dma_init() and pl_lfp_set_config() touch the PL, so they now run right
-  // after the PCAP fabric load (just before lwip_init), not here -- the fabric
-  // is not configured yet at this point in the deferred-boot image.
+  // pl_dma_init() and pl_lfp_set_config() touch the PL, so they run in
+  // acq_pl_init_early() just before lwip_init, not here -- see the ordering note
+  // there for why that placement is load-bearing.
   // ========================================================================
 
   // ========================================================================
@@ -643,7 +643,7 @@ int main() {
 
   // ---- The PL is already configured by the time we get here -----------------
   // BOOT.bin bakes the default acquisition bitstream, so the FSBL configured the
-  // PL before this code ran (docs/deferred-boot.md). That buys the serial console
+  // PL before this code ran (docs/boot.md). That buys the serial console
   // and the DONE LED, because the debug UART leaves the chip through PL balls --
   // a blank PL is silent.
   //

@@ -525,7 +525,7 @@ extern struct udp_pcb *udp;
 extern volatile int stream_enabled;
 extern uint32_t packets_received_count;
 
-// PL configuration swap (docs/deferred-boot.md). pl_is_acq is 1 while an
+// PL configuration swap (docs/boot.md). pl_is_acq is 1 while an
 // acquisition fabric is live; gate PL-touching work on it. pl_config_apply()
 // PCAP-loads a config by selector (caller must not be streaming) and resets the
 // master timestamp on a successful acquisition load. Returns 0 ok, >0

@@ -96,6 +96,9 @@ runtime. Copying only `BOOT.bin` boots and streams, but every fabric swap then f
    It auto-detects your host IP, points the board's UDP stream at you over TCP, and drops
    into an interactive prompt (`start`, `stop`, `get_status`, `auto_cable_detect`,
    `verify_sine`, …; type `help`). No chip needed — `set_debug 1` streams a synthetic sine.
-4. For real recording/visualization use the **[ephys-socket](https://github.com/ckemere/ephys-socket)**
-   OpenEphys plugin (drag **Intan Socket** in as the source, set the IP, **CONNECT** →
-   **RESCAN** → play).
+4. For real recording/visualization use the
+   **[glance-neuro-plugin](https://github.com/glanceneuro/glance-neuro-plugin)** Open Ephys
+   plugin: drag **GLANCE** in as the source, set the IP, **CONNECT** → **RESCAN** → play.
+   RESCAN is what discovers the headstages — it censuses the IMUs, loads the PL fabric that
+   matches what is plugged in, and then runs the phase sweep, so run it before recording
+   after any cable change.

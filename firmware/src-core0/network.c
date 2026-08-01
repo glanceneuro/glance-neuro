@@ -526,7 +526,7 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
         case CMD_SET_CONFIG: {
             // PCAP-swap the PL fabric. Only when NOT streaming (nothing in flight
             // on the PL AXI); pl_config_apply() resets the master timestamp on a
-            // successful acquisition load. docs/deferred-boot.md.
+            // successful acquisition load. docs/boot.md.
             if (stream_enabled) {
                 status = ACK_ERROR;
                 send_message("SET_CONFIG refused: stop streaming first\r\n");
@@ -550,10 +550,10 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
         }
 
         case CMD_PL_STATUS: {
-            // Which fabric is loaded -- readable in ANY fabric state (blank/scan/
-            // acq). Reads the loader's firmware record (pl_current_config), never a
-            // PL register, so a host reconnecting after a drop can recover even if
-            // the board was left in the detect fabric. docs/deferred-boot.md.
+            // Which fabric is loaded -- readable in ANY fabric state, blank
+            // included. Reads the loader's firmware record (pl_current_config),
+            // never a PL register, so a host reconnecting after a drop can recover
+            // even if the last swap left the PL blank. docs/boot.md.
             struct __attribute__((packed)) {
                 int32_t  config;   // -1 blank, else the CMD_SET_CONFIG selector
                 uint32_t flags;    // bit0 = is_acq, bit1 = link_up

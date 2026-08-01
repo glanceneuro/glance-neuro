@@ -723,7 +723,7 @@ def pl_status(sock, verbose=True):
     acquisition) because the firmware answers from its loader record, not from a PL
     register -- so a host reconnecting after a drop can learn the board's config and
     recover (e.g. it was left in the detect fabric mid-rescan). Returns a dict or
-    None. docs/deferred-boot.md."""
+    None. docs/boot.md."""
     ok, data = send_binary_command(sock, CMD_PL_STATUS, timeout=2.0)
     if not ok or data is None or len(data) < 8:
         if verbose:
@@ -3726,10 +3726,10 @@ def tcp_control():
             print(f"[TCP] Failed to configure UDP destination")
             print(f"[TCP] Device may still be sending to default: 192.168.18.100:{UDP_PORT}")
         
-        # Which PL fabric is loaded? Query this FIRST -- it works in any state
-        # (blank / scan / acquisition), so a deferred-boot board, or one left in the
-        # detect fabric after a host drop, is understood before we try the
-        # acquisition-only status (which would time out on a non-acq fabric).
+        # Which PL fabric is loaded? Query this FIRST -- it works in any state,
+        # including a blank PL, so a board whose bitstream was omitted or whose
+        # last swap failed is understood before we try the acquisition-only
+        # status (which would time out without an acquisition fabric).
         print("\n[TCP] Checking loaded PL fabric...")
         pl = pl_status(sock)
         if pl is None or pl['is_acq']:

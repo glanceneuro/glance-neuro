@@ -13,7 +13,7 @@
 // runtime PCAP reconfiguration (PROG_B clear + level-shifter/FPGA_RST toggles
 // from a live app) landing next to GEM/lwIP bring-up. An FSBL-configured PL
 // involves no PCAP at boot at all. Runtime set_config swaps are unchanged and
-// still happen over a settled link. See docs/deferred-boot.md.
+// still happen over a settled link. See docs/boot.md.
 //
 // The other fabrics still ship as separate .bin files on the SD card and are
 // swapped in at runtime; this one is only the default the board wakes up with.

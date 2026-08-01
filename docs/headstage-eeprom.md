@@ -93,8 +93,10 @@ range. Treat the format as third-party: parse it, do not extend it.
 
 - **≤16 Kbit parts (24LC01–24LC16) use 1-byte word addressing**, and a 24LC16
   uses A2..A0 as *block-select* — one chip **ACKs all eight addresses
-  0x50–0x57**. So "all 8 addresses ACK" ≠ "8 devices". This part uses 1-byte
-  addressing, so it is in this family.
+  0x50–0x57**. So "all 8 addresses ACK" ≠ "8 devices". **This part answers only
+  at 0x50** (scanned on hardware), so it is not a 24LC16: a smaller 24xx with
+  A2..A0 strapped or ignored. Exact size is unknown and unimportant — nothing
+  reads past offset 63, and the record ends at 56.
 - **≥32 Kbit parts use 2-byte word addressing** and occupy one address.
 - 0x28/0x29 (BNO055 primary/alternate) and 0x50–0x57 don't collide.
 
@@ -108,9 +110,6 @@ agree, so the probe is not wrong, just indirect.
 
 ## Still open
 
-- Exact part number, and whether 0x51–0x57 also ACK (block-select, one chip) or
-  stay silent. `i2c_scan a` answers this in one shot and has not been run since
-  the record was decoded.
 - Is WP tied high? Unresolved and **not worth resolving by experiment** — the
   only test is a write, and the thing we would be writing over is the identity
   record.

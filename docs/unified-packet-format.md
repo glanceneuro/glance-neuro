@@ -1,10 +1,8 @@
 # Unified single-port packet format (no-loss, no-MTU-framer)
 
-Status: **design contract** for the `claude/unified-ports` (broadband + LFP) stream and its
-`ephys-socket` consumer. This is the single source of truth — PL, firmware, `net.py`, and the
-Open Ephys plugin all implement exactly this. A wavelet/scalogram stream (type 4) is a
-*possible future* direction, sketched at the end for reference; it is **not** implemented and
-**not** part of the current contract.
+Status: **the wire contract**, and the single source of truth for it — the PL, the firmware,
+`net.py` and the Open Ephys plugin all implement exactly this. Change it and all four move
+together, along with `docs/protocol.md` and `docs/register-map.md`.
 
 ## Principles (from the CLAUDE.md hard rule)
 
@@ -59,8 +57,7 @@ wrong. This is why principle 1 is one port + a `stream_type` tag, not a port per
 `stream_type`: **1 = BROADBAND, 2 = LFP, 3 = IMU.** Numbers are handed out in the order
 streams actually ship, with no reserved gaps — a held-open middle number only invites a
 mismatch between what a reader assumes and what is on the wire. The next stream to land
-takes 4; the wavelet sketch at the end of this document is written against that number
-but claims nothing until it exists.
+takes 4, whenever there is one.
 
 The host demuxes on `TYPE_VER[7:0]`. **Per-stream `SEQ` continuity = the loss check.** Keep
 each stream's `SEQ` independent so broadband's integrity is unaffected by the others.
@@ -75,7 +72,7 @@ each stream's `SEQ` independent so broadband's integrity is unaffected by the ot
   10-word-header content into the new header + a small broadband sub-block — lose nothing.**
 - Already ≤ 1 datagram (≤140 data words + header ≈ 600 B). Fits trivially.
 
-**As implemented (claude/unified-ports):** the broadband frame is the 8-word common
+**As implemented:** the broadband frame is the 8-word common
 header **+ a 6-word broadband sub-block = 14 header words** ahead of the data (the PL
 writes these as 7 × 64-bit FIFO header writes). Word map (32-bit LE):
 
@@ -102,7 +99,7 @@ packet (the loss check). Max packet = 14 + 140 = 154 words = 616 B (≤ 1 datagr
 - `AUX1` = `num_samples`
 - Payload = the decimated samples (int16, as today). One frame ≤ 1 datagram. Fits.
 
-**As implemented (claude/unified-ports):** the LFP frame is exactly the 8-word common
+**As implemented:** the LFP frame is exactly the 8-word common
 header (no sub-block) then the decimated samples. `num_samples` = `popcount(lane_mask)·32`
 (`lane_mask` mirrors the broadband `channel_enable`). The PL builds the whole frame
 (header + samples) in its output BRAM; the PS DMAs it and sends it on UDP 0x6800 with
@@ -135,28 +132,6 @@ the main loop). Verified host-side in `firmware/test-host/` (simulated IIC core 
 BNO055) and cross-checked against `net.py parse_imu_packet` by
 `remote/test_imu_host.py`, which parses datagrams the (simulated) firmware emitted.
 
-### WAVELET (type 4) — POTENTIAL FUTURE, not implemented
-
-> This is a sketch for a *possible* future on-PL wavelet/scalogram stream, kept for
-> reference. It is **not** implemented and **not** part of the current wire contract
-> (which is broadband + LFP only). If that engine is ever built, this is the intended shape:
-
-- **One packet = one octave.** `AUX0` = `octave[3:0]` · `n_octaves[7:4]` · `n_voices[11:8]`
-  · `overrun[24]`. `AUX1` = `n_channels[7:0]` · `lane_start[23:8]`.
-- Payload = `n_channels × n_voices` complex coefficients (re,im as int32 each) for **this
-  octave only**, lane-major then voice-minor:
-  `[(ch0,v0.re),(ch0,v0.im),(ch0,v1.re),(ch0,v1.im)...,(ch1,v0.re)...]`.
-- **Rate-aligned emission:** emit octave *o*'s packet **only on the frames where it updates**
-  (the à trous engine advances octave *o* when `fcount mod 2^o == 0` — the work-spread
-  scheduler already computes this flag). So octave 0 streams at 3 kHz, octave 7 at ~23 Hz —
-  **no redundant re-sending of slow bands** (≈4× less traffic than sending all octaves every
-  frame). The host holds each octave's last value between its updates (the truthful
-  representation of a multirate scalogram).
-- **Fits one datagram by construction (no MTU framer):** `32 + n_channels·n_voices·8 ≤ 1472`
-  ⇒ `n_channels·n_voices ≤ 180`. The monitored channel count is a **spec we bound** (e.g.
-  ≤ 40 channels at V=4) so a one-octave packet always fits. Want more channels than fit?
-  **Reduce the channel count** (the no-loss rule) — do not split/fragment. (Full 256-ch
-  resolution is the future DDR/soft-core path, not this UDP monitor.)
 
 ## Host (net.py + Open Ephys)
 
@@ -164,12 +139,3 @@ BNO055) and cross-checked against `net.py parse_imu_packet` by
   blocks on processing; demux + per-stream handling happen downstream. Big `SO_RCVBUF`.
 - Demux by `TYPE_VER[7:0]`; verify per-stream `SEQ` continuity (the loss check).
 
-## Branch plan
-
-1. `claude/unified-ports` (off `main`): broadband + LFP on port 0x6800 with this header. PL
-   (both packet builders) + firmware (single send path/port) + `net.py` (one socket, demux)
-   + sim. **No wavelet.**
-2. `claude/unified-wavelet` (off `unified-ports`): port the v2 wavelet engine on top, add the
-   octave-split rate-aligned WAVELET packets.
-3. `ephys-socket` branch 1: consume the unified port (broadband + LFP demux).
-4. `ephys-socket` branch 2 (off branch 1): add the WAVELET scalogram consumer.

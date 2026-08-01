@@ -7,7 +7,7 @@
 // sequence. Because the app -- not the FSBL -- programs the PL here, it must
 // also do what the FSBL handoff normally does: enable the PS->PL level shifters
 // and release the PL resets through the SLCR afterward, or the fabric loads but
-// looks dead. See docs/deferred-boot.md.
+// looks dead. See docs/boot.md.
 
 #include "pl_loader.h"
 

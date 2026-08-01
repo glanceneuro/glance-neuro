@@ -15,7 +15,7 @@
 #
 # It is the single source of truth: the generated overlay/XDC carry a DO-NOT-EDIT
 # header and are regenerated on every build. design_1_bd.tcl and the RTL stay the
-# shared base; this only expresses the per-variant diff. See docs/deferred-boot.md
+# shared base; this only expresses the per-variant diff. See docs/boot.md
 # and the memory note fabric-variant-builds.
 #
 #   scripts/build_fabric.py <variant>            # generate + synthesize -> .xsa

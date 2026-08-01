@@ -49,7 +49,7 @@ globs `*.xdc`, and `uart.xdc` is what pins the console), `src-core1` (its ELF is
 from the **acq_imu_both** `.xsa`, so an `acq_imu_both_*` edit changes `BOOT.bin` too.
 
 The bitstream is baked because the debug UART leaves the chip through PL balls: a blank PL
-means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
+means no serial console and an unlit DONE LED. See `docs/boot.md`.
 
 **`build_acq_loader.sh` is the only build script.** Every other one that wrote
 `blobs/BOOT.bin` has been deleted — `build.sh` (the monolithic acquisition image),
@@ -67,9 +67,15 @@ artifact(s), and **don't leave a stale or foreign blob in `blobs/`** — the fiv
 there are the SD card, and anything else in that directory gets copied onto it. This is
 the only supported build script; it decides what to rebuild and verifies what it
 produced. Don't hand-run the underlying Vivado/Vitis steps — that is how stale
-artifacts ship. If a build fails, bring it to the
-user rather than working around it, and refuse to commit. (A `blobs` manifest +
-`check_blobs.sh` to enforce this across artifacts is planned — see `docs/deferred-boot.md`.)
+artifacts ship. If a build fails, bring it to the user rather than working around it,
+and refuse to commit.
+
+A `blobs/MANIFEST.sha256` + `check_blobs.sh` was once proposed to prove the whole blob
+set against its source. It was **dropped**, not forgotten: `blobs/` is five files from
+one script, that script already fingerprints every PL input and refuses `--app-only`
+when the fingerprint moves, and comparing checksums across a rebuild is a one-line
+check that has caught what it needed to twice. A manifest would add a second thing to
+keep in step with the first.
 
 **2. Single-sample latency is the reason this exists.** One 30 kHz sample per
 datagram. Never propose batching samples, coalescing datagrams, jumbo frames, or an
