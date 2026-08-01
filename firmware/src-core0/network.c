@@ -4,6 +4,10 @@
 #include "main.h"
 #include "pl_dma.h"     // CDMA read of the LFP output BRAM into non-cacheable staging
 #include "pl_stim.h"    // DAC70502 stimulus peripheral driver
+#include "pl_imu_detect.h"  // per-cable BNO055 probe over the AXI IICs (CMD_DETECT_IMU)
+#include "pl_imu_read.h"    // one-shot BNO055 NDOF sample (CMD_IMU_READ)
+#include "pl_imu_stream.h"  // continuous BNO055 readout (CMD_IMU_STREAM)
+#include "pl_i2c_probe.h"   // bus scan + EEPROM read (CMD_I2C_SCAN / CMD_EEPROM_READ)
 #include "lwip/init.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -92,6 +96,13 @@ ID   | Command          | Param1              | Param2
 #define CMD_STIM_GET_STATUS   0xAB  // -> stim_status_response_t
 #define CMD_STIM_SET_IDLE     0xAC  // param1 = drive_codes; param2 = codeB<<16|codeA
 #define CMD_STIM_POWERDOWN    0xAD  // disarm + outputs -> 1k to AGND
+#define CMD_DETECT_IMU        0xB0  // probe both cables' AXI IIC for a BNO055 (fabric must carry the IICs)
+#define CMD_SET_CONFIG        0xB4  // param1 = config selector; PCAP-swap the PL fabric
+#define CMD_PL_STATUS         0xB5  // query the loaded fabric -- works in ANY fabric state
+#define CMD_IMU_READ          0xB6  // param1 = port (0=A,1=B); one-shot BNO055 NDOF sample
+#define CMD_IMU_STREAM        0xB8  // param1 = port mask (absolute; 0=stop all); param2 = period ms
+#define CMD_I2C_SCAN          0xB7  // param1 = port; scan 0x08..0x77 -> 24-byte ACK bitmap
+#define CMD_EEPROM_READ       0xB9  // param1 = port<<16|width<<8|i2c_addr; param2 = offset<<8|len
 
 #define ACK_SUCCESS         0x06
 #define ACK_ERROR           0x15
@@ -154,7 +165,10 @@ int udp_reconfigure_destination(uint32_t new_ip, uint16_t new_port) {
     return 1;
 }
 
-void udp_stream_init() {
+// Create the pcb the BROADBAND stream sends on. Named for the stream, not the
+// transport: LFP and IMU are also UDP and have their own init (lfp_stream_init,
+// pl_imu_stream_init), so "udp_stream_init" read like it set up all of them.
+void broadband_stream_init(void) {
     ip_addr_t dest_ip;
     dest_ip.addr = udp_dest_ip;
     
@@ -164,7 +178,7 @@ void udp_stream_init() {
         return;
     }
     
-    send_message("UDP initialized (destination: %s:%d)\r\n",
+    send_message("Broadband stream ready (UDP destination %s:%d)\r\n",
                  ip4addr_ntoa(&dest_ip), udp_dest_port);
 }
 
@@ -186,7 +200,7 @@ void beacon_init(void) {
     uint32_t ip = netif_ip4_addr(&server_netif)->addr;
     beacon_self_ip = ip;
     // Use the LIMITED broadcast (255.255.255.255), not a subnet-directed one.
-    // A subnet-directed broadcast is only recognised as a broadcast by hosts
+    // A subnet-directed broadcast is only recognized as a broadcast by hosts
     // that agree with us about the netmask: a client on the same wire with a
     // /16 sees our /24 broadcast 192.168.18.255 as an ordinary host address,
     // and its IP stack silently discards the datagram -- while a packet capture
@@ -393,6 +407,26 @@ static void send_response(struct tcp_pcb *tpcb, uint32_t ack_id, uint8_t status,
 static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
     uint8_t status = ACK_SUCCESS;
 
+    // With no acquisition fabric live -- a torn-down PL mid-swap, or a blank one
+    // because the bitstream was omitted from BOOT.bin or a load failed -- refuse
+    // anything that reads/writes acquisition registers at 0x40000000 / CDMA /
+    // BRAM: those are not present, and such an AXI access never gets a response,
+    // so the core hangs. The allow-list is therefore "touches no PL", not "looks
+    // harmless" -- SET_UDP_DEST qualifies because it only reconfigures lwIP's
+    // destination on the PS side, and a host must be able to say where packets
+    // go without first proving a fabric is up, or a client that configures its
+    // UDP destination at connect gets refused and concludes the board is broken.
+    // GET_STATUS deliberately stays out: it reads PL status registers.
+    if (!pl_is_acq && cmd->cmd_id != CMD_SET_CONFIG && cmd->cmd_id != CMD_PING &&
+        cmd->cmd_id != CMD_PL_STATUS && cmd->cmd_id != CMD_DETECT_IMU &&
+        cmd->cmd_id != CMD_IMU_READ && cmd->cmd_id != CMD_I2C_SCAN &&
+        cmd->cmd_id != CMD_EEPROM_READ && cmd->cmd_id != CMD_SET_UDP_DEST) {
+        send_message("cmd 0x%02X refused: no acquisition fabric "
+                     "(set_config acquisition first)\r\n", (unsigned)cmd->cmd_id);
+        send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+        return;
+    }
+
     switch (cmd->cmd_id) {
         case CMD_START:
             command_flags->enable_streaming_flag = 1;
@@ -488,6 +522,211 @@ static void process_command(struct tcp_pcb *tpcb, cmd_packet_t *cmd) {
             // Lightweight link check - no send_message() to avoid UDP streaming lag
             // Just ACK immediately
             break;
+
+        case CMD_SET_CONFIG: {
+            // PCAP-swap the PL fabric. Only when NOT streaming (nothing in flight
+            // on the PL AXI); pl_config_apply() resets the master timestamp on a
+            // successful acquisition load. docs/deferred-boot.md.
+            if (stream_enabled) {
+                status = ACK_ERROR;
+                send_message("SET_CONFIG refused: stop streaming first\r\n");
+                break;
+            }
+            struct __attribute__((packed)) {
+                int32_t  rc;      // 0 ok; >0 pl_status_t; -1 bad selector
+                uint32_t bytes;   // bitstream bytes programmed
+                uint32_t flags;   // bit0 = is_acq, bit1 = link_up
+            } r;
+            uint32_t bytes = 0; uint8_t is_acq = 0;
+            r.rc    = pl_config_apply(cmd->param1, &bytes, &is_acq);
+            r.bytes = bytes;
+            r.flags = (is_acq ? 1u : 0u) |
+                      (netif_is_link_up(&server_netif) ? 2u : 0u);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
+            send_message("SET_CONFIG sel=%u rc=%d %s link=%s\r\n",
+                         (unsigned)cmd->param1, (int)r.rc,
+                         is_acq ? "acq" : "non-acq", (r.flags & 2) ? "UP" : "DOWN");
+            return;  // response already sent
+        }
+
+        case CMD_PL_STATUS: {
+            // Which fabric is loaded -- readable in ANY fabric state (blank/scan/
+            // acq). Reads the loader's firmware record (pl_current_config), never a
+            // PL register, so a host reconnecting after a drop can recover even if
+            // the board was left in the detect fabric. docs/deferred-boot.md.
+            struct __attribute__((packed)) {
+                int32_t  config;   // -1 blank, else the CMD_SET_CONFIG selector
+                uint32_t flags;    // bit0 = is_acq, bit1 = link_up
+            } r;
+            r.config = pl_current_config();
+            r.flags  = (pl_is_acq ? 1u : 0u) |
+                       (netif_is_link_up(&server_netif) ? 2u : 0u);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
+            send_message("PL_STATUS config=%d %s link=%s\r\n",
+                         (int)r.config, pl_is_acq ? "acq" : "non-acq",
+                         (r.flags & 2) ? "UP" : "DOWN");
+            return;  // response already sent
+        }
+
+        case CMD_DETECT_IMU: {
+            // Probe both cables' AXI IIC for a BNO055. Allowed on any fabric that
+            // carries the IICs (acq_imu_* OR the scan/detect fabric); refused on a
+            // fabric without them (plain acq), where 0x43D0 is absent and the AXI
+            // read would never return. Gated by pl_has_iic, not pl_is_acq, so it
+            // also works without an acquisition fabric (past the guard allow-list).
+            if (!pl_has_iic) {
+                send_message("DETECT_IMU refused: loaded fabric has no I2C "
+                             "(set_config acq_imu_both first)\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if (pl_imu_stream_mask()) {
+                send_message("DETECT_IMU refused: IMU stream active "
+                             "(imu_stream 0 first)\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_detect_response_t resp;
+            // Probe ONLY the ports whose IIC the loaded fabric carries -- a mixed
+            // acq_imu_port_a/_b fabric has one IIC and one 128-ch LVDS port, and
+            // probing the absent port's AXI slave hangs the core.
+            pl_imu_detect_run(&resp, pl_has_iic_a, pl_has_iic_b);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &resp, sizeof(resp));
+            return;  // response already sent
+        }
+
+        case CMD_IMU_READ: {
+            // One-shot BNO055 fused sample (quat/accel/gyro) from one port.
+            // Blocking polled I2C, milliseconds long (plus ~50 ms on first use
+            // to enter NDOF) -- refuse while streaming: the pump would miss
+            // hundreds of 33 us sample slots and overrun the PL FIFO. Checking
+            // transmission state reads an acquisition register, so only do it
+            // when an acq fabric is live (on scan, streaming can't be active).
+            int port = cmd->param1 & 1;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            if (!has_iic) {
+                send_message("IMU_READ refused: port %c has no I2C on this "
+                             "fabric\r\n", port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if (pl_is_acq && pl_is_transmission_active()) {
+                send_message("IMU_READ refused: stop streaming first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if (pl_imu_stream_active(port)) {
+                send_message("IMU_READ refused: IMU stream active on port %c "
+                             "(its packets carry the same data)\r\n",
+                             port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_sample_response_t sample;
+            pl_imu_read_sample(port, &sample);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &sample, sizeof(sample));
+            return;  // response already sent
+        }
+
+        case CMD_I2C_SCAN: {
+            // Inventory one port's I2C bus (0x08..0x77 ACK bitmap). Cold path,
+            // deadline-bounded (~25 ms clean, one 5 ms deadline if wedged);
+            // same gates as IMU_READ: the port must have an IIC, and neither
+            // the pump nor the IMU stream may own the bus.
+            int port = cmd->param1 & 1;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            if (!has_iic) {
+                send_message("I2C_SCAN refused: port %c has no I2C on this "
+                             "fabric\r\n", port ? 'B' : 'A');
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if ((pl_is_acq && pl_is_transmission_active()) ||
+                pl_imu_stream_active(port)) {
+                send_message("I2C_SCAN refused: stop streaming / imu_stream "
+                             "first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            i2c_scan_response_t scan;
+            pl_i2c_scan(port, &scan);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &scan, sizeof(scan));
+            return;  // response already sent
+        }
+
+        case CMD_EEPROM_READ: {
+            // Bounded combined-read from an arbitrary device on the port's bus
+            // (identification / EEPROM contents). Non-destructive: the offset
+            // write only moves the device's read pointer.
+            int port = (cmd->param1 >> 16) & 1;
+            int width = (cmd->param1 >> 8) & 0xFF;
+            uint8_t i2c_addr = cmd->param1 & 0x7F;
+            uint16_t offset = (cmd->param2 >> 8) & 0xFFFF;
+            uint8_t len = cmd->param2 & 0xFF;
+            int has_iic = port ? pl_has_iic_b : pl_has_iic_a;
+            // Reserved I2C addresses are refused outright, not just avoided by
+            // convention: address 0x00 is the GENERAL CALL, and a "read" there
+            // puts our offset byte on a broadcast that several device families
+            // decode as a reset command. 0x08..0x77 is the addressable range
+            // (matching I2C_SCAN), so nothing legitimate is lost.
+            int addr_ok = (i2c_addr >= I2C_SCAN_FIRST && i2c_addr <= I2C_SCAN_LAST);
+            if (!has_iic || (width != 1 && width != 2) || !addr_ok) {
+                send_message("EEPROM_READ refused: %s\r\n",
+                             !has_iic ? "port has no I2C on this fabric"
+                             : !addr_ok ? "device address outside 0x08..0x77"
+                                        : "addr width must be 1 or 2");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            if ((pl_is_acq && pl_is_transmission_active()) ||
+                pl_imu_stream_active(port)) {
+                send_message("EEPROM_READ refused: stop streaming / imu_stream "
+                             "first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            eeprom_read_response_t rd;
+            pl_i2c_read(port, i2c_addr, width, offset, len, &rd);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &rd, sizeof(rd));
+            return;  // response already sent
+        }
+
+        case CMD_IMU_STREAM: {
+            // Absolute port set: param1 selects which ports stream (0 = stop
+            // all), param2 = sample period ms (0 -> 10 ms = the BNO055's 100 Hz
+            // fusion rate). Requires an acquisition fabric (the guard above):
+            // packets carry the PL master timestamp, and the IICs only exist on
+            // acq_imu_* fabrics anyway. Starting a NEW port does a blocking
+            // ~50 ms NDOF entry, so that is refused mid-stream -- start the IMU
+            // BEFORE 'start'. Stopping ports never blocks and is always allowed.
+            imu_stream_response_t q;
+            if (cmd->param1 & IMU_STREAM_QUERY) {
+                // Report-only: never touches the state machine, so it is safe
+                // to call while a stream is running or while none is.
+                q.active_mask = pl_imu_stream_mask();
+                q.period_ms   = pl_imu_stream_period_ms();
+                q.version     = IMU_STREAM_VERSION;
+                send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &q, sizeof(q));
+                return;
+            }
+            uint32_t want = cmd->param1 & 3;
+            uint32_t newly = want & ~pl_imu_stream_mask();
+            if (newly && pl_is_transmission_active()) {
+                send_message("IMU_STREAM refused: starting a port needs a "
+                             "blocking NDOF entry -- imu_stream before start, "
+                             "or stop first\r\n");
+                send_ack(tpcb, cmd->ack_id, ACK_ERROR);
+                return;
+            }
+            imu_stream_response_t r;
+            r.active_mask = pl_imu_stream_set(want, cmd->param2);
+            r.period_ms   = pl_imu_stream_period_ms();
+            r.version     = IMU_STREAM_VERSION;
+            send_message("Binary Command: IMU_STREAM mask=%lu -> active=%lu\r\n",
+                         (unsigned long)want, (unsigned long)r.active_mask);
+            send_response(tpcb, cmd->ack_id, ACK_SUCCESS, &r, sizeof(r));
+            return;  // response already sent
+        }
 
         case CMD_GET_STATUS: {
             // NOTE: pl_print_status() (a ~16-line console flood) is deliberately

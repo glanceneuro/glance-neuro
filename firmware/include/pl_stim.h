@@ -3,8 +3,8 @@
 //
 // PS-side driver for the PL stimulus peripheral (stim_top): DAC70502
 // waveform playback out of the 16384-frame PL RAM. Register map mirrors
-// programmable_logic/src/stim_axi_regs.sv; wire protocol and semantics are
-// docs/dac-stim-requirements.md. All of this is cold path -- nothing here may
+// programmable_logic/src/stim_axi_regs.sv; the wire protocol and semantics are
+// docs/stim.md. All of this is cold path -- nothing here may
 // be called from the per-sample streaming loop.
 #ifndef PL_STIM_H
 #define PL_STIM_H

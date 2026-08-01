@@ -28,6 +28,24 @@ void init_print_buffer(void);
 void send_message(const char *format, ...);
 void print_handler_loop(void);
 
+// Set by core 0 immediately after it SEVs core 1. Before that point core 1 is
+// parked, so NOTHING drains the print ring: a send_message() would sit unseen
+// and, once 64 entries pile up, be dropped outright.
+extern volatile int core1_print_active;
+
+// For code that can run on BOTH sides of that moment. pl_dma_init() is the
+// case that forced this to exist: it runs from acq_pl_init_early(), which is
+// called once at boot BEFORE core 1 is awake and again on every runtime
+// set_config swap, long after. Neither xil_printf nor send_message is correct
+// in both places -- direct printing collides with core 1 for the UART, queued
+// printing vanishes when core 1 is parked -- so this picks per call.
+//
+// Ordinary code should keep calling send_message(). This is deliberately NOT
+// folded into send_message() itself: the one queued line in the boot path
+// ("Debug server up and running.") is a self-test of the ring, and it only
+// tests anything if send_message() always means "go through the ring".
+void boot_print(const char *format, ...);
+
 
 typedef struct {
     print_entry_t entries[MAX_PRINT_ENTRIES];
@@ -57,6 +75,18 @@ typedef struct {
     volatile int cable_test_flag;
     volatile uint32_t start_bram_addr;
     volatile uint32_t word_count;
+    // Serial DEBUG-console input gate, owned by core 0, read by core 1.
+    //
+    // The console UART leaves this chip through PL balls (EMIO to M14/M15 via
+    // JX2), so while the PL is unconfigured or being reprogrammed its RX line
+    // FLOATS and the receiver picks up noise. Core 1's check_serial_input()
+    // accumulates that into a command line and executes it -- and the command
+    // set includes "dump [start] [count]", whose sscanf'd word_count then sends
+    // core 0 into an enormous BRAM read loop, and "start", which begins
+    // streaming. Both leave the board unresponsive to the network. Core 0
+    // therefore closes this gate across every PCAP reconfiguration; core 1
+    // discards RX bytes while it is shut.
+    volatile int serial_input_ok;
 } command_flags_t;
 
 extern volatile command_flags_t *command_flags;

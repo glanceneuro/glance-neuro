@@ -158,7 +158,7 @@ void pl_stim_upload_abort(void) {
 int pl_stim_upload_write2(uint32_t w0, uint32_t w1) {
     if (upload_remaining == 0)
         return -1;
-    stim_wr(STIM_RAM_OFFSET + upload_ptr * 4u, w0);  // DMA-EXEMPT: stimulus upload is deliberately single-beat -- cold path, refused while acquisition streams (R4), chosen over a DMA/bulk path in dac-stim-requirements.md 3.9
+    stim_wr(STIM_RAM_OFFSET + upload_ptr * 4u, w0);  // DMA-EXEMPT: stimulus upload is deliberately single-beat -- cold path, refused while acquisition streams (R4), chosen over a DMA/bulk path because the upload is cold and bounded
     upload_ptr++;
     upload_remaining--;
     if (upload_remaining > 0) {          // final odd word: w1 is padding

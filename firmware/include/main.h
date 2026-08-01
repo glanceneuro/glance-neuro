@@ -90,7 +90,11 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define UNIFIED_HEADER_WORDS    8
 #define STREAM_TYPE_BROADBAND   1
 #define STREAM_TYPE_LFP         2
-// stream_type 3 is reserved for a possible future wavelet/scalogram stream (not implemented)
+// stream_type 3 is the IMU side channel (STREAM_TYPE_IMU, pl_imu_stream.h) -- the
+// one PS-built stream: its source is I2C, not a PL BRAM, so the DMA-into-pbuf
+// rule doesn't apply and the PS assembles the 13-word packet itself at 100 Hz.
+// Types are handed out in the order streams actually ship, with no gaps; the next
+// stream to land takes 4.
 
 // Packet size calculation based on channel_enable bits.
 // channel_enable is now 8 bits: [3:0] = port 0 streams, [7:4] = port 1 (dual
@@ -321,9 +325,32 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 
 // Protocol version
 #define PROTOCOL_VERSION               1
-#define FIRMWARE_VERSION_MAJOR         2
-// MAJOR bumps when the wire contract breaks; MINOR when it only grows.
-#define FIRMWARE_VERSION_MINOR         2   // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
+#define FIRMWARE_VERSION_MAJOR         3
+// MAJOR bumps when a host built for the previous version can no longer drive this
+// board correctly -- either the wire contract broke, or the board grew a capability
+// it cannot know to ask about. MINOR when the contract only grows compatibly.
+#define FIRMWARE_VERSION_MINOR         0   // 3.0.0.0: the board is no longer one fixed fabric. It carries
+                                           //      a set of runtime-swappable PL configurations and
+                                           //      chooses among them from what is physically plugged in
+                                           //      (SET_CONFIG 0xB4 / PL_STATUS 0xB5 + the host-side
+                                           //      rescan orchestrator). BOOT.bin bakes the default
+                                           //      acquisition bitstream so the FSBL configures the PL,
+                                           //      and blobs/ carries the other three fabrics as files on
+                                           //      the card. That is an architecture change, not a feature
+                                           //      added to a fixed design, hence MAJOR: what "the PL" is
+                                           //      became a runtime property a host must ask about.
+                                           //      Riding on it: headstage IMU -- a BNO055 on each cable's
+                                           //      freed CIPO pair as a stream_type=3 UDP side channel at
+                                           //      100 Hz -- plus the I2C bus-scan/EEPROM probes. New
+                                           //      commands: CMD_DETECT_IMU 0xB0, SET_CONFIG 0xB4,
+                                           //      PL_STATUS 0xB5, IMU_READ 0xB6, I2C_SCAN 0xB7,
+                                           //      IMU_STREAM 0xB8, EEPROM_READ 0xB9. Broadband, LFP, aux
+                                           //      and stim remain byte-for-byte unchanged and
+                                           //      status_response_t is still 288 B, so a 2.x host that
+                                           //      only streams still works against the default fabric --
+                                           //      but it cannot see or select a configuration, which is
+                                           //      the part that now matters. See docs/imu-ingestion.md.
+                                           // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
                                            //      + firmware driver + host API, TCP cmds 0xA0..0xAD).
                                            //      ADDITIVE over 2.1.0.0 -- the broadband/aux/LFP wire
                                            //      contract is UNCHANGED (stim is control-only + a PL
@@ -344,10 +371,10 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            //      engine is always on, reg22 carries the override
                                            //      semantics, and the accel slot-0 reply rides in-frame at
                                            //      data word 34. A 1.x host does not interoperate.
-#define FIRMWARE_VERSION_PATCH         1   // 2.2.0.1: harden the hw retrigger path --
-                                           //      latch the trigger edge (no drop in the
-                                           //      RD pipeline) + start-latch FRAME_COUNT.
-                                           //      RTL bugfix; wire contract unchanged.
+#define FIRMWARE_VERSION_PATCH         0   // reset by the 3.0.0.0 MAJOR bump. (2.2.0.1 was
+                                           //      the hw-retrigger hardening: latch the trigger
+                                           //      edge + start-latch FRAME_COUNT; that RTL fix
+                                           //      is included here.)
 #define FIRMWARE_VERSION_BUILD         0
 #define FIRMWARE_VERSION_WORD          ((FIRMWARE_VERSION_MAJOR << 24) | \
                                        (FIRMWARE_VERSION_MINOR << 16) | \
@@ -497,6 +524,22 @@ extern struct netif server_netif;
 extern struct udp_pcb *udp;
 extern volatile int stream_enabled;
 extern uint32_t packets_received_count;
+
+// PL configuration swap (docs/deferred-boot.md). pl_is_acq is 1 while an
+// acquisition fabric is live; gate PL-touching work on it. pl_config_apply()
+// PCAP-loads a config by selector (caller must not be streaming) and resets the
+// master timestamp on a successful acquisition load. Returns 0 ok, >0
+// pl_status_t on load failure, -1 bad selector.
+extern volatile int pl_is_acq;
+// Per-port IIC presence (port A 0x43D0, port B 0x43D1). CMD_DETECT_IMU probes a
+// port ONLY if its flag is set -- a mixed acq_imu_port_a/_b fabric has one IIC and
+// leaves the other port as 128-ch LVDS, whose absent AXI slave hangs the core.
+// pl_has_iic is the OR that gates the command (plain acq, with neither, refuses).
+extern volatile int pl_has_iic_a;
+extern volatile int pl_has_iic_b;
+extern volatile int pl_has_iic;
+int pl_config_apply(uint32_t sel, uint32_t *out_bytes, uint8_t *out_is_acq);
+int pl_current_config(void);   // -1 blank, else pl_configs index (for CMD_PL_STATUS)
 
 // Command flags for main loop processing
 extern volatile int enable_streaming_flag;
@@ -650,7 +693,7 @@ extern const uint16_t cable_length_cmd_sequence[32];
 // Network functions (implemented in network.c)
 uint32_t sys_now(void);
 void start_tcp_server(void);
-void udp_stream_init(void);
+void broadband_stream_init(void);   // creates the broadband UDP pcb (stream_type=1)
 
 // UDP destination configuration
 int udp_reconfigure_destination(uint32_t new_ip, uint16_t new_port);

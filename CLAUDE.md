@@ -24,20 +24,52 @@ implementation detail — see the hard rules.
 | `firmware/src-core0/` | network, streaming, PL control |
 | `firmware/include/main.h` | the PS side of the register/packet contract |
 | `remote/net.py` | reference host client and diagnostic tool |
-| `blobs/BOOT.bin` | the bootable image, matching the source in the same commit |
+| `blobs/` | the SD card image (copied verbatim to the FAT root): `BOOT.bin` + any runtime fabrics, matching the source in the same commit — see rule 1 |
 | `docs/` | protocol, register map, LFP cascade, testing |
 
 ## Hard rules
 
 These are not preferences. Violating one is a reason to stop and ask.
 
-**1. Never ship source and binary out of step.** Any commit touching
-`programmable_logic/` or `firmware/` carries a `blobs/BOOT.bin` built from that exact
-source. Run `scripts/build.sh` — it is the only supported way to build, it decides for
-itself what needs rebuilding, and it verifies what it produced. Don't hand-run the
-underlying Vivado/Vitis steps: doing so is how stale artefacts get shipped, which is the
-whole reason that script exists. If it fails, bring the failure to the user rather than
-working around it, and refuse to commit.
+**1. Never ship source and binary out of step.** `blobs/` **is the SD card image** —
+its contents are copied verbatim to the FAT root. It always holds `BOOT.bin` (the boot
+image; the BootROM requires exactly that name) plus the fabric `*.bin` files loaded at
+runtime. There is **one** builder and **one** SD image:
+
+| `blobs/` contents = the SD card | built from | built by |
+|---|---|---|
+| `BOOT.bin` (FSBL + baked acq bitstream + both core ELFs) and `acq.bin` / `aimu*.bin` | `firmware/src-core0` + `firmware/src-core1` + `firmware/include` + `programmable_logic/{src,constraints,block_design,ip}` | `scripts/build_acq_loader.sh` |
+
+**`BOOT.bin` is a PL artifact as well as a firmware one** — it carries a bitstream, so a
+`programmable_logic/` change must rebuild it, not just the fabric `.bin`. The build script
+enforces this with a source fingerprint: `--app-only` **refuses** rather than baking a
+stale fabric. Note the inputs that are easy to forget: `constraints/` (the acq project
+globs `*.xdc`, and `uart.xdc` is what pins the console), `src-core1` (its ELF is inside
+`BOOT.bin`), and the fact that the Vitis platform — hence the FSBL and BSP — is generated
+from the **acq_imu_both** `.xsa`, so an `acq_imu_both_*` edit changes `BOOT.bin` too.
+
+The bitstream is baked because the debug UART leaves the chip through PL balls: a blank PL
+means no serial console and an unlit DONE LED. See `docs/deferred-boot.md`.
+
+**`build_acq_loader.sh` is the only build script.** Every other one that wrote
+`blobs/BOOT.bin` has been deleted — `build.sh` (the monolithic acquisition image),
+`build_detect.sh` and `build_loader.sh`, together with the `detect` fabric they served
+(`detect_bd.tcl`, `detect_pins.xdc`, `firmware/src-detect/`). A build script that
+overwrites `BOOT.bin` and isn't the product is a trap, not a fallback, and `build.sh` was
+the worst of them: it baked the *same* acquisition bitstream, so its image booted and
+streamed and looked correct, while its firmware was built against the plain `.xsa` and
+therefore could not drive any of the `aimu*.bin` fabrics sitting beside it on the card.
+
+A commit that changes a source subtree rebuilds every artifact that lists it. The
+corollary has bitten before: an app grew a feature but the baked `BOOT.bin` image wasn't
+rebuilt, so it shipped stale. So: after touching a subtree, rebuild its
+artifact(s), and **don't leave a stale or foreign blob in `blobs/`** — the five files
+there are the SD card, and anything else in that directory gets copied onto it. This is
+the only supported build script; it decides what to rebuild and verifies what it
+produced. Don't hand-run the underlying Vivado/Vitis steps — that is how stale
+artifacts ship. If a build fails, bring it to the
+user rather than working around it, and refuse to commit. (A `blobs` manifest +
+`check_blobs.sh` to enforce this across artifacts is planned — see `docs/deferred-boot.md`.)
 
 **2. Single-sample latency is the reason this exists.** One 30 kHz sample per
 datagram. Never propose batching samples, coalescing datagrams, jumbo frames, or an
@@ -70,7 +102,7 @@ lands outside its bit reports "no overrun" forever.
 
 ## Diagnosing
 
-Measure before theorising. This is the lesson that cost the most.
+Measure before theorizing. This is the lesson that cost the most.
 
 - A plausible mechanism is not evidence. Get a number that distinguishes your
   hypothesis from its alternatives, and be willing to have it disproved.
@@ -108,6 +140,10 @@ Measure before theorising. This is the lesson that cost the most.
 - Source files carry SPDX headers. This repo is MIT; the plugin repo is GPL-3 and the
   hardware repo is CERN-OHL-P. When moving code between them, keep the destination's
   header — copying a file verbatim from another tree silently strips it.
-- Plain forward commits. Don't rebase shared branches.
-- Commit or push only when asked. No AI attribution trailers.
+- Plain forward commits. Don't rebase shared branches. No AI attribution trailers.
+- **Always push your work; never leave it local, never push straight to `main`.** The
+  build host sits in the lab but has no link to the board (separate subnet, no JTAG, no
+  SD card), so the user can only test what has been pushed — unpushed work is
+  untestable. Stage everything on a `testing/<topic>` branch to keep `main` and other
+  shared branches clean; the user pulls that branch to flash and test.
 - See `docs/TESTING.md` for what earns a test and what gets retired.

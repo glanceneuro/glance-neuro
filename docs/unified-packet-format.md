@@ -2,7 +2,7 @@
 
 Status: **design contract** for the `claude/unified-ports` (broadband + LFP) stream and its
 `ephys-socket` consumer. This is the single source of truth — PL, firmware, `net.py`, and the
-Open Ephys plugin all implement exactly this. A wavelet/scalogram stream (type 3) is a
+Open Ephys plugin all implement exactly this. A wavelet/scalogram stream (type 4) is a
 *possible future* direction, sketched at the end for reference; it is **not** implemented and
 **not** part of the current contract.
 
@@ -56,8 +56,11 @@ wrong. This is why principle 1 is one port + a `stream_type` tag, not a port per
 | 6 | `AUX1` | stream-specific (below) |
 | 7 | `RSVD` | 0 (reserved; candidate for a future CRC32 of the packet) |
 
-`stream_type`: **1 = BROADBAND, 2 = LFP.** (Type 3 is reserved for a possible future
-wavelet/scalogram stream — sketched at the end; not implemented.)
+`stream_type`: **1 = BROADBAND, 2 = LFP, 3 = IMU.** Numbers are handed out in the order
+streams actually ship, with no reserved gaps — a held-open middle number only invites a
+mismatch between what a reader assumes and what is on the wire. The next stream to land
+takes 4; the wavelet sketch at the end of this document is written against that number
+but claims nothing until it exists.
 
 The host demuxes on `TYPE_VER[7:0]`. **Per-stream `SEQ` continuity = the loss check.** Keep
 each stream's `SEQ` independent so broadband's integrity is unaffected by the others.
@@ -103,9 +106,36 @@ packet (the loss check). Max packet = 14 + 140 = 154 words = 616 B (≤ 1 datagr
 header (no sub-block) then the decimated samples. `num_samples` = `popcount(lane_mask)·32`
 (`lane_mask` mirrors the broadband `channel_enable`). The PL builds the whole frame
 (header + samples) in its output BRAM; the PS DMAs it and sends it on UDP 0x6800 with
-stream_type=2. Verified in `programmable_logic/sim/lfp_dsp_block_tb.sv`.
+stream_type=2. The cascade was validated in simulation against the reference response from
+`design_lfp_filters.py`; that bench was retired once the engine was built and tested on
+hardware, per `docs/TESTING.md` — one-off benches are deleted outright rather than carried,
+and git history keeps them.
 
-### WAVELET (type 3) — POTENTIAL FUTURE, not implemented
+### IMU (type 3) — BNO055 side channel
+
+One datagram per fused sample (default 100 Hz per port, `CMD_IMU_STREAM`), 8-word
+common header + 5 payload words = **52 bytes**. The one PS-built stream: its source
+is I2C (not a PL BRAM), so the firmware assembles the packet and stamps it with
+`pl_get_timestamp()` when the sample completes — IMU samples land on the **same
+master clock as the neural data**, which is the point of ingesting them on-board.
+
+- `TYPE_VER` flags: bit 16 = port (0 = A, 1 = B). Each port is its own stream with
+  its own `SEQ` (starts at 0 on `imu_stream` start). A failed send is never retried
+  (the next sample is 10 ms away and fresher), so a SEQ gap = exactly one lost sample.
+- `AUX0` = `period_ms[15:0]` · `iic_errors[23:16]` · `send_drops[31:24]` (both
+  counters saturate at 255 — health at a glance).
+- `AUX1` = `calib_stat[7:0]` (BNO055 CALIB_STAT: `[7:6]`sys `[5:4]`gyr `[3:2]`acc
+  `[1:0]`mag, 3 = calibrated; `0xFF` until the first housekeeping read) ·
+  `opr_mode[15:8]` · `temp_c[23:16]` (die temperature, int8).
+- Payload = 10 LE int16: quat `w,x,y,z` (1 = 2^14), acc `x,y,z` (1 LSB = 0.01 m/s²),
+  gyr `x,y,z` (1 LSB = 1/16 °/s).
+
+Source: `firmware/src-core0/pl_imu_stream.c` (non-blocking AXI IIC state machine in
+the main loop). Verified host-side in `firmware/test-host/` (simulated IIC core +
+BNO055) and cross-checked against `net.py parse_imu_packet` by
+`remote/test_imu_host.py`, which parses datagrams the (simulated) firmware emitted.
+
+### WAVELET (type 4) — POTENTIAL FUTURE, not implemented
 
 > This is a sketch for a *possible* future on-PL wavelet/scalogram stream, kept for
 > reference. It is **not** implemented and **not** part of the current wire contract

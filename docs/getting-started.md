@@ -7,7 +7,7 @@ conventions see [`../CLAUDE.md`](../CLAUDE.md).
 ## 1. Hardware
 
 - A **MicroZed** Zynq-7000 SOM (7Z020; the 7Z010 should also work) on the
-  [carrier PCB](../pcb/KiCad-Project/) (manufactured at JLCPCB).
+  [carrier PCB](https://github.com/glanceneuro/glance-neuro-hardware) (manufactured at JLCPCB).
 - An Intan RHD2000-style headstage on a 12-pin Omnetics cable.
 - A microSD card, Ethernet, and a **USB-C** cable. On the carrier the USB-C connector
   supplies **both power and the serial debug console** (UART) — the board draws about
@@ -38,19 +38,22 @@ as shown below:
 
 ## 3. Put a bootable image on the SD card
 
-The SD card needs a **FAT32** partition named **`Boot`** containing a `BOOT.bin`.
+The SD card needs a **FAT32** partition named **`Boot`** containing **everything in
+`blobs/`** — not just `BOOT.bin`.
 
-**Quickest — use the prebuilt image:** copy [`../blobs/BOOT.bin`](../blobs/BOOT.bin)
-straight to the `Boot` partition. Insert the card, set the jumpers (step 2), power on.
+**Quickest — use the prebuilt image:** copy the whole of [`../blobs/`](../blobs/) to the
+`Boot` partition. Insert the card, set the jumpers (step 2), power on.
 
-**Or rebuild it** (see step 4), then:
-```bash
-bootgen -image scripts/boot.bif -o BOOT.bin -w   # produces BOOT.bin
-cp BOOT.bin <SD Boot partition>/
-```
-`boot.bif` packs the FSBL + bitstream + both core ELFs. After **any PL change** the fresh
-bitstream must be re-staged into the path `boot.bif` references before running `bootgen`
-(see [`../CLAUDE.md`](../CLAUDE.md)).
+`blobs/` is the SD image: `BOOT.bin` boots the board (it carries the FSBL, the default
+acquisition bitstream, and both core ELFs, so the PL is configured before the network
+exists — which is why the serial console and the DONE LED come up immediately), and the
+four fabric files `acq.bin` / `aimuboth.bin` / `aimu_a.bin` / `aimu_b.bin` are what
+`set_config` and `rescan` load at runtime.
+
+Copying **only** `BOOT.bin` boots and streams, so it looks fine — but every fabric swap
+then fails with `PL_ERR_OPEN`, which reads as a firmware bug rather than a missing file.
+
+**Or rebuild it** — see step 4, which writes the whole set; then copy `blobs/*` across.
 
 ## 4. Build from source (optional)
 
@@ -60,24 +63,25 @@ The repo ships a bootable image at `blobs/BOOT.bin`, built from the source besid
 you only need this if you are changing the design.
 
 ```bash
-scripts/build.sh
+scripts/build_acq_loader.sh              # the whole set: BOOT.bin + four fabrics
+scripts/build_acq_loader.sh --app-only   # firmware only; refuses if the PL changed
 ```
 
-That is the whole build. It fingerprints the PL sources to decide whether the fabric needs
-re-synthesising (~18 min) or can be reused (~3 min), regenerates the firmware against the
-current hardware definition either way, produces `blobs/BOOT.bin`, and then checks what it
-made — timing closed, and the bitstream inside the image identical to the one
-implementation produced. It fails rather than emit an image it cannot vouch for.
-
-```bash
-scripts/build.sh --check      # say what would be rebuilt, change nothing
-scripts/build.sh --force-pl   # re-synthesise the PL even if unchanged
-```
+That is the whole build, and the only one — every other script that wrote `blobs/BOOT.bin`
+has been deleted. It fingerprints the PL sources to decide whether the four fabrics need re-synthesizing
+(~72 min) or can be reused (~3 min), builds the firmware against the acq_imu_both `.xsa`
+(the superset, so the BSP carries XIic), packages `blobs/BOOT.bin`, converts each fabric
+to its PCAP `.bin`, and then checks what it made — every fabric's timing closed, and the
+bitstream genuinely inside the boot image. It fails rather than emit an image it cannot
+vouch for.
 
 Needs **Vivado + Vitis 2025.1**; set `XILINX_ROOT` if they are not at `/opt/Xilinx/2025.1`.
 The part (`xc7z020clg400-1`) is set in `scripts/create_vivado_project.tcl`.
 
-Copy `blobs/BOOT.bin` to the FAT32 boot partition of the SD card to flash it.
+Copy **the entire contents of `blobs/`** to the FAT32 boot partition — `BOOT.bin` boots
+the board, and the four fabric `.bin` files are what `set_config` / `rescan` load at
+runtime. Copying only `BOOT.bin` boots and streams, but every fabric swap then fails with
+`PL_ERR_OPEN`, which looks like a firmware bug rather than a missing file.
 
 ## 5. First connection
 
