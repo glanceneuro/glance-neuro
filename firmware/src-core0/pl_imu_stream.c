@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2025-2026 Caleb Kemere, Rice University
 //
 // Continuous BNO055 readout (stream_type = 3). See pl_imu_stream.h for the
-// wire format and the API contract; docs/imu-ingestion.md for the design.
+// wire format and the API; docs/imu-ingestion.md for the design.
 //
 // The whole point of the shape below: the 30 kHz broadband pump shares this
 // loop, so NOTHING here may block. Every I2C transfer is a "combined

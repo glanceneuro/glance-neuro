@@ -385,7 +385,7 @@ module lfp_dsp_block #(
                     samp_count <= samp_count + 1'b1;
                 end
             end else if (hdr_busy) begin
-                // One header word per clock, from the shared contract.
+                // One header word per clock, from the shared layout.
                 bram_word_r <= frame_base + LFP_WORD_AW'(hdr_idx);
                 bram_din_r  <= unified_hdr_word(hdr_idx[2:0], STREAM_TYPE_LFP,
                                                 ts_frame, frame_seq,

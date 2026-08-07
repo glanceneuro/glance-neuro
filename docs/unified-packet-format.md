@@ -1,6 +1,6 @@
 # Unified single-port packet format (no-loss, no-MTU-framer)
 
-Status: **the wire contract**, and the single source of truth for it — the PL, the firmware,
+Status: **the wire format**, and the single source of truth for it — the PL, the firmware,
 `net.py` and the Open Ephys plugin all implement exactly this. Change it and all four move
 together, along with `docs/protocol.md` and `docs/register-map.md`.
 

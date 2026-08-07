@@ -185,7 +185,7 @@ void broadband_stream_init(void) {
 // ============================================================================
 // DEVICE DISCOVERY BEACON: broadcast device_beacon_t to <subnet>.255:BEACON_PORT
 // ~1 Hz so a client can discover our IP + know we're up WITHOUT sending us
-// anything during the fragile boot window. See the contract in main.h.
+// anything during the fragile boot window. See the layout in main.h.
 // IP_SOF_BROADCAST is off in this build, so a plain udp_sendto() to a broadcast
 // address is permitted (no SOF_BROADCAST flag needed).
 // ============================================================================

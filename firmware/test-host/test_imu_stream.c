@@ -71,7 +71,7 @@ static void test_basic_stream(void)
     CHECK(mock_pkts[0].len == 52, "len=%u", mock_pkts[0].len);
     CHECK(pkt_word(0, 0) == UNIFIED_MAGIC, "magic=0x%08X", pkt_word(0, 0));
     // Spelled out as a literal, NOT built from STREAM_TYPE_IMU: this is the wire
-    // contract, so the test has to fail when the constant moves rather than
+    // wire format, so the test has to fail when the constant moves rather than
     // follow it. 3 = IMU, 1 = unified version, 0 = port A in the flags field.
     CHECK(pkt_word(0, 1) == (3u | (1u << 8) | (0u << 16)), "type_ver=0x%08X", pkt_word(0, 1));
     CHECK(pkt_word(0, 2) == 0x11223344 && pkt_word(0, 3) == 0x5, "timestamp");
@@ -434,7 +434,7 @@ static void test_period_clamp(void)
 
 // With IMU_TEST_DUMP=<path> set, run a clean dual-port capture and write the
 // raw datagrams (u16-LE length prefix each) for the Python side to parse with
-// net.py's real parse_imu_packet -- the cross-implementation contract test.
+// net.py's real parse_imu_packet -- the cross-implementation check.
 static void dump_packets(const char *path)
 {
     mock_reset();

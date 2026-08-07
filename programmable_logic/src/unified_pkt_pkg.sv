@@ -3,7 +3,7 @@
 
 // unified_pkt_pkg.sv
 //
-// The wire-format contract for every PL->host stream, in one place.
+// The wire format for every PL->host stream, in one place.
 //
 // All streams (broadband, LFP, ...) leave the board on ONE UDP port and are told
 // apart by `stream_type` in header word 1, so every stream MUST emit the same
@@ -29,7 +29,7 @@
 // individual stream. Producers differ in how WIDE they write (broadband packs
 // 64-bit pairs into its FIFO, the LFP engine writes 32-bit words straight to
 // BRAM), so both a word-at-a-time accessor and a whole-header vector are
-// provided -- the transport differs, the contract does not.
+// provided -- the transport differs, the packet layout does not.
 //
 // See docs/unified-packet-format.md for the prose version and the payload
 // layouts, and docs/register-map.md for the control/status registers.

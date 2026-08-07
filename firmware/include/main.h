@@ -30,7 +30,7 @@
 // IP (from the datagram source address / the ip field), (b) know the board is UP
 // (readiness gate -- it only beacons after init), and (c) stay fully passive
 // until it arrives (zero packets to the board during its fragile boot window).
-// CONTRACT -- keep in sync across: network.c (build), remote/net.py (decode),
+// KEEP IN SYNC across: network.c (build), remote/net.py (decode),
 // and the ephys-socket plugin (decode). All fields naturally aligned; no padding.
 #define BEACON_PORT     0x6880   // 26752 -- discovery beacon (subnet broadcast)
 #define BEACON_MAGIC    0x4B4C4231u   // distinctive discovery magic ("KLB1")
@@ -327,8 +327,8 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
 #define PROTOCOL_VERSION               1
 #define FIRMWARE_VERSION_MAJOR         3
 // MAJOR bumps when a host built for the previous version can no longer drive this
-// board correctly -- either the wire contract broke, or the board grew a capability
-// it cannot know to ask about. MINOR when the contract only grows compatibly.
+// board correctly -- either the wire format changed, or the board grew a capability
+// it cannot know to ask about. MINOR when everything old still works.
 #define FIRMWARE_VERSION_MINOR         0   // 3.0.0.0: the board is no longer one fixed fabric. It carries
                                            //      a set of runtime-swappable PL configurations and
                                            //      chooses among them from what is physically plugged in
@@ -353,12 +353,12 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            // 2.2.0.0: DAC70502 stimulus playback engine (PL stim engine
                                            //      + firmware driver + host API, TCP cmds 0xA0..0xAD).
                                            //      ADDITIVE over 2.1.0.0 -- the broadband/aux/LFP wire
-                                           //      contract is UNCHANGED (stim is control-only + a PL
+                                           //      wire format is UNCHANGED (stim is control-only + a PL
                                            //      peripheral; no new UDP stream), so a 2.1.x host still
                                            //      interoperates. See docs/stim.md.
                                            // 2.1.0.0: aux command engine + the on-PL LFP/DSP engine
                                            //      (a stream_type=2 producer). ADDITIVE over 2.0.0.0 --
-                                           //      the broadband + aux wire contract is UNCHANGED, so a
+                                           //      the broadband + aux wire format is UNCHANGED, so a
                                            //      2.0.x host still interoperates. LFP is a second stream
                                            //      on the SAME unified port (0x6800, stream_type=2), with
                                            //      the unified 8-word header unchanged. LFP control regs
@@ -366,7 +366,7 @@ void beacon_send(void);   // broadcast one beacon (call ~1 Hz while link is up)
                                            //      status_response_t wire size 288 B (264 aux + 24 LFP):
                                            //      keep net.py get_status, the _Static_assert, AND the
                                            //      plugin parseStatusResponse in sync.
-                                           // 2.0.0.0: the current contract baseline. There is no aux
+                                           // 2.0.0.0: the current baseline. There is no aux
                                            //      enable command (0x72 unassigned), the aux command
                                            //      engine is always on, reg22 carries the override
                                            //      semantics, and the accel slot-0 reply rides in-frame at

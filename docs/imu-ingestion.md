@@ -72,7 +72,7 @@ UDP send is a counted drop (AUX0 `send_drops`) and a SEQ gap — never a retry
   auto-stop, dual-port independence, fabric gating, drop accounting,
   teardown, period clamping. The mock also asserts the FIFO traffic is
   exactly the canonical combined sequence.
-- `remote/test_imu_host.py` — contract test: parses datagrams the simulated
+- `remote/test_imu_host.py` — cross-check: parses datagrams the simulated
   firmware emitted with `net.py parse_imu_packet` (field-for-field), plus a
   loopback-UDP UnifiedSink demux/fan-out/gap-accounting test.
 - On hardware (needs a board + mounted IMU): see `docs/TESTING.md` /

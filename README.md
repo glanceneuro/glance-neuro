@@ -37,7 +37,8 @@ The carrier PCB (KiCad, manufactured at JLCPCB) lives in the
   assembling the board (Omnetics epoxy), the MicroZed boot jumpers, copying the boot image
   to SD, and building from source.
 
-**The contract** — change any of these and the firmware, `net.py` and the plugin move together:
+**The wire format and register map** — change any of these and the firmware, `net.py`
+and the plugin move together:
 
 - **[Protocol](docs/protocol.md)** — the TCP command set and the replies each command returns.
 - **[Register map](docs/register-map.md)** — the AXI-Lite control/status bank at `0x40000000`.
@@ -73,7 +74,7 @@ The board's protocol has two reference clients (both speak TCP control + UDP cap
 </p>
 
 The firmware (`firmware/`), `remote/net.py`, and the plugin are the **three consumers of the
-same register/packet contract** — keep them in sync when changing the protocol.
+same packet and register layout** — keep them in sync when changing the protocol.
 
 ## License
 

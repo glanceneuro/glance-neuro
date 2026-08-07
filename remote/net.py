@@ -20,7 +20,7 @@ TCP_PORT = 0x6900  # 26880 -- must match your board's TCP_PORT
 UDP_PORT = 0x6800  # 26624 -- must match your board's UDP_PORT (ALL streams; demux by stream_type)
 
 # ---------------------------------------------------------------------------
-# Device discovery beacon (contract: firmware main.h device_beacon_t, built in
+# Device discovery beacon (layout: firmware main.h device_beacon_t, built in
 # network.c). The board broadcasts a 28-byte beacon to <subnet>.255:BEACON_PORT
 # ~1 Hz once it's up. We listen for it to (a) auto-discover the board's IP (no
 # hardcoding), (b) confirm it's ready before we send it anything, and (c) stay

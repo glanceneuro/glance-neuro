@@ -3,7 +3,7 @@
 """Host-side tests for the IMU stream receive path in net.py.
 
 Two layers:
-  1. CONTRACT: run the firmware host-test binary (firmware/test-host) with
+  1. CROSS-CHECK: run the firmware host-test binary (firmware/test-host) with
      IMU_TEST_DUMP set, then parse the raw datagrams the (simulated) firmware
      actually emitted with net.py's real parse_imu_packet. Firmware C and host
      Python are two independent implementations of docs/protocol.md -- this
@@ -41,8 +41,8 @@ def mock_acc(p, i): return -981 + i * 100 + p * 3
 def mock_gyr(p, i): return 160 * (i - 1) + p
 
 
-def test_contract():
-    print("contract: firmware-emitted datagrams parse correctly in net.py")
+def test_cross_check():
+    print("cross-check: firmware-emitted datagrams parse correctly in net.py")
     dump = os.path.join(tempfile.mkdtemp(), "imu_pkts.bin")
     env = dict(os.environ, IMU_TEST_DUMP=dump)
     r = subprocess.run(
@@ -144,7 +144,7 @@ def test_sink_demux():
 
 
 def main():
-    test_contract()
+    test_cross_check()
     test_sink_demux()
     if failures:
         print(f"TB_FAIL  Errors: {failures}")

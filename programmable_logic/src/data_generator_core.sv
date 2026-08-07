@@ -543,7 +543,7 @@ always_ff @(posedge clk) begin
 end
 
 
-// The broadband common header, built from the shared contract. AUX0 gives the
+// The broadband common header, built from the shared layout. AUX0 gives the
 // host the payload size; AUX1 carries the digital inputs, the aux flags, and the
 // sweep-slot command that labels the accel axis replying in this same packet.
 wire [31:0] bb_aux0 = {8'd0, bb_num_data_words[15:0], channel_enable_reg};

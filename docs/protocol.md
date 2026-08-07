@@ -13,9 +13,9 @@ broadcasts a ~1 Hz discovery beacon so `net.py` can find it without a hard-coded
 `remote/net.py` and `firmware/include/main.h` are the **authoritative** sources for the exact
 IDs, bit layouts, and offsets; `docs/register-map.md` details the full AXI-Lite register map
 (PS ↔ PL). This document is the readable summary. Firmware, `net.py`, and
-the Open Ephys plugin are the **three consumers of the same contract**; changing it means
-changing all three. This is the **v2** contract: aux command sequencing is on by default (the
-firmware version's MAJOR field bumps when the contract breaks).
+the Open Ephys plugin all have to agree on what follows; changing it means changing all
+three. This is the **v2** command set: aux command sequencing is on by default (the firmware
+version's MAJOR field bumps when a host built for the previous version stops working).
 
 ## TCP control commands
 

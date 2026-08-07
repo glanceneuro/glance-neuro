@@ -143,7 +143,7 @@ reg        run_retrig;
 reg [ADDR_W-1:0] run_start_index, run_end_index, run_loop_index;
 reg [31:0] run_frames_left;      // finite mode countdown
 reg [31:0] run_frame_count;      // start-latched reload value; retrigger reloads
-                                 // from this, not live cfg (config-frozen contract)
+                                 // from this, not live cfg (config frozen at start)
 reg [40:0] run_period;           // 350 * k, up to 41 bits at k = 2^32-1
 reg [40:0] tick_cnt;
 

@@ -11,7 +11,8 @@ full of noise trains you to skim past a real failure.
 
 The bar for keeping a testbench here is narrow:
 
-- **It guards a contract, not an implementation.** Byte-exact output against a
+- **It pins down something two pieces of code must agree on, not how either one
+  works.** Byte-exact output against a
   reference, a wire format, a handshake — something that would still be true after a
   rewrite.
 - **It guards code that still changes.** A test over frozen code is documentation with
@@ -75,7 +76,7 @@ in the bitstream — and `design_lfp_filters.py` regenerates them along with `lf
 ```bash
 bash firmware/test-host/run_imu_stream_test.sh   # IMU state machine (C, simulated I2C)
 bash firmware/test-host/run_probe_test.sh        # bounded I2C: detect / read / scan / eeprom
-python3 remote/test_imu_host.py                  # firmware<->net.py wire contract + sink
+python3 remote/test_imu_host.py                  # firmware<->net.py wire format + sink
 python3 remote/test_rescan.py                    # rescan orchestration + I2C decoders
 ```
 
@@ -89,7 +90,7 @@ at the bench:
 |---|---|
 | `run_probe_test.sh` | The **bounded I2C primitives** — `pl_imu_read.c`, `pl_i2c_probe.c`, `pl_imu_detect.c`. These carry the fixes for the two worst bugs this firmware has had (an unbounded `BUS_BUSY` spin reachable from a TCP handler, and a reply that shipped uninitialized core-0 stack), and until this suite existed they were verified by compilation alone. `timeout` in the runner is load-bearing: a reverted bound *hangs*, and the timeout turns that into a failure |
 | `run_imu_stream_test.sh` | The **non-blocking IMU state machine** compiled on the host against a register-accurate simulated AXI IIC core + BNO055: tick cadence, packet layout, per-port SEQ, NACK / wedged-bus recovery, auto-stop after 16 consecutive errors, dual-port independence, per-port fabric gating, send-drop accounting, teardown mid-transfer, period clamping. The mock also asserts the command-FIFO traffic is exactly the canonical combined write-then-read — the one thing silicon must still confirm is that the IIC core accepts it |
-| `remote/test_imu_host.py` | The **wire contract between firmware and `net.py`**: datagrams the simulated firmware actually emitted are parsed field-for-field by `parse_imu_packet`. Two independent implementations of `docs/protocol.md`, so drift fails here. Plus a loopback-UDP `UnifiedSink` demux / fan-out / per-port SEQ-gap test |
+| `remote/test_imu_host.py` | **Firmware and `net.py` agreeing on the bytes**: datagrams the simulated firmware actually emitted are parsed field-for-field by `parse_imu_packet`. Two independent implementations of `docs/protocol.md`, so drift fails here. Plus a loopback-UDP `UnifiedSink` demux / fan-out / per-port SEQ-gap test |
 | `remote/test_rescan.py` | **`rescan` decision logic** against a simulated board: fabric selection for all four headstage populations, the census-then-target config order, and the freed-CIPO lane correction (a mask bit with no LVDS pair behind it must never reach the board). Plus `i2c_scan` / `eeprom_read` decoding, including the wedged-bus report |
 
 The plugin repo's `test/run_imu_decode_test.sh` closes the same loop for the **third**

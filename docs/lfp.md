@@ -302,7 +302,7 @@ comparison that shows the minimum-phase trade directly.
 | `programmable_logic/src/lfp_halfband_dec2.sv` | stage 1: 11-tap halfband, /2 |
 | `programmable_logic/src/lfp_poly_dec5.sv` | stage 2: ≤120-tap decimator, /5, lane-parallel MACs |
 | `programmable_logic/src/lfp_coef_pkg.sv` | generated power-on coefficients |
-| `programmable_logic/src/unified_pkt_pkg.sv` | the common packet header contract |
+| `programmable_logic/src/unified_pkt_pkg.sv` | the common packet header layout |
 | `programmable_logic/sim/design_lfp_filters.py` | filter design + measured numbers |
 | `firmware/src-core0/pl_control.c` | `pl_lfp_set_config`, coefficient upload |
 | `firmware/src-core0/stream.c` | drains the LFP BRAM to UDP |

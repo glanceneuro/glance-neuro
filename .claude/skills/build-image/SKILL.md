@@ -20,7 +20,7 @@ This is the only build script; the others that wrote `blobs/BOOT.bin` have been
 deleted. It takes no options other than `--app-only` — `--check` and `--force-pl`
 belonged to the removed `build.sh` and are now errors rather than no-ops.
 
-Note `--app-only` is a firmware-only path *by contract*: it refuses when the PL
+Note `--app-only` is a firmware-only path *by design*: it refuses when the PL
 fingerprint has moved rather than quietly baking a stale fabric. `BOOT.bin`
 carries a bitstream, so a `programmable_logic/` change — even a comment — must
 go through the full build.

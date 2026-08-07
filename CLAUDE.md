@@ -22,7 +22,7 @@ implementation detail — see the hard rules.
 | `programmable_logic/ip/` | custom Intan SPI IP. A build input |
 | `programmable_logic/sim/` | testbenches, runners, filter design script, coefficients |
 | `firmware/src-core0/` | network, streaming, PL control |
-| `firmware/include/main.h` | the PS side of the register/packet contract |
+| `firmware/include/main.h` | the PS side of the packet and register layout |
 | `remote/net.py` | reference host client and diagnostic tool |
 | `blobs/` | the SD card image (copied verbatim to the FAT root): `BOOT.bin` + any runtime fabrics, matching the source in the same commit — see rule 1 |
 | `docs/` | protocol, register map, LFP cascade, testing |
@@ -95,12 +95,13 @@ commit changed it, or how it used to work. A reader has no access to that histor
 should not need it. Explain *why* the current shape is the way it is when the reason
 is not obvious — especially where it is load-bearing.
 
-## The contract
+## Keeping the three sides in step
 
 `firmware/include/main.h`, `remote/net.py`, and the Open Ephys plugin are **three
-consumers of one contract**. Change it and all three move together, along with
-`docs/protocol.md` and `docs/register-map.md`. A `_Static_assert` on the status struct
-keeps the firmware and `net.py` honest; nothing enforces the plugin, so check it by hand.
+implementations of one packet and register layout**. Change it and all three move
+together, along with `docs/protocol.md` and `docs/register-map.md`. A `_Static_assert`
+on the status struct keeps the firmware and `net.py` honest; nothing enforces the
+plugin, so check it by hand.
 
 Bit positions in the packet header are part of the wire format. A field written to the
 wrong bits is not a decode error — it reads as a plausible value. An overrun flag that
