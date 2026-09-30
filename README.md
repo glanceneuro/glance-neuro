@@ -7,6 +7,8 @@
 
 by the [Kemere Lab](https://kemerelab.com) at [Rice University](https://neuroengineering.rice.edu)
 
+**[glanceneuro.org](https://glanceneuro.org)**
+
 </div>
 
 An FPGA data-acquisition interface for **Intan RHD2000-style neural recording chips**, built
